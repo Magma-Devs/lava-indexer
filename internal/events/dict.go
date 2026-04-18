@@ -3,7 +3,6 @@ package events
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -19,19 +18,21 @@ import (
 // names) be stored as 4-byte INT references in fact tables, saving ~25–30%
 // of disk over the naive design for our row shape.
 //
-// The cache is populated lazily from successful UPSERTs and lives for the
-// lifetime of the process. It is safe for concurrent use.
+// Each IDs call goes to Postgres — no in-memory cache. An earlier version
+// cached ids in-process, but under parallel workers that produced FK
+// violations: worker A would insert a row and cache its id before A's tx
+// committed, worker B would grab the id from cache, then A would roll back
+// and B's COPY into the fact table would reference a non-existent id. The
+// round-trip is cheap (N=107 unique values across the entire chain's
+// history for our workload) and the correctness win dwarfs the saving.
 type Dict struct {
 	Schema string // e.g. "app"
 	Table  string // e.g. "providers"
 	Column string // e.g. "addr"
-
-	mu    sync.RWMutex
-	cache map[string]int32
 }
 
 func NewDict(schema, table, col string) *Dict {
-	return &Dict{Schema: schema, Table: table, Column: col, cache: make(map[string]int32)}
+	return &Dict{Schema: schema, Table: table, Column: col}
 }
 
 func (d *Dict) DDL() string {
@@ -42,35 +43,19 @@ func (d *Dict) DDL() string {
 		);`, d.Schema, d.Table, d.Column)
 }
 
-// IDs returns id for every value in `values`, inserting new ones via a single
-// bulk UPSERT. Must be called with an active transaction — the writes commit
-// atomically with the caller's batch.
+// IDs returns id for every value in `values`, inserting new ones via a
+// single bulk UPSERT. Must be called with an active transaction so that
+// dict writes commit (or roll back) atomically with the caller's batch.
 func (d *Dict) IDs(ctx context.Context, tx pgx.Tx, values []string) (map[string]int32, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
-	out := make(map[string]int32, len(values))
-	var missing []string
 
-	// Fast path: read-lock the cache for hits.
-	d.mu.RLock()
+	// Dedup before round-tripping. unnest+DISTINCT would handle this
+	// server-side, but trimming the arg array first keeps the wire smaller.
+	seen := make(map[string]struct{}, len(values))
+	dedup := make([]string, 0, len(values))
 	for _, v := range values {
-		if id, ok := d.cache[v]; ok {
-			out[v] = id
-		} else {
-			missing = append(missing, v)
-		}
-	}
-	d.mu.RUnlock()
-
-	if len(missing) == 0 {
-		return out, nil
-	}
-
-	// Dedup missing before round-tripping.
-	seen := make(map[string]struct{}, len(missing))
-	dedup := missing[:0]
-	for _, v := range missing {
 		if _, ok := seen[v]; ok {
 			continue
 		}
@@ -78,8 +63,10 @@ func (d *Dict) IDs(ctx context.Context, tx pgx.Tx, values []string) (map[string]
 		dedup = append(dedup, v)
 	}
 
-	// ON CONFLICT DO UPDATE ... RETURNING is the trick to get the id back for
-	// both newly-inserted and already-existing rows in one round-trip.
+	// ON CONFLICT DO UPDATE ... RETURNING returns the id for BOTH new and
+	// pre-existing rows in one round-trip. The DO UPDATE is a no-op write
+	// whose sole purpose is to trigger RETURNING; without it, ON CONFLICT
+	// DO NOTHING would skip RETURNING for the conflict rows.
 	sql := fmt.Sprintf(`
 		INSERT INTO %[1]s.%[2]s (%[3]s)
 		SELECT DISTINCT v FROM unnest($1::text[]) AS t(v)
@@ -91,17 +78,14 @@ func (d *Dict) IDs(ctx context.Context, tx pgx.Tx, values []string) (map[string]
 	}
 	defer rows.Close()
 
-	d.mu.Lock()
+	out := make(map[string]int32, len(dedup))
 	for rows.Next() {
 		var id int32
 		var v string
 		if err := rows.Scan(&id, &v); err != nil {
-			d.mu.Unlock()
 			return nil, err
 		}
-		d.cache[v] = id
 		out[v] = id
 	}
-	d.mu.Unlock()
 	return out, rows.Err()
 }
