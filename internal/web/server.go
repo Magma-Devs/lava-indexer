@@ -209,9 +209,14 @@ type HandlerStatus struct {
 
 	// Dead-letter: heights that exhausted their retry budget. Still gaps
 	// in indexer_ranges, so a future sweep (or restart) picks them up.
-	FailureCount int64       `json:"failure_count"`
-	MaxRetries   int         `json:"max_retries"`
-	FailedRanges []RangeJSON `json:"failed_ranges,omitempty"`
+	// FailureCount sums both slices; the individual fields let the UI
+	// distinguish a churning retry pool from one the pipeline has
+	// permanently given up on.
+	FailureCount     int64       `json:"failure_count"`
+	RetryingCount    int64       `json:"retrying_count"`
+	PermanentCount   int64       `json:"permanent_count"`
+	MaxRetries       int         `json:"max_retries"`
+	FailedRanges     []RangeJSON `json:"failed_ranges,omitempty"`
 }
 
 type RangeJSON struct {
@@ -364,8 +369,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			hs.DataFrom = &from
 			hs.DataTo = &to
 		}
-		if cnt, maxR, err := s.State.FailureCount(ctx, h.Name()); err == nil {
-			hs.FailureCount = cnt
+		if retrying, permanent, maxR, err := s.State.FailureCount(ctx, h.Name()); err == nil {
+			hs.RetryingCount = retrying
+			hs.PermanentCount = permanent
+			hs.FailureCount = retrying + permanent
 			hs.MaxRetries = maxR
 		}
 		if frs, err := s.State.FailureRanges(ctx, h.Name()); err == nil {

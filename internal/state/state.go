@@ -64,6 +64,11 @@ func (s *State) Ensure(ctx context.Context) error {
 // all retries. Skipped heights stay out of indexer_ranges, so the next
 // invocation picks them up — the row here records the reason for any
 // operator who wants to look later.
+//
+// The `permanent` column separates "give up forever" rows (pruned heights,
+// ranges no endpoint covers, retry-cap exhausted) from the transient pool
+// the retry sweep still churns on. Permanent rows STAY in the table —
+// they're observability data, not forgotten work.
 func (s *State) ensureFailuresTable(ctx context.Context) error {
 	sql := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %[1]s.indexer_failures (
@@ -74,7 +79,13 @@ func (s *State) ensureFailuresTable(ctx context.Context) error {
 		  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 		  last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 		  PRIMARY KEY (handler, height)
-		);`, s.schema)
+		);
+		ALTER TABLE %[1]s.indexer_failures
+		  ADD COLUMN IF NOT EXISTS permanent BOOLEAN NOT NULL DEFAULT FALSE;
+		ALTER TABLE %[1]s.indexer_failures
+		  ADD COLUMN IF NOT EXISTS max_retries_reached_at TIMESTAMPTZ;
+		CREATE INDEX IF NOT EXISTS idx_indexer_failures_handler_permanent
+		  ON %[1]s.indexer_failures (handler, permanent);`, s.schema)
 	_, err := s.pool.Exec(ctx, sql)
 	return err
 }
@@ -82,25 +93,66 @@ func (s *State) ensureFailuresTable(ctx context.Context) error {
 // RecordFailure upserts a dead-letter entry for a height that exhausted its
 // retry budget. Safe to call repeatedly — each call bumps retries and
 // last_seen_at without changing first_seen_at.
-func (s *State) RecordFailure(ctx context.Context, handler string, height int64, reason string) error {
+//
+// When the post-upsert retry count would reach maxRetries (> 0), the row
+// is flipped to permanent in the SAME statement so it can't squeeze
+// through one more sweep before the pipeline notices. maxRetries <= 0
+// disables the cap (old behaviour).
+func (s *State) RecordFailure(ctx context.Context, handler string, height int64, reason string, maxRetries int) error {
 	_, err := s.pool.Exec(ctx, fmt.Sprintf(`
-		INSERT INTO %s.indexer_failures (handler, height, reason, retries)
+		INSERT INTO %[1]s.indexer_failures (handler, height, reason, retries)
 		VALUES ($1, $2, $3, 1)
 		ON CONFLICT (handler, height) DO UPDATE SET
 		  reason       = EXCLUDED.reason,
-		  retries      = %s.indexer_failures.retries + 1,
-		  last_seen_at = now()`, s.schema, s.schema),
+		  retries      = %[1]s.indexer_failures.retries + 1,
+		  last_seen_at = now(),
+		  permanent    = CASE
+		    WHEN $4 > 0 AND %[1]s.indexer_failures.retries + 1 >= $4 THEN TRUE
+		    ELSE %[1]s.indexer_failures.permanent
+		  END,
+		  max_retries_reached_at = CASE
+		    WHEN $4 > 0 AND %[1]s.indexer_failures.retries + 1 >= $4
+		      AND %[1]s.indexer_failures.max_retries_reached_at IS NULL
+		      THEN now()
+		    ELSE %[1]s.indexer_failures.max_retries_reached_at
+		  END`, s.schema),
+		handler, height, reason, maxRetries)
+	return err
+}
+
+// RecordPermanentFailure inserts (or updates) a dead-letter entry flagged
+// permanent from the start. Used for classified-permanent errors (no
+// endpoint covers the height, LCD returned a pruning 4xx) where one
+// retry is as pointless as a thousand.
+func (s *State) RecordPermanentFailure(ctx context.Context, handler string, height int64, reason string) error {
+	_, err := s.pool.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %[1]s.indexer_failures
+		  (handler, height, reason, retries, permanent, max_retries_reached_at)
+		VALUES ($1, $2, $3, 1, TRUE, now())
+		ON CONFLICT (handler, height) DO UPDATE SET
+		  reason                 = EXCLUDED.reason,
+		  permanent              = TRUE,
+		  max_retries_reached_at = COALESCE(%[1]s.indexer_failures.max_retries_reached_at, now()),
+		  last_seen_at           = now()`, s.schema),
 		handler, height, reason)
 	return err
 }
 
-// FailureCount returns (total_dead_letter_rows, max_retries) per handler.
-// Used by the UI to surface "there are holes and they've been tried N times".
-func (s *State) FailureCount(ctx context.Context, handler string) (count int64, maxRetries int, err error) {
-	row := s.pool.QueryRow(ctx, fmt.Sprintf(
-		`SELECT COUNT(*), COALESCE(MAX(retries), 0)
-		 FROM %s.indexer_failures WHERE handler = $1`, s.schema), handler)
-	err = row.Scan(&count, &maxRetries)
+// FailureCount returns the dead-letter split per handler:
+//   - retrying: rows still eligible for the retry sweep (permanent=FALSE)
+//   - permanent: rows the pipeline has given up on (permanent=TRUE)
+//   - maxRetries: max retries column across ALL rows, for operator context
+//
+// The UI renders "X retrying · Y permanent" so operators can tell a churning
+// pool from one that's settled into permanent failure.
+func (s *State) FailureCount(ctx context.Context, handler string) (retrying, permanent int64, maxRetries int, err error) {
+	row := s.pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT
+		  COUNT(*) FILTER (WHERE NOT permanent),
+		  COUNT(*) FILTER (WHERE permanent),
+		  COALESCE(MAX(retries), 0)
+		FROM %s.indexer_failures WHERE handler = $1`, s.schema), handler)
+	err = row.Scan(&retrying, &permanent, &maxRetries)
 	return
 }
 
@@ -108,6 +160,11 @@ func (s *State) FailureCount(ctx context.Context, handler string) (count int64, 
 // (highest heights first — tip-first just like the main producer) and
 // returns them. Atomic: the SELECT + DELETE happens inside a single
 // DELETE…RETURNING so a second caller can't pop the same height.
+//
+// Only rows with permanent=FALSE are popped. Permanent rows stay in the
+// table as an observability record — their height will never succeed
+// again (pruned, out of coverage, retry-cap exhausted), so cycling them
+// through the sweep would just waste endpoint budget.
 //
 // Heights returned here are candidates for in-run retry. If the retry
 // eventually succeeds, the height lands in indexer_ranges and the failure
@@ -123,7 +180,7 @@ func (s *State) PopFailures(ctx context.Context, handler string, limit int) ([]i
 		WHERE (handler, height) IN (
 		  SELECT handler, height
 		  FROM %[1]s.indexer_failures
-		  WHERE handler = $1
+		  WHERE handler = $1 AND permanent = FALSE
 		  ORDER BY height DESC
 		  LIMIT $2
 		)

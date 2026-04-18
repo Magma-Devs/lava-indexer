@@ -104,6 +104,13 @@ type Indexer struct {
 	// drain. Default 200.
 	FailureRetryBatch int `yaml:"failure_retry_batch"`
 
+	// FailureMaxRetries caps how many times a transient dead-letter entry
+	// is retried before the pipeline flips it to permanent and stops
+	// cycling it through the retry sweep. Without a cap the sweep can
+	// churn on the same heights indefinitely (e.g. 10k "no endpoint
+	// covers" rows rotating forever). Default 5.
+	FailureMaxRetries int `yaml:"failure_max_retries"`
+
 	// BackfillInterleave controls how strictly tip-first the gap scheduler
 	// is. Every Nth batch goes to the OLDEST-cursor gap instead of the
 	// highest, so a large backfill gap can't starve behind tip-close
@@ -174,6 +181,7 @@ func defaults() *Config {
 			TipPollInterval:      3 * time.Second,
 			FailureRetryInterval: 60 * time.Second,
 			FailureRetryBatch:    200,
+			FailureMaxRetries:    5,
 			BackfillInterleave:   5,
 		},
 		Database: Database{

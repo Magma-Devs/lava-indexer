@@ -170,8 +170,14 @@ func retryableCall(ctx context.Context, httpc *http.Client, url string, body []b
 			continue
 		}
 		// 4xx other than 429 — don't retry, the request is malformed and
-		// hitting again won't help.
-		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, truncate(string(data), 300))
+		// hitting again won't help. Wrap as a typed error so the pipeline
+		// classifier can distinguish permanent failures (404 = pruned)
+		// from transient ones without string-matching error text.
+		return nil, &HTTPStatusError{
+			Status: resp.StatusCode,
+			Body:   truncate(string(data), 300),
+			URL:    url,
+		}
 	}
 	return nil, fmt.Errorf("exceeded %d retries: %w", maxRetries, lastErr)
 }
