@@ -477,29 +477,51 @@ func (p *Pipeline) processBatch(ctx context.Context, from, to int64) error {
 		p.totalRows.Add(int64(len(evs)))
 	}
 
-	// One tx per batch: all handler writes + per-handler range merges +
-	// run-stats heartbeat commit together. If the process dies mid-batch,
-	// neither the rows, the range update, NOR the counter advance lands,
-	// so state stays consistent and the batch is re-fetched on next run.
+	// Determine which handlers need this batch BEFORE acquiring a tx.
+	// HandlerNeedsRange issues a pool query; running it inside BeginTxFunc
+	// means every worker holds one pool connection for its tx while trying
+	// to acquire a second one for the gap read. Under N workers > pool_size
+	// that self-deadlocks — every connection is held by a tx waiting on a
+	// gap-read connection that will never come (observed at pool_size=16,
+	// workers=64). The result was thousands of "idle in transaction" rows
+	// in pg_stat_activity and /api/status timing out on its own pool acquire.
+	// The read is idempotent and safe to run without a tx — a concurrent
+	// writer's changes between now and tx-begin are handled by the advisory
+	// lock + merge semantics in RecordRange.
+	needs := make(map[string]bool, len(p.registry.All()))
+	anyNeeds := false
+	for _, h := range p.registry.All() {
+		n, err := p.state.HandlerNeedsRange(ctx, h.Name(), from, to)
+		if err != nil {
+			return fmt.Errorf("needs-range: %w", err)
+		}
+		needs[h.Name()] = n
+		if n {
+			anyNeeds = true
+		}
+	}
+
 	var rowsThisBatch int64
 	for _, evs := range dispatched {
 		rowsThisBatch += int64(len(evs))
 	}
 	blocksThisBatch := to - from + 1
+
+	// If no handler needs this batch, still commit a heartbeat so the run's
+	// progress counters advance and the dashboard shows the batch as work
+	// done (fetched but nothing to write). Skip the per-handler section.
 	return pgx.BeginTxFunc(ctx, p.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		for _, handler := range p.registry.All() {
-			needs, err := p.state.HandlerNeedsRange(ctx, handler.Name(), from, to)
-			if err != nil {
-				return err
-			}
-			if !needs {
-				continue
-			}
-			if err := handler.Persist(ctx, tx, dispatched[handler]); err != nil {
-				return fmt.Errorf("%s persist: %w", handler.Name(), err)
-			}
-			if err := p.state.RecordRange(ctx, tx, handler.Name(), from, to); err != nil {
-				return fmt.Errorf("%s record range: %w", handler.Name(), err)
+		if anyNeeds {
+			for _, handler := range p.registry.All() {
+				if !needs[handler.Name()] {
+					continue
+				}
+				if err := handler.Persist(ctx, tx, dispatched[handler]); err != nil {
+					return fmt.Errorf("%s persist: %w", handler.Name(), err)
+				}
+				if err := p.state.RecordRange(ctx, tx, handler.Name(), from, to); err != nil {
+					return fmt.Errorf("%s record range: %w", handler.Name(), err)
+				}
 			}
 		}
 		if p.runID != 0 {
