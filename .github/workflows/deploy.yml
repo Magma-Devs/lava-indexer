@@ -1,0 +1,69 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - mainnet
+          - testnet
+      tag:
+        description: "Image tag (commit SHA or latest)"
+        required: false
+        default: "latest"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy-indexer:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Deploy indexer to ${{ inputs.environment }}
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          CLUSTER: lava-indexer-${{ inputs.environment }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          IMAGE="${REGISTRY}/lava-indexer:${TAG}"
+
+          echo "Deploying ${IMAGE} to ${CLUSTER}/indexer"
+
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition ${CLUSTER}-indexer \
+            --query 'taskDefinition' \
+            --output json)
+
+          UPDATED=$(echo "$TASK_DEF" | jq \
+            --arg IMG "$IMAGE" \
+            '.containerDefinitions[0].image = $IMG |
+             {family, taskRoleArn, executionRoleArn, networkMode,
+              containerDefinitions, requiresCompatibilities, cpu, memory}')
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$UPDATED" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service indexer \
+            --task-definition "$NEW_ARN"
+
+          echo "Deployed ${IMAGE} → ${CLUSTER}/indexer (task def: ${NEW_ARN})"

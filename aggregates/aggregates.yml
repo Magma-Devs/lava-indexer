@@ -1,0 +1,14 @@
+# pg_cron refresh schedules for aggregates in this directory.
+# Each key is the job name; re-running the indexer edits schedules in-place.
+#
+# `sql` is executed by pg_cron; use CONCURRENTLY where supported so reads
+# aren't blocked during refresh.
+#
+# If pg_cron isn't installed, scheduling is skipped with a warning and the
+# DDL in *.sql files is still applied. You can trigger refreshes manually
+# via SELECT refresh_materialized_view(...).
+
+refresh:
+  mv_relay_daily:
+    sql: "REFRESH MATERIALIZED VIEW CONCURRENTLY app.mv_relay_daily"
+    schedule: "*/5 * * * *"

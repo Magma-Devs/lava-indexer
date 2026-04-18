@@ -1,0 +1,1104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>lava-indexer · progress</title>
+<style>
+  :root {
+    --bg:          #0b0e14;
+    --panel:       #121722;
+    --panel-2:     #1a2030;
+    --border:      #1e2738;
+    --muted:       #6b7a99;
+    --fg:          #dbe2f0;
+    --accent:      #6ee7b7;
+    --accent-dim:  #1e5e45;
+    --warn:        #f59e0b;
+    --danger:      #ef4444;
+    --track:       #22304a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header {
+    padding: 18px 24px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 16px; letter-spacing: 0.02em; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  header .pill {
+    display: inline-block; padding: 3px 10px; border-radius: 9999px;
+    border: 1px solid var(--border); background: var(--panel);
+    font-size: 11px; color: var(--muted);
+  }
+  header .pill.good { color: var(--accent); border-color: var(--accent-dim); }
+  header .pill.warn { color: var(--warn); border-color: #3b2a0d; }
+
+  main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card h2 { margin: 0 0 8px 0; font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
+  .card .v { font-size: 20px; font-variant-numeric: tabular-nums; word-break: break-all; }
+  .card .s { font-size: 11px; color: var(--muted); margin-top: 2px; white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere; }
+
+  .endpoints-card { grid-column: 1 / -1; }
+  .ep-list { display: grid; gap: 6px; margin-top: 6px; }
+  .ep {
+    display: grid; grid-template-columns: 14px auto minmax(180px, 2fr) 1fr 1fr;
+    gap: 12px; align-items: baseline;
+    padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel-2); font-size: 12px;
+  }
+  /* Kind badge (rpc / rest) shown alongside each endpoint. Colour-coded so
+     a mixed fleet is readable at a glance. Uses a neutral-grey fallback
+     for unknown kinds so a future "grpc" etc. doesn't render unstyled. */
+  .kind-badge {
+    display: inline-block; padding: 1px 7px; border-radius: 4px;
+    font-size: 10px; font-weight: 600; letter-spacing: 0.06em;
+    text-transform: uppercase; font-family: ui-monospace, monospace;
+    border: 1px solid;
+  }
+  .kind-rpc  { color: #60a5fa; background: rgba(96, 165, 250, 0.10); border-color: rgba(96, 165, 250, 0.35); }
+  .kind-rest { color: #a78bfa; background: rgba(167, 139, 250, 0.10); border-color: rgba(167, 139, 250, 0.35); }
+  .kind-unknown { color: var(--muted); background: var(--panel-2); border-color: var(--border); }
+  .ep-metrics { grid-column: 1 / -1; display: flex; gap: 16px; flex-wrap: wrap;
+                color: var(--muted); font-size: 11px; padding-top: 6px;
+                border-top: 1px dashed var(--border); margin-top: 2px; }
+  .ep-metrics span b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .ep-metrics .warn b { color: var(--warn); }
+  .ep-metrics .bad b { color: var(--danger); }
+
+  .info {
+    display: inline-block; width: 14px; height: 14px; border-radius: 50%;
+    border: 1px solid var(--border); color: var(--muted); font-size: 10px;
+    line-height: 12px; text-align: center; margin-left: 4px; cursor: help;
+    font-weight: 600; vertical-align: 1px;
+  }
+  .info:hover { color: var(--fg); border-color: var(--muted); }
+
+  .acronym {
+    border-bottom: 1px dotted var(--muted);
+    cursor: help;
+  }
+  .ep .ok { color: var(--accent); }
+  .ep .bad { color: var(--danger); }
+  .ep .url { word-break: break-all; overflow-wrap: anywhere; color: var(--fg); font-size: 11px; }
+  .ep .range { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .ep .range b { color: var(--fg); font-weight: 600; }
+
+  section.handlers { margin-top: 24px; }
+  section.handlers h2 { font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 10px 0; }
+
+  .handler {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; margin-bottom: 12px;
+  }
+  .handler-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .handler-name { font-size: 14px; font-weight: 600; }
+  .handler-types { color: var(--muted); font-size: 11px; }
+  .handler-pct { margin-left: auto; font-variant-numeric: tabular-nums; font-size: 13px; text-align: right; }
+  .handler-pct .chain { color: var(--muted); font-size: 11px; }
+  .handler-pct .win   { color: var(--accent); font-weight: 600; }
+  .handler-row-counts { color: var(--muted); font-size: 11px; margin-top: 6px; }
+  .handler-dates { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .handler-dates b { color: var(--fg); font-weight: 600; }
+
+  .timeline-wrap { margin-top: 12px; }
+  .timeline {
+    position: relative; width: 100%; height: 28px;
+    background: var(--track); border-radius: 6px; overflow: hidden;
+    cursor: crosshair;
+  }
+  .timeline .covered {
+    position: absolute; top: 0; bottom: 0;
+    background: linear-gradient(to bottom, #4ade80, #22c55e);
+  }
+  .timeline .failed {
+    position: absolute; top: 0; bottom: 0;
+    background: linear-gradient(to bottom, #ef4444, #b91c1c);
+    z-index: 1; /* sit above covered so a red overlay wins */
+  }
+  .timeline .window {
+    position: absolute; top: 0; bottom: 0;
+    border-left: 1px dashed rgba(255,255,255,0.35);
+    border-right: 1px dashed rgba(255,255,255,0.35);
+    background: rgba(110, 231, 183, 0.06);
+    pointer-events: none;
+  }
+  .timeline .tip-marker {
+    position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--warn);
+    pointer-events: none;
+  }
+  .axis {
+    display: flex; justify-content: space-between; color: var(--muted);
+    font-size: 11px; font-variant-numeric: tabular-nums; margin-top: 6px;
+  }
+  .axis .end { display: flex; flex-direction: column; line-height: 1.35; }
+  .axis .end.right { text-align: right; }
+  .axis .end .height { color: var(--fg); font-weight: 600; font-size: 12px; }
+  .axis .end .label  { color: var(--muted); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .axis .end .date   { color: var(--muted); font-size: 11px; margin-top: 1px; }
+  .tooltip {
+    position: fixed; pointer-events: none; z-index: 10;
+    background: #050810; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; font-size: 11px; font-variant-numeric: tabular-nums;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5); transform: translate(-50%, -100%);
+    white-space: nowrap;
+  }
+  /* Wider info tooltip for multi-paragraph explanations (Budget, AIMD). */
+  .tooltip.info-tooltip {
+    white-space: normal; max-width: 360px; line-height: 1.45; font-size: 12px;
+    padding: 8px 10px;
+  }
+  .tooltip.info-tooltip p { margin: 0 0 6px 0; }
+  .tooltip.info-tooltip p:last-child { margin-bottom: 0; }
+
+  details.ranges-detail { margin-top: 10px; }
+  details.ranges-detail summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+  details.ranges-detail .list {
+    margin-top: 6px; display: grid; gap: 4px;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  }
+  details.ranges-detail .list span {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px;
+    padding: 3px 7px; font-size: 11px; font-variant-numeric: tabular-nums;
+  }
+  details.ranges-detail .list span.gap {
+    color: var(--warn); border-color: #3b2a0d;
+  }
+
+  footer { padding: 18px 24px; color: var(--muted); font-size: 11px; border-top: 1px solid var(--border); margin-top: 40px; text-align: center; }
+
+  nav.tabs {
+    display: flex; gap: 4px; padding: 0 24px; border-bottom: 1px solid var(--border);
+  }
+  nav.tabs button {
+    appearance: none; background: transparent; color: var(--muted); border: none;
+    padding: 10px 16px; font: inherit; cursor: pointer;
+    border-bottom: 2px solid transparent; font-size: 12px;
+    letter-spacing: 0.05em; text-transform: uppercase;
+  }
+  nav.tabs button.active { color: var(--fg); border-bottom-color: var(--accent); }
+  nav.tabs button:hover { color: var(--fg); }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  .ep-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; margin-bottom: 12px;
+  }
+  .ep-card-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .ep-card-head .url { font-weight: 600; word-break: break-all; overflow-wrap: anywhere; }
+  .ep-card-head .coverage { color: var(--muted); font-size: 11px; margin-left: auto; }
+  .ep-card-row {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;
+    margin-top: 12px;
+  }
+  .ep-stat { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  .ep-stat .label { color: var(--muted); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; }
+  .ep-stat .value { font-size: 16px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .ep-stat.warn .value { color: var(--warn); }
+  .ep-stat.bad  .value { color: var(--danger); }
+
+  .sparkline-block {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px;
+  }
+  .sparkline {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px 10px;
+    position: relative;
+  }
+  .sparkline .title {
+    color: var(--muted); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+    margin-bottom: 8px; display: flex; justify-content: space-between; align-items: baseline;
+  }
+  .sparkline .title b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; font-size: 13px; }
+
+  /* Plot layout: [ y-ticks  |  plot SVG ]  with x-ticks underneath. */
+  .sparkline .plot {
+    display: flex; align-items: stretch; gap: 6px;
+    height: 100px;
+  }
+  .sparkline .yticks {
+    display: flex; flex-direction: column; justify-content: space-between;
+    align-items: flex-end;
+    color: var(--muted); font-size: 10px; line-height: 1;
+    font-variant-numeric: tabular-nums;
+    padding-right: 4px; border-right: 1px solid var(--border);
+    min-width: 36px;
+  }
+  /* Top label rides on the top edge; bottom on the bottom. The
+     middle ones just flow in justify-content space-between. */
+  .sparkline .yticks span { white-space: nowrap; }
+  .sparkline .chart { flex: 1; min-width: 0; }
+  .sparkline svg { display: block; width: 100%; height: 100%; overflow: visible; }
+  .sparkline .gridline { stroke: var(--border); stroke-width: 1; stroke-dasharray: 2,3; opacity: 0.5; vector-effect: non-scaling-stroke; }
+  .sparkline .axis-bottom { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+  .sparkline .series-line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+  .sparkline .series-fill { stroke: none; fill-opacity: 0.12; }
+  .sparkline .xticks {
+    display: flex; justify-content: space-between;
+    color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums;
+    margin-top: 6px;
+    /* align under the plot column (width of y-ticks + flex gap) */
+    padding-left: 42px;
+  }
+
+  /* Collapsible endpoint card */
+  .ep-card-head { cursor: pointer; user-select: none; }
+  .ep-card-head .chevron {
+    display: inline-block; width: 14px; height: 14px; margin-left: auto;
+    color: var(--muted); transition: transform 0.15s ease;
+    font-size: 11px; line-height: 14px; text-align: center;
+  }
+  .ep-card.collapsed .chevron { transform: rotate(-90deg); }
+  .ep-card.collapsed .ep-card-row,
+  .ep-card.collapsed .sparkline-block { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>lava-indexer</h1>
+  <span class="meta" id="chain"></span>
+  <span class="spacer"></span>
+  <span class="pill" id="endpoint-pill">loading…</span>
+  <span class="meta" id="updated"></span>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button data-view="overview" class="active">Overview</button>
+  <button data-view="endpoints">Endpoints</button>
+  <button data-view="graphql" id="tab-graphql" style="display:none">GraphQL</button>
+</nav>
+
+<main>
+  <div id="view-overview" class="view active">
+    <div class="grid" id="stat-cards"></div>
+    <section class="handlers" style="margin-top:24px">
+      <h2 style="font-size:12px;color:var(--muted);font-weight:600;letter-spacing:0.08em;text-transform:uppercase;margin:0 0 10px 0">Endpoints</h2>
+      <div id="endpoints" class="ep-list"></div>
+    </section>
+    <section class="handlers">
+      <h2>Handlers</h2>
+      <div id="handlers"></div>
+    </section>
+  </div>
+
+  <div id="view-endpoints" class="view">
+    <div id="endpoints-detail"></div>
+  </div>
+
+  <div id="view-graphql" class="view" style="padding:0">
+    <iframe id="graphql-iframe"
+            src="/graphiql"
+            style="border:0; width:100%; height:calc(100vh - 120px); background:var(--bg)"></iframe>
+  </div>
+</main>
+
+<div id="tooltip" class="tooltip" style="display:none"></div>
+
+<footer>
+  <span>Polling <code>/api/status</code> every 3s · <a href="/api/status">view JSON</a></span>
+</footer>
+
+<script>
+(() => {
+  const fmt = (n) => {
+    if (n == null) return '–';
+    if (n === 0) return '0';
+    return new Intl.NumberFormat('en-US').format(n);
+  };
+  const pct = (n) => (n == null ? '–' : n.toFixed(2) + '%');
+  const fmtBytes = (n) => {
+    if (n == null) return '–';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0, v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v.toFixed(0) : v.toFixed(v < 10 ? 2 : v < 100 ? 1 : 0)) + ' ' + units[i];
+  };
+  const fmtDate = (s) => {
+    if (!s) return null;
+    const d = new Date(s);
+    if (isNaN(d)) return null;
+    // Compact yyyy-mm-dd; include time only when meaningful (recent).
+    const iso = d.toISOString();
+    return iso.slice(0, 10);
+  };
+  const fmtDateTime = (s) => {
+    if (!s) return null;
+    const d = new Date(s);
+    if (isNaN(d)) return null;
+    return d.toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  };
+  const formatEta = (secs) => {
+    if (!isFinite(secs) || secs < 0) return '–';
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    if (h >= 24) {
+      const d = Math.floor(h / 24);
+      return `${d}d ${h % 24}h`;
+    }
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  };
+
+  const el = (tag, attrs = {}, ...children) => {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === 'style') Object.assign(e.style, v);
+      else if (k.startsWith('on')) e[k] = v;
+      else e.setAttribute(k, v);
+    }
+    for (const c of children) {
+      if (c == null) continue;
+      e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    }
+    return e;
+  };
+
+  const tooltip = document.getElementById('tooltip');
+  function showTooltip(e, html) {
+    tooltip.className = 'tooltip';
+    tooltip.innerHTML = html;
+    tooltip.style.display = 'block';
+    tooltip.style.left = (e.clientX) + 'px';
+    tooltip.style.top = (e.clientY - 10) + 'px';
+  }
+  function showInfoTooltip(e, text) {
+    // Format plain text with blank-line paragraph breaks so multi-paragraph
+    // explanations read nicely inside the overlay.
+    const html = text.split(/\n\s*\n/).map(p =>
+      `<p>${p.replace(/\n/g, '<br>').replace(/</g, '&lt;')}</p>`
+    ).join('');
+    tooltip.className = 'tooltip info-tooltip';
+    tooltip.innerHTML = html;
+    tooltip.style.display = 'block';
+    // Position above the hovered element, clamped to viewport.
+    const rect = e.currentTarget.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    tooltip.style.left = Math.min(Math.max(cx, 180), window.innerWidth - 180) + 'px';
+    tooltip.style.top = (rect.top - 8) + 'px';
+  }
+  function hideTooltip() { tooltip.style.display = 'none'; }
+
+  // Delegate tooltip handling from the document root — works even when
+  // cards are created after page load, and keeps the per-card code
+  // tooltip-free. Any element with data-tooltip="…" triggers the overlay.
+  document.addEventListener('mouseover', (e) => {
+    const t = e.target.closest('[data-tooltip]');
+    if (!t) return;
+    showInfoTooltip({ currentTarget: t, clientX: e.clientX, clientY: e.clientY },
+      t.getAttribute('data-tooltip'));
+  });
+  document.addEventListener('mouseout', (e) => {
+    const t = e.target.closest('[data-tooltip]');
+    if (t) hideTooltip();
+  });
+
+  // Top cards: DOM is built on first render, then the SAME elements have
+  // their text nodes rewritten on every poll. No innerHTML thrash.
+  const topCardRefs = new Map(); // key -> { root, v, s }
+  function cardRefs(key, label) {
+    let refs = topCardRefs.get(key);
+    if (refs) return refs;
+    const v = el('div', { class: 'v' });
+    const s = el('div', { class: 's' });
+    const root = el('div', { class: 'card' }, el('h2', {}, label), v, s);
+    document.getElementById('stat-cards').appendChild(root);
+    refs = { root, v, s };
+    topCardRefs.set(key, refs);
+    return refs;
+  }
+  function setCard(key, label, value, sub) {
+    const r = cardRefs(key, label);
+    r.v.textContent = value;
+    r.s.textContent = sub || '';
+    r.s.style.display = sub ? '' : 'none';
+  }
+
+  function renderCards(s) {
+    const indexedHeight = (s.handlers || []).reduce((max, h) => {
+      if (!h.ranges || !h.ranges.length) return max;
+      const top = h.ranges[h.ranges.length - 1].to;
+      return top > max ? top : max;
+    }, 0);
+    const behindTip = indexedHeight && s.tip ? (s.tip - indexedHeight) : null;
+
+    const bps = s.blocks_per_sec || 0;
+    const bpsValue = bps > 0 ? (bps < 1 ? bps.toFixed(2) : bps.toFixed(1)) : '–';
+    let bpsSub = null;
+    if (bps > 0 && behindTip != null && behindTip > 0) {
+      bpsSub = 'ETA to tip: ' + formatEta(behindTip / bps);
+    } else if (bps > 0 && behindTip != null && behindTip <= 0) {
+      bpsSub = 'caught up — following tip';
+    }
+
+    // Rows across every handler's tables, used to show a bytes-per-row
+    // density alongside total DB size.
+    const rowTotal = (s.handlers || []).reduce((n, h) => {
+      const rc = h.row_counts || {};
+      return n + Object.values(rc).reduce((a, b) => a + b, 0);
+    }, 0);
+    const bytesPerRow = rowTotal > 0 && s.db_size_bytes ? (s.db_size_bytes / rowTotal) : null;
+
+    setCard('chain',  'Chain',         s.chain_id || '–', null);
+    setCard('tip',    'Tip',           fmt(s.tip), s.tip_time ? fmtDateTime(s.tip_time) : null);
+    setCard('bps',    'Blocks / sec',  bpsValue,
+      bpsSub || (behindTip != null ? `${fmt(behindTip)} blocks behind tip` : null));
+    setCard('dbsize', 'Database size', fmtBytes(s.db_size_bytes || 0),
+      bytesPerRow ? `≈ ${bytesPerRow.toFixed(0)} B / row · ${fmt(rowTotal)} rows` : null);
+    setCard('start',  'Start height',  fmt(s.start_height), null);
+    setCard('end',    'End height',    s.end_height === 0 ? '(follow tip)' : fmt(s.end_height), null);
+  }
+
+  async function fetchHistory(url) {
+    try {
+      const r = await fetch('/api/history?url=' + encodeURIComponent(url));
+      if (!r.ok) return [];
+      return await r.json();
+    } catch (_) { return []; }
+  }
+
+  // Minimal SVG sparkline. Fits to width, 60px tall, matches CSS.
+  function sparkline(values, { color = '#6ee7b7', fill = true, min, max } = {}) {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    svg.setAttribute('viewBox', '0 0 100 100');
+    if (!values.length) return svg;
+    const lo = min != null ? min : Math.min(...values);
+    const hi = max != null ? max : Math.max(...values);
+    const span = (hi - lo) || 1;
+    const xs = values.map((_, i) => (i / Math.max(1, values.length - 1)) * 100);
+    const ys = values.map(v => 100 - ((v - lo) / span) * 95 - 2.5);
+    const d = xs.map((x, i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(2)},${ys[i].toFixed(2)}`).join(' ');
+    if (fill) {
+      const fillD = d + ` L100,100 L0,100 Z`;
+      const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      p.setAttribute('d', fillD); p.setAttribute('fill', color); p.setAttribute('fill-opacity', '0.15'); p.setAttribute('stroke', 'none');
+      svg.appendChild(p);
+    }
+    const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    p.setAttribute('d', d); p.setAttribute('fill', 'none'); p.setAttribute('stroke', color); p.setAttribute('stroke-width', '1.5');
+    svg.appendChild(p);
+    return svg;
+  }
+
+  // Compact endpoint list shown on Overview (just health + URL + coverage —
+  // no live metrics here; they live on the Endpoints tab). Updates in place:
+  // each endpoint is a stable DOM row keyed by URL so repolling doesn't make
+  // the UI twitch.
+  const overviewRows = new Map(); // url -> refs
+  function renderEndpointsOverview(s) {
+    const container = document.getElementById('endpoints');
+    const eps = s.endpoints || [];
+    // Drop rows whose endpoint is gone.
+    for (const [url, row] of overviewRows) {
+      if (!eps.find(e => e.url === url)) {
+        row.root.remove();
+        overviewRows.delete(url);
+      }
+    }
+    if (!eps.length) {
+      if (!overviewRows.has('__empty__')) {
+        const root = el('div', { style: { color: 'var(--muted)', fontSize: '11px' } },
+          'no endpoints configured');
+        container.appendChild(root);
+        overviewRows.set('__empty__', { root });
+      }
+      return;
+    }
+    overviewRows.delete('__empty__');
+
+    for (const e of eps) {
+      let row = overviewRows.get(e.url);
+      if (!row) {
+        const mark = el('span', {});
+        const kind = el('span', { class: 'kind-badge' });
+        const url = el('span', { class: 'url', title: e.url }, e.url);
+        const earliest = el('span', { class: 'range' });
+        const latest = el('span', { class: 'range' });
+        const root = el('div', { class: 'ep' }, mark, kind, url, earliest, latest);
+        container.appendChild(root);
+        row = { root, mark, kind, url, earliest, latest };
+        overviewRows.set(e.url, row);
+      }
+      row.mark.className = e.disabled ? 'bad' : 'ok';
+      row.mark.textContent = e.disabled ? '✗' : '✓';
+      const k = (e.kind || '').toLowerCase();
+      row.kind.className = 'kind-badge ' + (k === 'rpc' ? 'kind-rpc' : k === 'rest' ? 'kind-rest' : 'kind-unknown');
+      row.kind.textContent = k || '?';
+      const ef = e.earliest_time ? fmtDate(e.earliest_time) : null;
+      const lf = e.latest_time ? fmtDate(e.latest_time) : null;
+      row.earliest.innerHTML = `earliest <b>${fmt(e.earliest || 0)}</b>${ef ? ' · ' + ef : ''}`;
+      row.latest.innerHTML = `latest <b>${fmt(e.latest || 0)}</b>${lf ? ' · ' + lf : ''}`;
+    }
+  }
+
+  // Detailed per-endpoint view. Cards are built ONCE per URL, cached, and
+  // on every refresh only their text / SVG path attributes are rewritten.
+  // No DOM reflow, no sparkline flicker.
+  const BUDGET_TOOLTIP =
+    "Adaptive concurrency cap for this endpoint.\n\n" +
+    "An AIMD (additive-increase, multiplicative-decrease) controller watches " +
+    "p50/p99 latency and error rate, and adjusts this budget so we push the " +
+    "node as hard as it can take without the tail latency or errors blowing up.\n\n" +
+    "Grows (+2) when p99 < 3× p50, utilisation ≥ 70%, and errors < 1%.\n" +
+    "Shrinks (×0.75) when p99 > 8× p50 or error rate ≥ 5%.\n\n" +
+    "Clamped to [min, max]. The first 20 requests after startup are treated " +
+    "as warm-up and don't trigger shrinks so cold TLS/TCP handshakes can't " +
+    "collapse the budget.";
+  const INFLIGHT_TOOLTIP =
+    "Requests currently waiting for this endpoint to respond. 'peak' is the " +
+    "high-water mark since this process started.";
+  const RPS_TOOLTIP =
+    "Completed requests per second, averaged over the last 60 seconds. " +
+    "With N concurrent workers averaging L seconds/request, this equals N/L — " +
+    "so 16 workers × 0.5 s latency ≈ 32 req/s.";
+  const LATENCY_TOOLTIP =
+    "Latency percentiles over the last ~500 completed requests.\n" +
+    "p50 is typical.\n" +
+    "p95 tells you what a slow request looks like under normal load.\n" +
+    "p99 is the worst-case tail.\n\n" +
+    "A p99 much higher than p50 means requests are queueing on the node.";
+  const ERRORS_TOOLTIP =
+    "HTTP / RPC failures divided by total requests. Anything persistently " +
+    "above 1 % makes the adaptive controller pull back.";
+
+  const detailCards = new Map(); // url -> refs
+
+  async function renderEndpointsDetail(s) {
+    const container = document.getElementById('endpoints-detail');
+    const eps = s.endpoints || [];
+
+    for (const [url, card] of detailCards) {
+      if (!eps.find(e => e.url === url)) {
+        card.root.remove();
+        detailCards.delete(url);
+      }
+    }
+
+    if (!eps.length) {
+      if (!detailCards.has('__empty__')) {
+        container.innerHTML = '';
+        const root = el('div', { class: 'card' }, 'no endpoints configured');
+        container.appendChild(root);
+        detailCards.set('__empty__', { root });
+      }
+      return;
+    }
+    const emptyRef = detailCards.get('__empty__');
+    if (emptyRef) { emptyRef.root.remove(); detailCards.delete('__empty__'); }
+
+    for (const e of eps) {
+      let card = detailCards.get(e.url);
+      if (!card) {
+        card = buildDetailCard(e.url);
+        container.appendChild(card.root);
+        detailCards.set(e.url, card);
+      }
+      updateDetailCard(card, e);
+      fetchHistory(e.url).then(history => updateSparks(card, history));
+    }
+  }
+
+  function buildDetailCard(url) {
+    const mark = el('span', {});
+    const kind = el('span', { class: 'kind-badge' });
+    const urlSpan = el('span', { class: 'url' }, url);
+    const coverage = el('span', { class: 'coverage' });
+    const chevron = el('span', { class: 'chevron' }, '▾');
+    const head = el('div', { class: 'ep-card-head' }, mark, kind, urlSpan, coverage, chevron);
+
+    const budget   = makeStatCard('Budget',   BUDGET_TOOLTIP);
+    const inflight = makeStatCard('In flight', INFLIGHT_TOOLTIP);
+    const rps      = makeStatCard('Req / s', RPS_TOOLTIP);
+    const latency  = makeStatCard('p50 / p95 / p99', LATENCY_TOOLTIP);
+    const errors   = makeStatCard('Errors', ERRORS_TOOLTIP);
+    const stats = el('div', { class: 'ep-card-row' },
+      budget.root, inflight.root, rps.root, latency.root, errors.root);
+
+    const sparks = {
+      rps:      makeSparkBox('Throughput · req/s', '#6ee7b7', v => v.toFixed(1)),
+      p99:      makeSparkBox('p99 latency · ms',   '#f59e0b', v => v.toFixed(0) + 'ms'),
+      budget:   makeSparkBox('Adaptive budget',    '#8b5cf6', v => String(Math.round(v))),
+      inflight: makeSparkBox('In-flight',          '#60a5fa', v => String(Math.round(v))),
+    };
+    const charts = el('div', { class: 'sparkline-block' },
+      sparks.rps.root, sparks.p99.root, sparks.budget.root, sparks.inflight.root);
+
+    const root = el('div', { class: 'ep-card' }, head, stats, charts);
+
+    // Collapsible: toggle state on head click, persist per URL in
+    // localStorage so page reloads remember your layout.
+    const storeKey = 'ep-collapsed:' + url;
+    if (localStorage.getItem(storeKey) === '1') root.classList.add('collapsed');
+    head.addEventListener('click', () => {
+      root.classList.toggle('collapsed');
+      localStorage.setItem(storeKey, root.classList.contains('collapsed') ? '1' : '0');
+    });
+
+    return { root, mark, kind, urlSpan, coverage, budget, inflight, rps, latency, errors, sparks };
+  }
+
+  function updateDetailCard(card, e) {
+    const m = e.metrics || {};
+    card.mark.className = e.disabled ? 'bad' : 'ok';
+    card.mark.textContent = e.disabled ? '✗' : '✓';
+    const k = (e.kind || '').toLowerCase();
+    card.kind.className = 'kind-badge ' + (k === 'rpc' ? 'kind-rpc' : k === 'rest' ? 'kind-rest' : 'kind-unknown');
+    card.kind.textContent = k || '?';
+    card.urlSpan.textContent = e.url;
+    const ef = e.earliest_time ? fmtDate(e.earliest_time) : null;
+    const lf = e.latest_time ? fmtDate(e.latest_time) : null;
+    card.coverage.textContent =
+      `${fmt(e.earliest || 0)} → ${fmt(e.latest || 0)}${ef ? '  ·  ' + ef : ''}${lf ? ' → ' + lf : ''}`;
+
+    setStat(card.budget,   String(m.budget || 0),       'max concurrent · AIMD', '');
+    setStat(card.inflight, `${m.in_flight || 0} / ${m.max_in_flight || 0}`, 'now / peak', '');
+    setStat(card.rps,      (m.requests_per_sec || 0).toFixed(1), 'completed, rolling 60s', '');
+    const p99cls = (m.latency_p99_ms || 0) > ((m.latency_p50_ms || 0) * 5 + 500) ? 'bad'
+                 : (m.latency_p99_ms || 0) > ((m.latency_p50_ms || 0) * 3 + 200) ? 'warn' : '';
+    const fmtMs = v => (v || 0).toFixed(0);
+    setStat(card.latency,
+      `${fmtMs(m.latency_p50_ms)} / ${fmtMs(m.latency_p95_ms)} / ${fmtMs(m.latency_p99_ms)}ms`,
+      'latency', p99cls);
+    const errRate = m.total_requests > 0 ? m.total_errors / m.total_requests : 0;
+    const errCls = errRate > 0.01 ? 'bad' : m.total_errors > 0 ? 'warn' : '';
+    setStat(card.errors, `${fmt(m.total_errors || 0)} / ${fmt(m.total_requests || 0)}`,
+      (errRate*100).toFixed(2) + '% err rate', errCls);
+  }
+
+  function updateSparks(card, history) {
+    setSpark(card.sparks.rps,      history.map(s => s.requests_per_sec), v => v.toFixed(1));
+    setSpark(card.sparks.p99,      history.map(s => s.latency_p99_ms),   v => v.toFixed(0) + 'ms');
+    setSpark(card.sparks.budget,   history.map(s => s.budget),           v => String(v));
+    setSpark(card.sparks.inflight, history.map(s => s.in_flight),        v => String(v));
+  }
+
+  function makeStatCard(label, tooltip) {
+    const info = tooltip ? el('span', { class: 'info', 'data-tooltip': tooltip }, '?') : null;
+    const labelEl = el('div', { class: 'label' }, label, info);
+    const valueEl = el('div', { class: 'value' });
+    const subEl = el('div', { class: 'label' });
+    const root = el('div', { class: 'ep-stat' }, labelEl, valueEl, subEl);
+    return { root, labelEl, valueEl, subEl };
+  }
+  const AIMD_TOOLTIP =
+    "AIMD = Additive Increase, Multiplicative Decrease.\n\n" +
+    "A classic congestion-control technique (TCP Reno uses a version of " +
+    "it). The idea: when the system looks healthy, nudge the concurrency " +
+    "up by a small constant (+2 here). When it looks stressed, yank it " +
+    "down by a factor (×0.75 here).\n\n" +
+    "This asymmetry — slow up, fast down — is what keeps the controller " +
+    "probing for more capacity during calm and getting out of the way " +
+    "fast during a problem.";
+
+  function setStat(entry, value, sub, cls) {
+    entry.root.className = 'ep-stat' + (cls ? ' ' + cls : '');
+    entry.valueEl.textContent = value;
+    entry.subEl.innerHTML = '';
+    if (!sub) return;
+    // Render 'AIMD' as a hoverable term inside the sub-line.
+    const parts = sub.split(/\b(AIMD)\b/);
+    for (const p of parts) {
+      if (p === 'AIMD') {
+        entry.subEl.appendChild(el('span', { class: 'acronym', 'data-tooltip': AIMD_TOOLTIP }, 'AIMD'));
+      } else if (p) {
+        entry.subEl.appendChild(document.createTextNode(p));
+      }
+    }
+  }
+
+  // Mini-chart builder in a standard 3-band layout:
+  //   [ y-ticks · plot SVG ]
+  //   [            x-ticks ]
+  // The y-axis has 4 tick values at 0 / 33 / 66 / 100 %. Starting from 0
+  // is the Grafana-default convention — makes absolute magnitudes legible
+  // at a glance and stops small variations from dominating the chart.
+  function makeSparkBox(title, color, fmtAxis) {
+    const titleLabel = el('span', {}, title);
+    const currentLabel = el('b', {}, '—');
+    const titleRow = el('div', { class: 'title' }, titleLabel, currentLabel);
+
+    const yticks = el('div', { class: 'yticks' });
+    const ytickEls = [0, 1, 2, 3].map(() => {
+      const n = el('span', {}, '');
+      yticks.appendChild(n);
+      return n;
+    });
+
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(svgNS, 'svg');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    svg.setAttribute('viewBox', '0 0 100 100');
+
+    // Horizontal grid at 0/33/66/100 % to match the y-tick positions.
+    const grid = document.createElementNS(svgNS, 'g');
+    [0, 33.33, 66.66, 100].forEach(y => {
+      const ln = document.createElementNS(svgNS, 'line');
+      ln.setAttribute('x1', 0); ln.setAttribute('x2', 100);
+      ln.setAttribute('y1', y.toFixed(2)); ln.setAttribute('y2', y.toFixed(2));
+      ln.setAttribute('class', y === 100 ? 'axis-bottom' : 'gridline');
+      grid.appendChild(ln);
+    });
+
+    const fill = document.createElementNS(svgNS, 'path');
+    fill.setAttribute('fill', color);
+    fill.setAttribute('class', 'series-fill');
+    const line = document.createElementNS(svgNS, 'path');
+    line.setAttribute('stroke', color);
+    line.setAttribute('class', 'series-line');
+
+    svg.appendChild(grid);
+    svg.appendChild(fill);
+    svg.appendChild(line);
+
+    const chart = el('div', { class: 'chart' }, svg);
+    const plot = el('div', { class: 'plot' }, yticks, chart);
+
+    const xaxisLeft = el('span', {}, '—');
+    const xaxisMid = el('span', {}, '');
+    const xaxisRight = el('span', {}, 'now');
+    const xticks = el('div', { class: 'xticks' }, xaxisLeft, xaxisMid, xaxisRight);
+
+    const root = el('div', { class: 'sparkline' }, titleRow, plot, xticks);
+    return { root, svg, fill, line, currentLabel, ytickEls, yticks, xaxisLeft, xaxisMid, xaxisRight, fmtAxis };
+  }
+
+  function setSpark(box, values, fmtCurrent) {
+    const fmtAxis = box.fmtAxis || fmtCurrent;
+
+    if (!values.length) {
+      box.fill.setAttribute('d', '');
+      box.line.setAttribute('d', '');
+      box.currentLabel.textContent = '—';
+      box.ytickEls.forEach(n => (n.textContent = ''));
+      box.xaxisLeft.textContent = '—';
+      box.xaxisMid.textContent = '';
+      return;
+    }
+
+    // Scale starts at 0 (standard chart convention) and extends to at least
+    // the max sample. Small headroom so the series doesn't hit the ceiling.
+    const hi = Math.max(...values);
+    const rangeHi = hi <= 0 ? 1 : hi * 1.05;
+    const lo = 0;
+    const span = rangeHi - lo;
+
+    const xs = values.map((_, i) => (i / Math.max(1, values.length - 1)) * 100);
+    const ys = values.map(v => 100 - ((v - lo) / span) * 100);
+    const lineD = xs.map((x, i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(2)},${ys[i].toFixed(2)}`).join(' ');
+    box.line.setAttribute('d', lineD);
+    box.fill.setAttribute('d', lineD + ` L100,100 L0,100 Z`);
+
+    // Y-axis ticks: 4 values distributed top→bottom. Flexbox handles the
+    // placement (space-between on a column flex), so we only have to set
+    // the text content.
+    [100, 66.66, 33.33, 0].forEach((pct, i) => {
+      const v = lo + pct / 100 * span;
+      box.ytickEls[i].textContent = fmtAxis(v);
+    });
+
+    box.currentLabel.textContent = fmtCurrent(values[values.length - 1]);
+
+    const seconds = (values.length - 1) * 3;
+    const formatAgo = secs => secs < 60 ? `-${secs}s` : `-${Math.round(secs / 60)}m`;
+    box.xaxisLeft.textContent = formatAgo(seconds);
+    box.xaxisMid.textContent = formatAgo(Math.round(seconds / 2));
+  }
+
+  // Lightweight copy of the timeline's heightToDate logic, used for the
+  // top-of-page cards before renderHandlers runs.
+  function heightToDateForCard(s, h) {
+    if (!s.tip_time) return null;
+    const tipDate = new Date(s.tip_time);
+    let ae = null, aeH = null;
+    (s.endpoints || []).forEach(e => {
+      if (!e.earliest_time) return;
+      const d = new Date(e.earliest_time);
+      if (!ae || d < ae) { ae = d; aeH = e.earliest; }
+    });
+    if (ae && aeH && aeH < s.tip) {
+      const r = (h - aeH) / (s.tip - aeH);
+      return new Date(ae.getTime() + r * (tipDate - ae));
+    }
+    return new Date(tipDate.getTime() - (s.tip - h) * 30_000);
+  }
+
+  // Handler cards: build once per handler name, update in place.
+  const handlerCards = new Map(); // name -> refs
+
+  function renderHandlers(s) {
+    const container = document.getElementById('handlers');
+    const handlers = s.handlers || [];
+    // Remove cards for handlers that no longer exist.
+    for (const [name, h] of handlerCards) {
+      if (!handlers.find(hh => hh.name === name)) {
+        h.root.remove();
+        handlerCards.delete(name);
+      }
+    }
+
+    // Timeline spans the WHOLE chain: genesis → current tip. The user's
+    // configured indexing window [start_height, end_height|tip] is shown as
+    // a dashed rectangle overlay so you can see both where you've chosen
+    // to index and where that sits within all of history.
+    const genesis = s.chain_genesis || 1;
+    const tip = s.tip || 1;
+    const windowStart = s.start_height;
+    const windowEnd = s.end_height === 0 ? tip : s.end_height;
+
+    // Use the endpoint probe's tip time and earliest endpoint time as axis
+    // anchors for block-height → date interpolation. If only tip_time is
+    // available, linearly extrapolate backward with Lava's ~30s block time.
+    const tipDate = s.tip_time ? new Date(s.tip_time) : null;
+    let anchorEarliest = null, anchorEarliestHeight = null;
+    (s.endpoints || []).forEach(e => {
+      if (!e.earliest_time) return;
+      if (!anchorEarliest || new Date(e.earliest_time) < anchorEarliest) {
+        anchorEarliest = new Date(e.earliest_time);
+        anchorEarliestHeight = e.earliest;
+      }
+    });
+    // heightToDate(h) — returns Date or null
+    const heightToDate = (h) => {
+      if (!tipDate) return null;
+      if (anchorEarliest && anchorEarliestHeight && anchorEarliestHeight < tip) {
+        const ratio = (h - anchorEarliestHeight) / (tip - anchorEarliestHeight);
+        return new Date(anchorEarliest.getTime() + ratio * (tipDate - anchorEarliest));
+      }
+      // Fallback: assume 30s/block from tip backwards (Lava approx).
+      const ms = (tip - h) * 30_000;
+      return new Date(tipDate.getTime() - ms);
+    };
+
+    const genesisDate = s.chain_genesis_time ? fmtDateTime(s.chain_genesis_time) : null;
+    (s.handlers || []).forEach(h => {
+      let card = handlerCards.get(h.name);
+      if (!card) { card = buildHandlerCard(h); document.getElementById('handlers').appendChild(card.root); handlerCards.set(h.name, card); }
+      updateHandlerCard(card, h, s, genesis, tip, windowStart, windowEnd, tipDate, genesisDate, heightToDate);
+    });
+  }
+
+  function buildHandlerCard(h) {
+    const name = el('div', { class: 'handler-name' }, h.name);
+    const types = el('div', { class: 'handler-types' });
+    const winPct = el('div', { class: 'win' });
+    const chainPct = el('div', { class: 'chain' });
+    const pctNode = el('div', { class: 'handler-pct' }, winPct, chainPct);
+    const head = el('div', { class: 'handler-head' }, name, types, pctNode);
+
+    const rowCounts = el('div', { class: 'handler-row-counts' });
+    const dates = el('div', { class: 'handler-dates' });
+
+    const windowOverlay = el('div', { class: 'window' });
+    const segments = el('div', { style: { position: 'absolute', inset: '0' } });
+    const failures = el('div', { style: { position: 'absolute', inset: '0' } });
+    const tipMarker = el('div', { class: 'tip-marker' });
+    const timeline = el('div', { class: 'timeline' }, windowOverlay, segments, failures, tipMarker);
+
+    const axisHeightL = el('span', { class: 'height' });
+    const axisDateL   = el('span', { class: 'date' });
+    const axisLeft = el('div', { class: 'end' }, axisHeightL, el('span', { class: 'label' }, 'genesis'), axisDateL);
+    const axisHeightR = el('span', { class: 'height' });
+    const axisDateR   = el('span', { class: 'date' });
+    const axisRight = el('div', { class: 'end right' }, axisHeightR, el('span', { class: 'label' }, 'tip'), axisDateR);
+    const axis = el('div', { class: 'axis' }, axisLeft, axisRight);
+    const timelineWrap = el('div', { class: 'timeline-wrap' }, timeline, axis);
+
+    const summary = el('summary', {});
+    const list = el('div', { class: 'list' });
+    const rangesDetail = el('details', { class: 'ranges-detail' }, summary, list);
+
+    const root = el('div', { class: 'handler' }, head, rowCounts, dates, timelineWrap, rangesDetail);
+    return {
+      root, name, types, winPct, chainPct, rowCounts, dates,
+      timeline, windowOverlay, segments, failures, tipMarker,
+      axisHeightL, axisDateL, axisHeightR, axisDateR,
+      summary, list,
+    };
+  }
+
+  function updateHandlerCard(card, h, s, genesis, tip, windowStart, windowEnd, tipDate, genesisDate, heightToDate) {
+    const total = Math.max(1, tip - genesis + 1);
+    card.name.textContent = h.name;
+    card.types.textContent = (h.event_types || []).join(', ');
+    card.winPct.textContent = pct(h.window_pct) + ' window';
+    card.chainPct.textContent = pct(h.chain_pct) + ' chain';
+
+    const rowCounts = h.row_counts || {};
+    const rowCountsText = Object.entries(rowCounts).map(([t, n]) => `${t}: ${fmt(n)}`).join('   ');
+    card.rowCounts.textContent = rowCountsText ? '≈ ' + rowCountsText : '';
+    card.rowCounts.style.display = rowCountsText ? '' : 'none';
+
+    const dataFrom = h.data_from ? fmtDateTime(h.data_from) : null;
+    const dataTo   = h.data_to   ? fmtDateTime(h.data_to)   : null;
+    if (dataFrom && dataTo) {
+      card.dates.innerHTML = `covers <b>${dataFrom}</b> → <b>${dataTo}</b>`;
+      card.dates.style.display = '';
+    } else {
+      card.dates.style.display = 'none';
+    }
+
+    if (windowStart >= genesis && windowStart <= tip) {
+      const left = ((windowStart - genesis) / total) * 100;
+      const width = ((Math.min(windowEnd, tip) - windowStart + 1) / total) * 100;
+      card.windowOverlay.style.display = '';
+      card.windowOverlay.style.left = left + '%';
+      card.windowOverlay.style.width = width + '%';
+    } else {
+      card.windowOverlay.style.display = 'none';
+    }
+
+    const ranges = h.ranges || [];
+    const children = card.segments.children;
+    while (children.length > ranges.length) card.segments.removeChild(children[children.length - 1]);
+    ranges.forEach((r, i) => {
+      const from = Math.max(r.from, genesis);
+      const to = Math.min(r.to, tip);
+      if (to < from) { if (children[i]) children[i].style.display = 'none'; return; }
+      const left = ((from - genesis) / total) * 100;
+      const width = ((to - from + 1) / total) * 100;
+      let seg = children[i];
+      if (!seg) {
+        seg = document.createElement('div');
+        seg.className = 'covered';
+        seg.addEventListener('mouseleave', hideTooltip);
+        card.segments.appendChild(seg);
+      }
+      seg.style.display = '';
+      seg.style.left = left + '%';
+      seg.style.width = width + '%';
+      seg.onmousemove = (e) => {
+        const dFrom = fmtDate(heightToDate(from));
+        const dTo = fmtDate(heightToDate(to));
+        const dateLine = dFrom ? `<br><span style="color:#6b7a99">${dFrom} → ${dTo}</span>` : '';
+        showTooltip(e, `covered: <b>${fmt(from)}</b> → <b>${fmt(to)}</b> (${fmt(to-from+1)} blocks)${dateLine}`);
+      };
+    });
+
+    // Failed ranges: red segments layered above the green ones. Dead-
+    // lettered heights are still gaps in indexer_ranges, so they aren't
+    // in `ranges` above — we paint them separately to flag holes clearly.
+    const failed = h.failed_ranges || [];
+    const fchildren = card.failures.children;
+    while (fchildren.length > failed.length) card.failures.removeChild(fchildren[fchildren.length - 1]);
+    failed.forEach((r, i) => {
+      const from = Math.max(r.from, genesis);
+      const to = Math.min(r.to, tip);
+      if (to < from) { if (fchildren[i]) fchildren[i].style.display = 'none'; return; }
+      const left = ((from - genesis) / total) * 100;
+      const width = Math.max(0.3, ((to - from + 1) / total) * 100); // min 0.3% so single heights still show
+      let seg = fchildren[i];
+      if (!seg) {
+        seg = document.createElement('div');
+        seg.className = 'failed';
+        seg.addEventListener('mouseleave', hideTooltip);
+        card.failures.appendChild(seg);
+      }
+      seg.style.display = '';
+      seg.style.left = left + '%';
+      seg.style.width = width + '%';
+      seg.onmousemove = (e) => {
+        const dFrom = fmtDate(heightToDate(from));
+        const dTo = fmtDate(heightToDate(to));
+        const dateLine = dFrom ? `<br><span style="color:#6b7a99">${dFrom}${dFrom !== dTo ? ' → ' + dTo : ''}</span>` : '';
+        const cnt = to - from + 1;
+        showTooltip(e, `FAILED · ${cnt} block${cnt === 1 ? '' : 's'}  <b>${fmt(from)}${from !== to ? ' → ' + fmt(to) : ''}</b>${dateLine}<br><span style="color:#ef4444">retry next run</span>`);
+      };
+    });
+
+    if (tip >= genesis) {
+      card.tipMarker.style.display = '';
+      card.tipMarker.style.left = (((tip - genesis) / total) * 100) + '%';
+    } else {
+      card.tipMarker.style.display = 'none';
+    }
+
+    if (!card.timeline.__hoverBound) {
+      card.timeline.addEventListener('mousemove', (e) => {
+        if (e.target.classList.contains('covered')) return;
+        const rect = card.timeline.getBoundingClientRect();
+        const x = (e.clientX - rect.left) / rect.width;
+        const heightVal = Math.round(genesis + x * total);
+        const d = fmtDate(heightToDate(heightVal));
+        const dateLine = d ? `<br><span style="color:#6b7a99">${d}</span>` : '';
+        showTooltip(e, `block <b>${fmt(heightVal)}</b>${dateLine}`);
+      });
+      card.timeline.addEventListener('mouseleave', hideTooltip);
+      card.timeline.__hoverBound = true;
+    }
+
+    card.axisHeightL.textContent = fmt(genesis);
+    card.axisDateL.textContent = genesisDate || '';
+    card.axisDateL.style.display = genesisDate ? '' : 'none';
+    card.axisHeightR.textContent = fmt(tip);
+    const tipDateText = tipDate ? fmtDateTime(tipDate.toISOString()) : '';
+    card.axisDateR.textContent = tipDateText;
+    card.axisDateR.style.display = tipDateText ? '' : 'none';
+
+    card.summary.textContent = `${ranges.length} covered ranges, ${(h.gaps || []).length} gap${(h.gaps||[]).length === 1 ? '' : 's'}`;
+    card.list.innerHTML = '';
+    ranges.forEach(r => card.list.appendChild(el('span', {}, `${fmt(r.from)} → ${fmt(r.to)}`)));
+    (h.gaps || []).forEach(r => card.list.appendChild(el('span', { class: 'gap' }, `gap ${fmt(r.from)} → ${fmt(r.to)}`)));
+  }
+
+  function renderHeader(s) {
+    document.getElementById('chain').textContent = s.chain_id || '';
+    const endpoints = s.endpoints || [];
+    const healthy = endpoints.filter(e => !e.disabled).length;
+    const pill = document.getElementById('endpoint-pill');
+    pill.textContent = `${healthy}/${endpoints.length} endpoints healthy`;
+    pill.className = 'pill ' + (healthy === 0 ? 'warn' : healthy < endpoints.length ? 'warn' : 'good');
+    document.getElementById('updated').textContent = 'updated ' + new Date(s.generated_at).toLocaleTimeString();
+  }
+
+  let currentView = 'overview';
+  document.querySelectorAll('#tabs button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      currentView = btn.dataset.view;
+      document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('active', b === btn));
+      document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + currentView));
+      refresh();
+    });
+  });
+
+  // Tiny discovery endpoint: show the GraphQL tab only if the server's
+  // reverse-proxy is wired up.
+  fetch('/api/ui-config').then(r => r.json()).then(cfg => {
+    if (cfg.graphql_enabled) {
+      document.getElementById('tab-graphql').style.display = '';
+    }
+  }).catch(() => {});
+
+  async function refresh() {
+    try {
+      const r = await fetch('/api/status');
+      if (!r.ok) throw new Error(r.status);
+      const s = await r.json();
+      renderHeader(s);
+      renderCards(s);
+      renderEndpointsOverview(s);
+      renderHandlers(s);
+      if (currentView === 'endpoints') await renderEndpointsDetail(s);
+    } catch (err) {
+      console.error(err);
+    }
+  }
+  refresh();
+  setInterval(refresh, 3000);
+})();
+</script>
+</body>
+</html>
