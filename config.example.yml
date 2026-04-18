@@ -98,6 +98,12 @@ indexer:
   # larger = faster drain.
   failure_retry_batch: 200
 
+  # Retry cap for transient dead-letter entries. When a row's retries hits
+  # this cap, the pipeline flips it to permanent and the sweep stops
+  # picking it up. Prevents the dead-letter pool from cycling the same
+  # heights forever.
+  failure_max_retries: 5
+
   # If true, on startup delete indexer_ranges + indexer_failures rows for
   # heights OUTSIDE [start_height, end_height|tip]. Useful when narrowing
   # start_height after a previous wider run — otherwise the stale state

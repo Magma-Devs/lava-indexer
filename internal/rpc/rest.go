@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -121,6 +122,9 @@ func (c *RESTClient) fetchOne(ctx context.Context, height int64) (*Block, error)
 	}
 	path := fmt.Sprintf("/cosmos/base/tendermint/v1beta1/blocks/%d", height)
 	if err := c.getJSON(ctx, path, &hdr); err != nil {
+		if perr := classifyLCDStatus(err, height, c.baseURL); perr != nil {
+			return nil, perr
+		}
 		return nil, fmt.Errorf("header h=%d: %w", height, err)
 	}
 
@@ -139,6 +143,9 @@ func (c *RESTClient) fetchOne(ctx context.Context, height int64) (*Block, error)
 	}
 	path = fmt.Sprintf("/cosmos/tx/v1beta1/txs/block/%d?pagination.limit=1000", height)
 	if err := c.getJSON(ctx, path, &txs); err != nil {
+		if perr := classifyLCDStatus(err, height, c.baseURL); perr != nil {
+			return nil, perr
+		}
 		return nil, fmt.Errorf("txs h=%d: %w", height, err)
 	}
 
@@ -175,6 +182,23 @@ func (c *RESTClient) getJSON(ctx context.Context, path string, out any) error {
 		return fmt.Errorf("lcd %s: %w", path, err)
 	}
 	return json.Unmarshal(body, out)
+}
+
+// classifyLCDStatus inspects an error returned by getJSON and promotes
+// pruned-height signals to a typed *HeightPrunedError. Cosmos SDK LCD
+// answers with 400 or 404 for heights below the node's pruning horizon
+// (the exact body varies by SDK version, so we match on status alone).
+// Returns nil if the error isn't an HTTP status or isn't recognisable as
+// pruning — callers fall through to the generic error path.
+func classifyLCDStatus(err error, height int64, url string) error {
+	var hse *HTTPStatusError
+	if !errors.As(err, &hse) {
+		return nil
+	}
+	if hse.Status == http.StatusNotFound || hse.Status == http.StatusBadRequest {
+		return &HeightPrunedError{Height: height, URL: url, Status: hse.Status}
+	}
+	return nil
 }
 
 // retryableGet mirrors retryableCall but for GETs. Sharing would be nice
@@ -234,7 +258,14 @@ func retryableGet(ctx context.Context, httpc *http.Client, url string, extraHead
 			}
 			continue
 		}
-		return nil, fmt.Errorf("http %d", resp.StatusCode)
+		// 4xx other than 429 — terminal. Wrap so callers can classify
+		// pruned-height responses (Cosmos LCD returns 400/404 for blocks
+		// below the node's pruning horizon) without parsing strings.
+		return nil, &HTTPStatusError{
+			Status: resp.StatusCode,
+			Body:   truncate(string(data), 300),
+			URL:    url,
+		}
 	}
 	return nil, fmt.Errorf("exceeded %d retries: %w", maxRetries, lastErr)
 }

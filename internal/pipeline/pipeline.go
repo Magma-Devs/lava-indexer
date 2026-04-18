@@ -349,12 +349,17 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 	return g.Wait()
 }
 
-// processWithSplit runs processBatch. On a terminal failure it bisects the
-// range and retries each half, continuing down to size 1. Any size-1 range
-// that STILL fails is recorded in indexer_failures and skipped — its height
-// stays absent from indexer_ranges so the next indexer run picks it up
-// automatically. This turns a corrupt-block-on-one-node failure from a
-// process-killing error into an observable hole in the data.
+// processWithSplit runs processBatch. On a terminal transient failure it
+// bisects the range and retries each half, continuing down to size 1. A
+// size-1 range that STILL fails is recorded in indexer_failures and
+// skipped — its height stays absent from indexer_ranges so the next
+// indexer run picks it up automatically.
+//
+// Permanent failures short-circuit the bisect: if no endpoint covers the
+// range or the node has pruned the heights, splitting the range can't
+// change that — every sub-range will hit the same error. In that case
+// every height in [from, to] is recorded as permanent in one shot and
+// the function returns without bisecting.
 func (p *Pipeline) processWithSplit(ctx context.Context, from, to int64) error {
 	err := p.processBatch(ctx, from, to)
 	if err == nil {
@@ -363,11 +368,27 @@ func (p *Pipeline) processWithSplit(ctx context.Context, from, to int64) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	if from == to {
-		// single block and still failing → dead-letter and skip.
+	if isPermanentFetchError(err) {
 		reason := truncate(err.Error(), 250)
+		for h := from; h <= to; h++ {
+			for _, handler := range p.registry.All() {
+				if rerr := p.state.RecordPermanentFailure(ctx, handler.Name(), h, reason); rerr != nil {
+					slog.Warn("could not record permanent dead-letter", "height", h, "err", rerr)
+				}
+			}
+		}
+		slog.Error("permanent fetch failure, skipping bisect and recording range as dead-letter",
+			"from", from, "to", to, "err", reason)
+		return nil
+	}
+	if from == to {
+		// Single block and still failing transiently → dead-letter for the
+		// sweep to retry. RecordFailure flips the row to permanent when
+		// retries hit the configured cap so the sweep eventually stops.
+		reason := truncate(err.Error(), 250)
+		maxRetries := p.cfg.Indexer.FailureMaxRetries
 		for _, h := range p.registry.All() {
-			if rerr := p.state.RecordFailure(ctx, h.Name(), from, reason); rerr != nil {
+			if rerr := p.state.RecordFailure(ctx, h.Name(), from, reason, maxRetries); rerr != nil {
 				slog.Warn("could not record dead-letter", "height", from, "err", rerr)
 			}
 		}

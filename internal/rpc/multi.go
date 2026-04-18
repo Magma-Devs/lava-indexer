@@ -266,7 +266,7 @@ func (m *MultiClient) FetchBlocks(ctx context.Context, heights []int64) ([]*Bloc
 		eligible = append(eligible, ep)
 	}
 	if len(eligible) == 0 {
-		return nil, fmt.Errorf("no endpoint covers heights %d-%d", minH, maxH)
+		return nil, &NoEndpointCoversError{MinHeight: minH, MaxHeight: maxH}
 	}
 
 	// Wait up to ~5s for some endpoint to have budget headroom. This is the

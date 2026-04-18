@@ -1051,15 +1051,18 @@
     card.axisDateR.textContent = tipDateText;
     card.axisDateR.style.display = tipDateText ? '' : 'none';
 
-    // Two separate counts: untouched gaps (never attempted) and dead-letter
-    // holes (attempted, failed, waiting for retry). Historically both were
-    // lumped as "gaps" which made a transiently-saturated fleet look like
-    // a huge unindexed hole when actually most of the window WAS attempted.
+    // Three separate counts: untouched gaps (never attempted), retrying
+    // dead-letter rows (transient — the sweep will pick them up again),
+    // and permanent dead-letter rows (pruned / no-endpoint-covers / cap
+    // exhausted — the pipeline has given up). Operators need the split
+    // to tell a churning fleet from one that's permanently wedged.
     const gapCount = (h.gaps || []).length;
-    const failedCount = (h.failed_ranges || []).length;
+    const retryingCount = h.retrying_count || 0;
+    const permanentCount = h.permanent_count || 0;
     const parts = [`${fmt(ranges.length)} covered range${ranges.length === 1 ? '' : 's'}`];
     if (gapCount) parts.push(`${fmt(gapCount)} untouched`);
-    if (failedCount) parts.push(`${fmt(failedCount)} dead-letter range${failedCount === 1 ? '' : 's'}`);
+    if (retryingCount) parts.push(`${fmt(retryingCount)} retrying`);
+    if (permanentCount) parts.push(`${fmt(permanentCount)} permanent`);
     card.summary.textContent = parts.join(' · ');
     card.list.innerHTML = '';
     ranges.forEach(r => card.list.appendChild(el('span', {}, `${fmt(r.from)} → ${fmt(r.to)}`)));
