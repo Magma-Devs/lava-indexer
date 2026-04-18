@@ -16,7 +16,9 @@ services:
       - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
       - ./docker/pg_hba.conf:/etc/pg_hba_custom.conf
     environment:
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      # Required — no default. Pick a strong value in .env. The bridge
+      # pg_hba enforces scram-sha-256 against this same password.
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
       POSTGRES_DB: ${DB_DATABASE:-postgres}
     shm_size: 1gb
     command:
@@ -67,7 +69,7 @@ services:
     environment:
       DB_HOST: postgres
       DB_USER: ${DB_USER:-postgres}
-      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
       DB_DATABASE: ${DB_DATABASE:-postgres}
       LAVA_RPC_ENDPOINT: ${LAVA_RPC_ENDPOINT:-}
     volumes:
@@ -93,7 +95,7 @@ services:
     restart: on-failure:10
     command:
       - "--connection"
-      - "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/${DB_DATABASE:-postgres}"
+      - "postgres://${DB_USER:-postgres}:${DB_PASSWORD:?DB_PASSWORD must be set in .env}@postgres:5432/${DB_DATABASE:-postgres}"
       - "--schema"
       - "app"
       - "--host"

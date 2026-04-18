@@ -185,10 +185,12 @@ func defaults() *Config {
 			BackfillInterleave:   5,
 		},
 		Database: Database{
-			Host:     "localhost",
-			Port:     5432,
-			User:     "postgres",
-			Password: "postgres",
+			Host: "localhost",
+			Port: 5432,
+			User: "postgres",
+			// Password intentionally has no default — operator must set
+			// it via config or DB_PASSWORD env. A baked-in default would
+			// silently ship as a known credential.
 			Database: "postgres",
 			Schema:   "app",
 			PoolSize: 8,

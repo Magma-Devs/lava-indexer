@@ -122,7 +122,10 @@ database:
   host: postgres
   port: 5432
   user: postgres
-  password: postgres
+  # Password is intentionally omitted — supply via the DB_PASSWORD env var
+  # (compose / k8s secret). Hard-coding it here makes it easy to commit
+  # creds by accident; the example config is also baked into the indexer
+  # image, so a literal here would ship as a default credential.
   database: postgres
   schema: app
   # pgxpool max connections. Writer uses one; rest are for aggregates/queries.
