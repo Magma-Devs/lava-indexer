@@ -84,6 +84,33 @@ type Indexer struct {
 	WriteBatchRows   int           `yaml:"write_batch_rows"`
 	QueueDepth       int           `yaml:"queue_depth"`
 	TipPollInterval  time.Duration `yaml:"tip_poll_interval"`
+
+	// PruneOutsideWindow, if true, deletes any indexer_ranges and
+	// indexer_failures entries for heights outside [StartHeight, EndHeight|tip]
+	// on startup. Useful when the operator narrowed the window after a
+	// previous (wider) run and wants the stale state dropped so gap math
+	// reflects the new window. One-shot per startup; safe to leave on.
+	PruneOutsideWindow bool `yaml:"prune_outside_window"`
+
+	// FailureRetryInterval controls how often the pipeline sweeps the
+	// dead-letter table and re-queues failed heights during an active
+	// run. 0 disables in-run retry (old behaviour: dead-letters wait
+	// until a restart or until tip-follow re-picks them up). Default 60s
+	// catches transient saturation failures without hammering the DB.
+	FailureRetryInterval time.Duration `yaml:"failure_retry_interval"`
+
+	// FailureRetryBatch is the max number of failed heights retried per
+	// sweep. Smaller = gentler on the RPC endpoints, larger = faster
+	// drain. Default 200.
+	FailureRetryBatch int `yaml:"failure_retry_batch"`
+
+	// BackfillInterleave controls how strictly tip-first the gap scheduler
+	// is. Every Nth batch goes to the OLDEST-cursor gap instead of the
+	// highest, so a large backfill gap can't starve behind tip-close
+	// fragments. 0 or 1 disables the interleave (pure tip-first — good
+	// when you only ever have one gap). Default 5 → 80/20 split in
+	// favour of tip-close work.
+	BackfillInterleave int `yaml:"backfill_interleave"`
 }
 
 // WantsHandler reports whether `name` should be registered given the
@@ -137,14 +164,17 @@ func Load(path string) (*Config, error) {
 func defaults() *Config {
 	return &Config{
 		Indexer: Indexer{
-			StartHeight:      1,
-			EndHeight:        0,
-			TipConfirmations: 0, // Cosmos/CometBFT has deterministic finality
-			FetchWorkers:     16,
-			FetchBatchSize:   10,
-			WriteBatchRows:   20000,
-			QueueDepth:       200,
-			TipPollInterval:  3 * time.Second,
+			StartHeight:          1,
+			EndHeight:            0,
+			TipConfirmations:     0, // Cosmos/CometBFT has deterministic finality
+			FetchWorkers:         16,
+			FetchBatchSize:       10,
+			WriteBatchRows:       20000,
+			QueueDepth:           200,
+			TipPollInterval:      3 * time.Second,
+			FailureRetryInterval: 60 * time.Second,
+			FailureRetryBatch:    200,
+			BackfillInterleave:   5,
 		},
 		Database: Database{
 			Host:     "localhost",
