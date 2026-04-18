@@ -62,6 +62,12 @@ func (c *RESTClient) Tip(ctx context.Context) (int64, error) {
 // earliest_height so we return 1 — attempts to fetch below the node's
 // pruning horizon will fail at FetchBlocks time, which the multi-client
 // will surface.
+//
+// Probe also calls /cosmos/base/tendermint/v1beta1/node_info to learn the
+// advertised chain_id. This is a single extra GET per endpoint at startup
+// and lets MultiClient.Probe fail fast when an endpoint serves the wrong
+// network (an operator indexing testnet into a DB labelled mainnet is
+// otherwise silent until the data is already wrong).
 func (c *RESTClient) Probe(ctx context.Context) (StatusInfo, error) {
 	var r struct {
 		Block struct {
@@ -75,10 +81,20 @@ func (c *RESTClient) Probe(ctx context.Context) (StatusInfo, error) {
 		return StatusInfo{}, err
 	}
 	h, _ := strconv.ParseInt(r.Block.Header.Height, 10, 64)
+
+	var ni struct {
+		DefaultNodeInfo struct {
+			Network string `json:"network"`
+		} `json:"default_node_info"`
+	}
+	if err := c.getJSON(ctx, "/cosmos/base/tendermint/v1beta1/node_info", &ni); err != nil {
+		return StatusInfo{}, fmt.Errorf("node_info: %w", err)
+	}
 	return StatusInfo{
 		EarliestHeight: 1,
 		LatestHeight:   h,
 		LatestTime:     r.Block.Header.Time,
+		Network:        ni.DefaultNodeInfo.Network,
 	}, nil
 }
 

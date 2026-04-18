@@ -16,6 +16,10 @@ type StatusInfo struct {
 	EarliestTime   time.Time
 	LatestHeight   int64
 	LatestTime     time.Time
+	// Network is the chain_id the endpoint advertises (e.g. "lava-mainnet-1").
+	// Empty means the endpoint didn't report one — callers that care (e.g.
+	// MultiClient.Probe) treat this distinctly from a mismatch.
+	Network string
 }
 
 // Prober is optional — clients that can report their block-height window
@@ -48,6 +52,12 @@ type Endpoint struct {
 	LatestTime   time.Time
 
 	Disabled bool
+	// Reason is a short human-readable explanation for why this endpoint
+	// is Disabled — e.g. "chain_id mismatch: expected=lava-mainnet-1
+	// advertised=lava-testnet-2" or "probe failed: connection refused".
+	// Empty when the endpoint is healthy. Surfaced on /api/status so the
+	// dashboard can show why an endpoint was taken out of rotation.
+	Reason string
 
 	metrics    *metricsTracker
 	ctrl       *AdaptiveController
@@ -147,10 +157,27 @@ func (m *MultiClient) StartController(ctx context.Context, interval time.Duratio
 	}()
 }
 
-// Probe queries every endpoint's status. Endpoints that fail to respond are
-// flagged as disabled but the process continues so a single flaky endpoint
-// doesn't block indexing — as long as at least one works.
-func (m *MultiClient) Probe(ctx context.Context) error {
+// Probe queries every endpoint's status. Endpoints that fail to respond, or
+// that fail chain_id validation, are flagged Disabled with a human-readable
+// Reason and the process continues — a single flaky or misconfigured
+// endpoint shouldn't block indexing as long as at least one healthy endpoint
+// remains. The reason string is surfaced via /api/status so the dashboard
+// can explain to operators why an endpoint is out of rotation.
+//
+// When expectedChainID is non-empty, every endpoint's advertised chain_id is
+// compared against it. A mismatch — or an endpoint that didn't advertise one
+// at all — disables that endpoint. We treat "didn't report" the same as a
+// mismatch on purpose: without verification, the risk we're guarding against
+// (indexing the wrong network into the DB) is exactly what empty Network
+// leaves open. An empty expectedChainID skips validation entirely (backward
+// compat) and is logged.
+//
+// Probe returns an error only when ZERO endpoints remain healthy — the
+// existing "nothing left to work with" fail-fast.
+func (m *MultiClient) Probe(ctx context.Context, expectedChainID string) error {
+	if expectedChainID == "" {
+		slog.Info("chain_id validation skipped (empty network.chain_id in config)")
+	}
 	any := false
 	for _, ep := range m.endpoints {
 		p, ok := ep.Client.(Prober)
@@ -159,19 +186,42 @@ func (m *MultiClient) Probe(ctx context.Context) error {
 		}
 		info, err := p.Probe(ctx)
 		if err != nil {
+			reason := fmt.Sprintf("probe failed: %s", err)
 			slog.Warn("endpoint probe failed, will be disabled", "url", ep.URL, "err", err)
 			ep.Disabled = true
+			ep.Reason = reason
 			continue
 		}
 		ep.Earliest = info.EarliestHeight
 		ep.EarliestTime = info.EarliestTime
 		ep.Latest = info.LatestHeight
 		ep.LatestTime = info.LatestTime
-		any = true
 		slog.Info("endpoint ready",
 			"url", ep.URL, "kind", ep.Kind,
 			"earliest_block", info.EarliestHeight, "latest_block", info.LatestHeight,
 			"earliest_time", info.EarliestTime, "latest_time", info.LatestTime)
+		if expectedChainID != "" {
+			switch {
+			case info.Network == "":
+				reason := fmt.Sprintf("endpoint did not report chain_id (expected %s)", expectedChainID)
+				slog.Warn("endpoint disabled: chain_id unverified",
+					"url", ep.URL, "expected", expectedChainID)
+				ep.Disabled = true
+				ep.Reason = reason
+				continue
+			case info.Network != expectedChainID:
+				reason := fmt.Sprintf("chain_id mismatch: expected=%s advertised=%s",
+					expectedChainID, info.Network)
+				slog.Warn("endpoint disabled: chain_id mismatch",
+					"url", ep.URL, "expected", expectedChainID, "advertised", info.Network)
+				ep.Disabled = true
+				ep.Reason = reason
+				continue
+			default:
+				slog.Info("endpoint chain_id verified", "url", ep.URL, "network", info.Network)
+			}
+		}
+		any = true
 	}
 	if !any {
 		return fmt.Errorf("no healthy endpoints")

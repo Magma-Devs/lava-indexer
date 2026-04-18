@@ -66,7 +66,7 @@ func main() {
 	}
 	defer client.Close()
 
-	if err := client.Probe(ctx); err != nil {
+	if err := client.Probe(ctx, cfg.Network.ChainID); err != nil {
 		fatal("probe endpoints", err)
 	}
 

@@ -93,6 +93,20 @@
   .ep .url { word-break: break-all; overflow-wrap: anywhere; color: var(--fg); font-size: 11px; }
   .ep .range { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
   .ep .range b { color: var(--fg); font-weight: 600; }
+  /* Disabled-endpoint reason. On the compact list it sits under the URL
+     as a muted one-liner so healthy endpoints stay visually quiet. On
+     the detail card it's promoted to a red banner — the endpoint is
+     out of rotation and the operator needs to notice. */
+  .ep-reason {
+    grid-column: 2 / -1; color: var(--danger); font-size: 11px;
+    padding-top: 2px; word-break: break-all; overflow-wrap: anywhere;
+  }
+  .ep-reason-banner {
+    margin-top: 10px; padding: 8px 10px; border-radius: 6px;
+    background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.35);
+    color: var(--danger); font-size: 12px; word-break: break-all; overflow-wrap: anywhere;
+  }
+  .ep-reason-banner b { font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; font-size: 11px; margin-right: 8px; }
 
   section.handlers { margin-top: 24px; }
   section.handlers h2 { font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 10px 0; }
@@ -531,9 +545,10 @@
         const url = el('span', { class: 'url', title: e.url }, e.url);
         const earliest = el('span', { class: 'range' });
         const latest = el('span', { class: 'range' });
-        const root = el('div', { class: 'ep' }, mark, kind, url, earliest, latest);
+        const reason = el('span', { class: 'ep-reason' });
+        const root = el('div', { class: 'ep' }, mark, kind, url, earliest, latest, reason);
         container.appendChild(root);
-        row = { root, mark, kind, url, earliest, latest };
+        row = { root, mark, kind, url, earliest, latest, reason };
         overviewRows.set(e.url, row);
       }
       row.mark.className = e.disabled ? 'bad' : 'ok';
@@ -545,6 +560,13 @@
       const lf = e.latest_time ? fmtDate(e.latest_time) : null;
       row.earliest.innerHTML = `earliest <b>${fmt(e.earliest || 0)}</b>${ef ? ' · ' + ef : ''}`;
       row.latest.innerHTML = `latest <b>${fmt(e.latest || 0)}</b>${lf ? ' · ' + lf : ''}`;
+      if (e.disabled && e.reason) {
+        row.reason.textContent = e.reason;
+        row.reason.style.display = '';
+      } else {
+        row.reason.textContent = '';
+        row.reason.style.display = 'none';
+      }
     }
   }
 
@@ -623,6 +645,11 @@
     const chevron = el('span', { class: 'chevron' }, '▾');
     const head = el('div', { class: 'ep-card-head' }, mark, kind, urlSpan, coverage, chevron);
 
+    // Banner for disabled endpoints — placed directly under the head so the
+    // reason is the first thing an operator sees on a broken card. Hidden
+    // (display:none) when the endpoint is healthy.
+    const reasonBanner = el('div', { class: 'ep-reason-banner', style: { display: 'none' } });
+
     const budget   = makeStatCard('Budget',   BUDGET_TOOLTIP);
     const inflight = makeStatCard('In flight', INFLIGHT_TOOLTIP);
     const rps      = makeStatCard('Req / s', RPS_TOOLTIP);
@@ -640,7 +667,7 @@
     const charts = el('div', { class: 'sparkline-block' },
       sparks.rps.root, sparks.p99.root, sparks.budget.root, sparks.inflight.root);
 
-    const root = el('div', { class: 'ep-card' }, head, stats, charts);
+    const root = el('div', { class: 'ep-card' }, head, reasonBanner, stats, charts);
 
     // Collapsible: toggle state on head click, persist per URL in
     // localStorage so page reloads remember your layout.
@@ -651,13 +678,21 @@
       localStorage.setItem(storeKey, root.classList.contains('collapsed') ? '1' : '0');
     });
 
-    return { root, mark, kind, urlSpan, coverage, budget, inflight, rps, latency, errors, sparks };
+    return { root, mark, kind, urlSpan, coverage, reasonBanner, budget, inflight, rps, latency, errors, sparks };
   }
 
   function updateDetailCard(card, e) {
     const m = e.metrics || {};
     card.mark.className = e.disabled ? 'bad' : 'ok';
     card.mark.textContent = e.disabled ? '✗' : '✓';
+    if (e.disabled && e.reason) {
+      card.reasonBanner.innerHTML = '';
+      card.reasonBanner.appendChild(el('b', {}, 'disabled'));
+      card.reasonBanner.appendChild(document.createTextNode(e.reason));
+      card.reasonBanner.style.display = '';
+    } else {
+      card.reasonBanner.style.display = 'none';
+    }
     const k = (e.kind || '').toLowerCase();
     card.kind.className = 'kind-badge ' + (k === 'rpc' ? 'kind-rpc' : k === 'rest' ? 'kind-rest' : 'kind-unknown');
     card.kind.textContent = k || '?';

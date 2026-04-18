@@ -268,6 +268,9 @@ func (c *RPCClient) Probe(ctx context.Context) (StatusInfo, error) {
 		return StatusInfo{}, fmt.Errorf("status rpc error: %s", resp.Error.Message)
 	}
 	var s struct {
+		NodeInfo struct {
+			Network string `json:"network"`
+		} `json:"node_info"`
 		SyncInfo struct {
 			LatestBlockHeight   string    `json:"latest_block_height"`
 			LatestBlockTime     time.Time `json:"latest_block_time"`
@@ -283,6 +286,7 @@ func (c *RPCClient) Probe(ctx context.Context) (StatusInfo, error) {
 	info.EarliestHeight, _ = strconv.ParseInt(s.SyncInfo.EarliestBlockHeight, 10, 64)
 	info.LatestTime = s.SyncInfo.LatestBlockTime
 	info.EarliestTime = s.SyncInfo.EarliestBlockTime
+	info.Network = s.NodeInfo.Network
 	return info, nil
 }
 

@@ -175,7 +175,11 @@ type EndpointStatus struct {
 	Latest       int64      `json:"latest"`
 	LatestTime   *time.Time `json:"latest_time,omitempty"`
 	Disabled     bool       `json:"disabled"`
-	Metrics      *EndpointMetricsJSON `json:"metrics,omitempty"`
+	// Reason is the short human-readable explanation for Disabled — set
+	// by MultiClient.Probe when an endpoint fails its probe or fails
+	// chain_id validation. Empty when the endpoint is healthy.
+	Reason  string               `json:"reason,omitempty"`
+	Metrics *EndpointMetricsJSON `json:"metrics,omitempty"`
 }
 
 type EndpointMetricsJSON struct {
@@ -294,6 +298,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			URL: ep.URL, Kind: ep.Kind,
 			Earliest: ep.Earliest, Latest: ep.Latest,
 			Disabled: ep.Disabled,
+			Reason:   ep.Reason,
 		}
 		if !ep.EarliestTime.IsZero() {
 			t := ep.EarliestTime
