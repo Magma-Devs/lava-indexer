@@ -1,7 +1,8 @@
 # Stable compose project name: Docker uses this for container + network +
-# default-volume prefixes. Pinning it means the folder can be renamed
-# without losing containers/state.
-name: lava-indexer
+# default-volume prefixes. Pinning it via PROJECT_NAME (set in .env) means
+# the folder can be renamed without losing containers/state, and two stacks
+# can coexist on one host by pointing at different names.
+name: ${PROJECT_NAME:-lava-indexer}
 
 services:
   postgres:
@@ -9,7 +10,7 @@ services:
       context: ./docker
       dockerfile: postgres.Dockerfile
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -62,7 +63,7 @@ services:
       postgres: { condition: service_healthy }
     restart: unless-stopped
     ports:
-      - "8080:8080"    # progress UI + /api/status
+      - "${INDEXER_PORT:-8080}:8080"    # progress UI + /api/status
     environment:
       DB_HOST: postgres
       DB_USER: ${DB_USER:-postgres}
@@ -86,7 +87,7 @@ services:
       context: ./docker
       dockerfile: postgraphile.Dockerfile
     ports:
-      - "3000:5000"
+      - "${GRAPHQL_PORT:-3000}:5000"
     depends_on:
       postgres: { condition: service_healthy }
     restart: on-failure:10
