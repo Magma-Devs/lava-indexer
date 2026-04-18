@@ -1,0 +1,118 @@
+# Stable compose project name: Docker uses this for container + network +
+# default-volume prefixes. Pinning it means the folder can be renamed
+# without losing containers/state.
+name: lava-indexer
+
+services:
+  postgres:
+    build:
+      context: ./docker
+      dockerfile: postgres.Dockerfile
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./docker/pg_hba.conf:/etc/pg_hba_custom.conf
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_DATABASE:-postgres}
+    shm_size: 1gb
+    command:
+      - postgres
+      - -c
+      - hba_file=/etc/pg_hba_custom.conf
+      - -c
+      - shared_preload_libraries=pg_cron
+      - -c
+      - cron.database_name=${DB_DATABASE:-postgres}
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=6GB
+      - -c
+      - work_mem=64MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - wal_buffers=32MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - synchronous_commit=off
+      - -c
+      - max_connections=100
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - default_toast_compression=lz4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+    ports:
+      - "8080:8080"    # progress UI + /api/status
+    environment:
+      DB_HOST: postgres
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_DATABASE: ${DB_DATABASE:-postgres}
+      LAVA_RPC_ENDPOINT: ${LAVA_RPC_ENDPOINT:-}
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+      - ./aggregates:/app/aggregates:ro
+
+  graphql:
+    # PostGraphile v4 exposes a GraphQL API over the Postgres schema with
+    # zero config. It auto-discovers app.*, including the materialised views
+    # defined in aggregates/. --watch is nice in dev, drop --enhance-graphiql
+    # in prod.
+    #
+    # Built from docker/postgraphile.Dockerfile which layers two plugins on
+    # top of the stock image — see that file for the rationale. The plugin
+    # package names are repeated in --append-plugins below.
+    build:
+      context: ./docker
+      dockerfile: postgraphile.Dockerfile
+    ports:
+      - "3000:5000"
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: on-failure:10
+    command:
+      - "--connection"
+      - "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/${DB_DATABASE:-postgres}"
+      - "--schema"
+      - "app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "5000"
+      - "--cors"
+      - "--enhance-graphiql"
+      - "--dynamic-json"
+      - "--no-setof-functions-contain-nulls"
+      - "--no-ignore-rbac"
+      - "--legacy-relations=omit"
+      - "--append-plugins"
+      - "postgraphile-plugin-connection-filter,@graphile/pg-aggregates"
+      - "--watch"
+
+volumes:
+  # When present, the DATA_VOLUME env var names an external pre-existing
+  # volume to reuse — lets us rename the compose project without losing
+  # the indexer's on-disk state. Falls back to the default named volume
+  # for fresh installs.
+  postgres_data:
+    name: ${DATA_VOLUME:-lava-indexer_postgres_data}
