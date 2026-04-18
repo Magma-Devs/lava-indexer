@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -173,6 +174,15 @@ func (p *Pipeline) runWindow(ctx context.Context, start, end int64) error {
 		slog.Info("window fully covered by prior runs, nothing to fetch", "start", start, "end", end)
 		return nil
 	}
+	// Slice any gap that crosses an endpoint's Earliest horizon into
+	// sub-gaps — otherwise the producer walks a single giant gap bottom-up
+	// and the tier's only eligible endpoint (usually the archive) does all
+	// the work while pruning endpoints sit idle until the cursor crosses
+	// their horizon. Splitting lets indexGaps' interleave producer dispatch
+	// across tiers in parallel from block zero of the backfill.
+	if multi, ok := p.client.(*rpc.MultiClient); ok {
+		gaps = splitByEndpointCoverage(gaps, multi.Endpoints())
+	}
 	total := int64(0)
 	for _, g := range gaps {
 		total += g.To - g.From + 1
@@ -182,6 +192,43 @@ func (p *Pipeline) runWindow(ctx context.Context, start, end int64) error {
 		"gap_blocks", total, "gap_count", len(gaps))
 
 	return p.indexGaps(ctx, gaps)
+}
+
+// splitByEndpointCoverage slices every gap at each endpoint's Earliest
+// boundary so gaps above a pruning endpoint's horizon become distinct
+// work units. The result preserves order, non-overlap, and total covered
+// heights; only the gap count changes. Endpoints whose Earliest is 0 or
+// which are Disabled do not contribute boundaries.
+func splitByEndpointCoverage(gaps []state.Range, eps []*rpc.Endpoint) []state.Range {
+	horizons := map[int64]struct{}{}
+	for _, ep := range eps {
+		if ep.Disabled || ep.Earliest <= 1 {
+			continue
+		}
+		horizons[ep.Earliest] = struct{}{}
+	}
+	if len(horizons) == 0 {
+		return gaps
+	}
+	sorted := make([]int64, 0, len(horizons))
+	for h := range horizons {
+		sorted = append(sorted, h)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	out := make([]state.Range, 0, len(gaps)+len(sorted))
+	for _, g := range gaps {
+		cursor := g.From
+		for _, h := range sorted {
+			if h <= cursor || h > g.To {
+				continue
+			}
+			out = append(out, state.Range{From: cursor, To: h - 1})
+			cursor = h
+		}
+		out = append(out, state.Range{From: cursor, To: g.To})
+	}
+	return out
 }
 
 // indexGaps fans out fetch work over N workers across ANY number of

@@ -479,9 +479,9 @@
     setCard('end',    'End height',    s.end_height === 0 ? '(follow tip)' : fmt(s.end_height), null);
   }
 
-  async function fetchHistory(url) {
+  async function fetchHistory(idx) {
     try {
-      const r = await fetch('/api/history?url=' + encodeURIComponent(url));
+      const r = await fetch('/api/history?idx=' + idx);
       if (!r.ok) return [];
       return await r.json();
     } catch (_) { return []; }
@@ -513,17 +513,19 @@
 
   // Compact endpoint list shown on Overview (just health + URL + coverage —
   // no live metrics here; they live on the Endpoints tab). Updates in place:
-  // each endpoint is a stable DOM row keyed by URL so repolling doesn't make
-  // the UI twitch.
-  const overviewRows = new Map(); // url -> refs
+  // each endpoint is a stable DOM row keyed by its index in the config list.
+  // Index rather than URL so a config that declares the same URL twice —
+  // typically with divergent headers like an archive-mode flag — still gets
+  // one row per entry.
+  const overviewRows = new Map(); // idx -> refs
   function renderEndpointsOverview(s) {
     const container = document.getElementById('endpoints');
     const eps = s.endpoints || [];
-    // Drop rows whose endpoint is gone.
-    for (const [url, row] of overviewRows) {
-      if (!eps.find(e => e.url === url)) {
+    // Drop rows whose index is no longer in range.
+    for (const [idx, row] of overviewRows) {
+      if (typeof idx === 'number' && idx >= eps.length) {
         row.root.remove();
-        overviewRows.delete(url);
+        overviewRows.delete(idx);
       }
     }
     if (!eps.length) {
@@ -537,8 +539,9 @@
     }
     overviewRows.delete('__empty__');
 
-    for (const e of eps) {
-      let row = overviewRows.get(e.url);
+    for (let i = 0; i < eps.length; i++) {
+      const e = eps[i];
+      let row = overviewRows.get(i);
       if (!row) {
         const mark = el('span', {});
         const kind = el('span', { class: 'kind-badge' });
@@ -549,8 +552,10 @@
         const root = el('div', { class: 'ep' }, mark, kind, url, earliest, latest, reason);
         container.appendChild(root);
         row = { root, mark, kind, url, earliest, latest, reason };
-        overviewRows.set(e.url, row);
+        overviewRows.set(i, row);
       }
+      row.url.textContent = e.url;
+      row.url.setAttribute('title', e.url);
       row.mark.className = e.disabled ? 'bad' : 'ok';
       row.mark.textContent = e.disabled ? '✗' : '✓';
       const k = (e.kind || '').toLowerCase();
@@ -600,16 +605,16 @@
     "HTTP / RPC failures divided by total requests. Anything persistently " +
     "above 1 % makes the adaptive controller pull back.";
 
-  const detailCards = new Map(); // url -> refs
+  const detailCards = new Map(); // idx -> refs
 
   async function renderEndpointsDetail(s) {
     const container = document.getElementById('endpoints-detail');
     const eps = s.endpoints || [];
 
-    for (const [url, card] of detailCards) {
-      if (!eps.find(e => e.url === url)) {
+    for (const [idx, card] of detailCards) {
+      if (typeof idx === 'number' && idx >= eps.length) {
         card.root.remove();
-        detailCards.delete(url);
+        detailCards.delete(idx);
       }
     }
 
@@ -625,19 +630,20 @@
     const emptyRef = detailCards.get('__empty__');
     if (emptyRef) { emptyRef.root.remove(); detailCards.delete('__empty__'); }
 
-    for (const e of eps) {
-      let card = detailCards.get(e.url);
+    for (let i = 0; i < eps.length; i++) {
+      const e = eps[i];
+      let card = detailCards.get(i);
       if (!card) {
-        card = buildDetailCard(e.url);
+        card = buildDetailCard(i, e.url);
         container.appendChild(card.root);
-        detailCards.set(e.url, card);
+        detailCards.set(i, card);
       }
       updateDetailCard(card, e);
-      fetchHistory(e.url).then(history => updateSparks(card, history));
+      fetchHistory(i).then(history => updateSparks(card, history));
     }
   }
 
-  function buildDetailCard(url) {
+  function buildDetailCard(idx, url) {
     const mark = el('span', {});
     const kind = el('span', { class: 'kind-badge' });
     const urlSpan = el('span', { class: 'url' }, url);
@@ -669,9 +675,10 @@
 
     const root = el('div', { class: 'ep-card' }, head, reasonBanner, stats, charts);
 
-    // Collapsible: toggle state on head click, persist per URL in
-    // localStorage so page reloads remember your layout.
-    const storeKey = 'ep-collapsed:' + url;
+    // Collapsible: toggle state on head click, persist per (idx, URL) in
+    // localStorage so page reloads remember your layout, even when two
+    // entries share the same URL.
+    const storeKey = 'ep-collapsed:' + idx + ':' + url;
     if (localStorage.getItem(storeKey) === '1') root.classList.add('collapsed');
     head.addEventListener('click', () => {
       root.classList.toggle('collapsed');

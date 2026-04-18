@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -434,15 +435,28 @@ func (s *Server) rowCountsFor(ctx context.Context, handler string) map[string]in
 }
 
 // handleHistory serves time-series metrics for a single endpoint. Clients
-// pass ?url=<endpoint-url> (URL-encoded). The response is a dense JSON array
-// of MetricSample suitable for a sparkline/chart.
+// pass ?idx=<endpoint-index> to disambiguate when the same URL appears
+// more than once (e.g. one with, one without an archive-mode header).
+// ?url= is still accepted as a fallback for older callers but is
+// ambiguous when URLs repeat.
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	url := r.URL.Query().Get("url")
-	if url == "" {
-		http.Error(w, "missing url query param", http.StatusBadRequest)
+	eps := s.Client.Endpoints()
+	if idxStr := r.URL.Query().Get("idx"); idxStr != "" {
+		idx, err := strconv.Atoi(idxStr)
+		if err != nil || idx < 0 || idx >= len(eps) {
+			http.Error(w, "idx out of range", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(eps[idx].MetricHistory())
 		return
 	}
-	for _, ep := range s.Client.Endpoints() {
+	url := r.URL.Query().Get("url")
+	if url == "" {
+		http.Error(w, "missing idx or url query param", http.StatusBadRequest)
+		return
+	}
+	for _, ep := range eps {
 		if ep.URL == url {
 			w.Header().Set("content-type", "application/json")
 			_ = json.NewEncoder(w).Encode(ep.MetricHistory())
