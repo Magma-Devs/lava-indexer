@@ -174,6 +174,9 @@
   details.ranges-detail .list span.gap {
     color: var(--warn); border-color: #3b2a0d;
   }
+  details.ranges-detail .list span.failed-range {
+    color: var(--danger); border-color: #3b0d0d;
+  }
 
   footer { padding: 18px 24px; color: var(--muted); font-size: 11px; border-top: 1px solid var(--border); margin-top: 40px; text-align: center; }
 
@@ -1048,10 +1051,20 @@
     card.axisDateR.textContent = tipDateText;
     card.axisDateR.style.display = tipDateText ? '' : 'none';
 
-    card.summary.textContent = `${ranges.length} covered ranges, ${(h.gaps || []).length} gap${(h.gaps||[]).length === 1 ? '' : 's'}`;
+    // Two separate counts: untouched gaps (never attempted) and dead-letter
+    // holes (attempted, failed, waiting for retry). Historically both were
+    // lumped as "gaps" which made a transiently-saturated fleet look like
+    // a huge unindexed hole when actually most of the window WAS attempted.
+    const gapCount = (h.gaps || []).length;
+    const failedCount = (h.failed_ranges || []).length;
+    const parts = [`${fmt(ranges.length)} covered range${ranges.length === 1 ? '' : 's'}`];
+    if (gapCount) parts.push(`${fmt(gapCount)} untouched`);
+    if (failedCount) parts.push(`${fmt(failedCount)} dead-letter range${failedCount === 1 ? '' : 's'}`);
+    card.summary.textContent = parts.join(' · ');
     card.list.innerHTML = '';
     ranges.forEach(r => card.list.appendChild(el('span', {}, `${fmt(r.from)} → ${fmt(r.to)}`)));
     (h.gaps || []).forEach(r => card.list.appendChild(el('span', { class: 'gap' }, `gap ${fmt(r.from)} → ${fmt(r.to)}`)));
+    (h.failed_ranges || []).forEach(r => card.list.appendChild(el('span', { class: 'failed-range' }, `dead-letter ${fmt(r.from)}${r.from !== r.to ? ' → ' + fmt(r.to) : ''}`)));
   }
 
   function renderHeader(s) {

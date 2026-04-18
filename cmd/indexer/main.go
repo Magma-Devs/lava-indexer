@@ -173,6 +173,34 @@ func main() {
 		slog.Warn("aggregates apply failed (non-fatal)", "err", err)
 	}
 
+	// Optional: drop state for heights outside the current window. Used
+	// when the operator has narrowed start_height (or dropped earliest_mode)
+	// after a previous run populated things below the new window. One-shot
+	// and idempotent — if there's nothing to prune the counts are 0.
+	if cfg.Indexer.PruneOutsideWindow && !cfg.Indexer.EarliestMode {
+		pruneEnd := cfg.Indexer.EndHeight
+		if pruneEnd == 0 {
+			if tip, err := client.Tip(ctx); err == nil {
+				pruneEnd = tip
+			}
+		}
+		if pruneEnd > 0 {
+			for _, h := range reg.All() {
+				rr, ff, err := st.PruneOutsideWindow(ctx, h.Name(), cfg.Indexer.StartHeight, pruneEnd)
+				if err != nil {
+					slog.Warn("prune outside window failed", "handler", h.Name(), "err", err)
+					continue
+				}
+				if rr > 0 || ff > 0 {
+					slog.Info("pruned state outside window",
+						"handler", h.Name(),
+						"start", cfg.Indexer.StartHeight, "end", pruneEnd,
+						"ranges_deleted", rr, "failures_deleted", ff)
+				}
+			}
+		}
+	}
+
 	pipe := pipeline.New(cfg, pool, client, st, reg)
 	if sizer != nil {
 		pipe = pipe.WithSizer(sizer)

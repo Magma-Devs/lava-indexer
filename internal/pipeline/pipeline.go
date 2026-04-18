@@ -205,33 +205,49 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	// Single producer, tip-first: on every emit we pick the gap whose
-	// current cursor is HIGHEST — i.e. closest to the chain tip — and
-	// dispatch the next batch from there. Consequences:
-	//   - With a historical-backfill gap (e.g. [6mo-ago, pruning-horizon])
-	//     plus a live tip-extension gap, the live gap always wins. The
-	//     backfill only gets worker attention once the tip gap is caught
-	//     up, so the observable "latest indexed height" tracks the chain
-	//     head even while history is still being filled.
-	//   - When tip-follower extends the top gap on each poll, those new
-	//     heights immediately jump to the front of the queue; they don't
-	//     sit behind half a million backfill blocks.
-	//   - Within a single gap the behaviour is unchanged: bottom-up walk
-	//     from gap.From to gap.To.
+	// Single producer, tip-first with interleave: most batches go to the
+	// gap with the HIGHEST cursor (closest to tip), but every Nth batch
+	// goes to the LOWEST-cursor gap instead, so a big historical gap
+	// can't starve behind thousands of tip-close fragments.
+	//
+	// Why not pure tip-first: if gaps are highly fragmented near tip
+	// (dead-letter holes × thousands) the tip-first preference keeps
+	// rotating through those fragments for hours while a single large
+	// bottom gap gets zero cycles. Interleave every N batches lets the
+	// bottom gap drain in parallel at ~(1/N) of the throughput without
+	// losing the "tip tracks head" property.
+	//
+	// BackfillInterleave: 0 or 1 → pure tip-first. Default 5 → ~80/20.
+	// Within a single gap the walk is still bottom-up From → To.
 	g.Go(func() error {
 		defer close(jobs)
 		cursors := make([]int64, len(gaps))
 		for i := range gaps {
 			cursors[i] = gaps[i].From
 		}
+		interleave := cfg.BackfillInterleave
+		batchIdx := 0
 		for {
+			// Every `interleave`-th batch, pick the LOWEST-cursor gap
+			// (oldest work) instead of the highest.
+			pickLowest := interleave > 1 && (batchIdx%interleave) == interleave-1
 			best := -1
 			for i := range gaps {
 				if cursors[i] > gaps[i].To {
 					continue
 				}
-				if best < 0 || cursors[i] > cursors[best] {
+				if best < 0 {
 					best = i
+					continue
+				}
+				if pickLowest {
+					if cursors[i] < cursors[best] {
+						best = i
+					}
+				} else {
+					if cursors[i] > cursors[best] {
+						best = i
+					}
 				}
 			}
 			if best < 0 {
@@ -248,8 +264,59 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 			case jobs <- job{from: cursors[best], to: to}:
 			}
 			cursors[best] = to + 1
+			batchIdx++
 		}
 	})
+
+	// Dead-letter retry sweep: the pipeline's processWithSplit records any
+	// size-1 block that exhausts its retries into app.indexer_failures and
+	// moves on. Historically those heights stayed "failed" until the process
+	// restarted — no good when a multi-day backfill briefly saturates the
+	// endpoints and racks up thousands of transient holes.
+	//
+	// This goroutine periodically pops the newest-first batch of failures,
+	// deletes their rows, and runs them back through processWithSplit. If
+	// the retry succeeds the height lands in indexer_ranges (so it stops
+	// being a gap); if it fails again, processWithSplit re-inserts the
+	// row with retries+1 and it gets another chance on the next sweep.
+	//
+	// Runs in parallel with the main tip-first producer — uses the same
+	// pgxpool + processWithSplit, so it shares the AIMD budget and advisory
+	// locks naturally. No separate worker pool needed; dead-letter retry
+	// is rarely the bottleneck.
+	if cfg.FailureRetryInterval > 0 && cfg.FailureRetryBatch > 0 {
+		g.Go(func() error {
+			ticker := time.NewTicker(cfg.FailureRetryInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-ticker.C:
+				}
+				for _, handler := range p.registry.All() {
+					heights, err := p.state.PopFailures(ctx, handler.Name(), cfg.FailureRetryBatch)
+					if err != nil {
+						slog.Warn("dead-letter sweep: pop failed", "handler", handler.Name(), "err", err)
+						continue
+					}
+					if len(heights) == 0 {
+						continue
+					}
+					slog.Info("dead-letter sweep: retrying heights",
+						"handler", handler.Name(), "count", len(heights))
+					for _, h := range heights {
+						if ctx.Err() != nil {
+							return nil
+						}
+						// Swallow errors: processWithSplit only returns ctx
+						// errors; real failures re-insert into indexer_failures.
+						_ = p.processWithSplit(ctx, h, h)
+					}
+				}
+			}
+		})
+	}
 
 	// Consumers.
 	start := time.Now()

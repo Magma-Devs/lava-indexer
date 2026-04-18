@@ -88,6 +88,30 @@ indexer:
   # How often the tip-follower polls /status after catching up.
   tip_poll_interval: 3s
 
+  # Dead-letter retry loop: how often the pipeline sweeps app.indexer_failures
+  # and re-enqueues failed heights. 0 disables (dead-letters then only get
+  # another chance on restart or when tip-follow re-picks them up). Default
+  # 60s catches transient saturation without churning the DB.
+  failure_retry_interval: 60s
+
+  # Max failed heights retried per sweep. Smaller = gentler on the RPC fleet,
+  # larger = faster drain.
+  failure_retry_batch: 200
+
+  # If true, on startup delete indexer_ranges + indexer_failures rows for
+  # heights OUTSIDE [start_height, end_height|tip]. Useful when narrowing
+  # start_height after a previous wider run — otherwise the stale state
+  # shows up as zombie "covered ranges" on the timeline that will never
+  # be touched again.
+  prune_outside_window: false
+
+  # Gap scheduler interleave. Most batches go to the highest-cursor gap
+  # (tip-first) but every Nth batch goes to the LOWEST-cursor gap — so a
+  # big historical-backfill gap can't starve behind thousands of
+  # tip-close fragments. 0 or 1 = pure tip-first (fine if you only ever
+  # have one gap). Default 5 ≈ 80/20 split in favour of tip work.
+  backfill_interleave: 5
+
 database:
   host: postgres
   port: 5432

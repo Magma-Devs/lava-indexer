@@ -195,6 +195,9 @@ type HandlerStatus struct {
 	Name         string           `json:"name"`
 	EventTypes   []string         `json:"event_types"`
 	Ranges       []RangeJSON      `json:"ranges"`
+	// Gaps is "never-tried" heights only: uncovered AND not currently in
+	// the dead-letter pool. FailedRanges holds the dead-letter side so
+	// the UI can report them separately with different semantics.
 	Gaps         []RangeJSON      `json:"gaps"`
 	WindowPct    float64          `json:"window_pct"` // % of configured [start, end∨tip]
 	ChainPct     float64          `json:"chain_pct"`  // % of full chain [1, tip]
@@ -205,10 +208,10 @@ type HandlerStatus struct {
 	RowCounts    map[string]int64 `json:"row_counts"`
 
 	// Dead-letter: heights that exhausted their retry budget. Still gaps
-	// in indexer_ranges, so a future run picks them up automatically.
-	FailureCount   int64       `json:"failure_count"`
-	MaxRetries     int         `json:"max_retries"`
-	FailedRanges   []RangeJSON `json:"failed_ranges,omitempty"`
+	// in indexer_ranges, so a future sweep (or restart) picks them up.
+	FailureCount int64       `json:"failure_count"`
+	MaxRetries   int         `json:"max_retries"`
+	FailedRanges []RangeJSON `json:"failed_ranges,omitempty"`
 }
 
 type RangeJSON struct {
@@ -340,11 +343,20 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			hs.CoveredStart = hs.Ranges[0].From
 			hs.CoveredEnd = hs.Ranges[len(hs.Ranges)-1].To
 		}
-		// Gaps within [start, windowEnd]
+		// Gaps = uncovered AND not already dead-lettered, within [start, windowEnd].
+		// The UI shows dead-lettered heights separately via FailedRanges.
 		gaps, err := s.State.Gaps(ctx, h.Name(), s.Start, windowEnd)
 		if err == nil {
-			for _, rg := range gaps {
-				hs.Gaps = append(hs.Gaps, RangeJSON{From: rg.From, To: rg.To})
+			failed, ferr := s.State.FailureHeights(ctx, h.Name(), s.Start, windowEnd)
+			if ferr != nil {
+				// Non-fatal: if we can't read failures, fall back to raw gaps.
+				for _, rg := range gaps {
+					hs.Gaps = append(hs.Gaps, RangeJSON{From: rg.From, To: rg.To})
+				}
+			} else {
+				for _, rg := range subtractHeightsFromRanges(gaps, failed) {
+					hs.Gaps = append(hs.Gaps, RangeJSON{From: rg.From, To: rg.To})
+				}
 			}
 		}
 		hs.RowCounts = s.rowCountsFor(ctx, h.Name())
@@ -474,6 +486,37 @@ func (s *Server) dataTimeRangeFor(ctx context.Context, handler string) (time.Tim
 
 // coverageRatio returns the fraction of [from, to] that is covered by ranges.
 // 0 if to < from.
+// subtractHeightsFromRanges splits each input range at every height in
+// `heights`, returning the sub-ranges that remain after the heights are
+// removed. `heights` must be sorted ascending (PopFailures / FailureHeights
+// both produce sorted output). Used by the status handler to return
+// "never-tried" gaps: raw gaps minus dead-lettered heights.
+func subtractHeightsFromRanges(ranges []state.Range, heights []int64) []state.Range {
+	if len(heights) == 0 || len(ranges) == 0 {
+		return ranges
+	}
+	out := make([]state.Range, 0, len(ranges))
+	h := 0
+	for _, rg := range ranges {
+		// Advance h past heights below this range — they're irrelevant.
+		for h < len(heights) && heights[h] < rg.From {
+			h++
+		}
+		cur := rg.From
+		for h < len(heights) && heights[h] <= rg.To {
+			if heights[h] > cur {
+				out = append(out, state.Range{From: cur, To: heights[h] - 1})
+			}
+			cur = heights[h] + 1
+			h++
+		}
+		if cur <= rg.To {
+			out = append(out, state.Range{From: cur, To: rg.To})
+		}
+	}
+	return out
+}
+
 func coverageRatio(ranges []RangeJSON, from, to int64) float64 {
 	if to < from {
 		return 0

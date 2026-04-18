@@ -104,6 +104,110 @@ func (s *State) FailureCount(ctx context.Context, handler string) (count int64, 
 	return
 }
 
+// PopFailures removes up to `limit` dead-letter heights for `handler`
+// (highest heights first — tip-first just like the main producer) and
+// returns them. Atomic: the SELECT + DELETE happens inside a single
+// DELETE…RETURNING so a second caller can't pop the same height.
+//
+// Heights returned here are candidates for in-run retry. If the retry
+// eventually succeeds, the height lands in indexer_ranges and the failure
+// is gone for good. If it fails again, processWithSplit re-inserts it
+// with retries+1, putting it back in the dead-letter pool for the next
+// cycle.
+func (s *State) PopFailures(ctx context.Context, handler string, limit int) ([]int64, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
+		DELETE FROM %[1]s.indexer_failures
+		WHERE (handler, height) IN (
+		  SELECT handler, height
+		  FROM %[1]s.indexer_failures
+		  WHERE handler = $1
+		  ORDER BY height DESC
+		  LIMIT $2
+		)
+		RETURNING height`, s.schema), handler, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]int64, 0, limit)
+	for rows.Next() {
+		var h int64
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// PruneOutsideWindow deletes indexer_ranges + indexer_failures entries
+// that fall entirely outside [start, end] for the given handler. Used on
+// startup when the operator narrows the start_height and wants the stale
+// state from a previous (wider) run removed so the UI + gap math stay
+// honest about the new window. Ranges that STRADDLE the boundary are
+// left untouched — they still contain blocks inside the new window.
+//
+// Returns (ranges_deleted, failures_deleted).
+func (s *State) PruneOutsideWindow(ctx context.Context, handler string, start, end int64) (int64, int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Advisory lock: prevents the pipeline's range-merge from racing with
+	// the prune on the same handler.
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext($1))`, handler); err != nil {
+		return 0, 0, err
+	}
+
+	rTag, err := tx.Exec(ctx, fmt.Sprintf(`
+		DELETE FROM %s.indexer_ranges
+		WHERE handler = $1 AND (to_height < $2 OR from_height > $3)`, s.schema),
+		handler, start, end)
+	if err != nil {
+		return 0, 0, err
+	}
+	fTag, err := tx.Exec(ctx, fmt.Sprintf(`
+		DELETE FROM %s.indexer_failures
+		WHERE handler = $1 AND (height < $2 OR height > $3)`, s.schema),
+		handler, start, end)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, 0, err
+	}
+	return rTag.RowsAffected(), fTag.RowsAffected(), nil
+}
+
+// FailureHeights returns the individual dead-letter heights in [start, end]
+// for a handler. Used by the web layer to subtract them from "untouched"
+// gaps so the UI distinguishes never-tried gaps from retry-waiting ones.
+func (s *State) FailureHeights(ctx context.Context, handler string, start, end int64) ([]int64, error) {
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
+		SELECT height FROM %s.indexer_failures
+		WHERE handler = $1 AND height BETWEEN $2 AND $3
+		ORDER BY height`, s.schema), handler, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]int64, 0, 256)
+	for rows.Next() {
+		var h int64
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
 // FailureRanges coalesces individual dead-letter heights into contiguous
 // ranges so the UI can paint them as red bars on the timeline instead of
 // 1-pixel spikes.
