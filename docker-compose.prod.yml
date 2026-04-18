@@ -1,0 +1,41 @@
+# Production-style compose: indexer only, no bundled Postgres.
+#
+# Point DB_HOST at your managed Postgres endpoint; set DB_SSLMODE=require
+# if your cluster requires TLS. Everything else is overridable via env.
+# Never put DB_PASSWORD inline here — inject it from your secret store.
+
+services:
+  indexer:
+    image: ${INDEXER_IMAGE:-lava-indexer:latest}
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # --- Chain / RPC ---
+      LAVA_CHAIN_ID: ${LAVA_CHAIN_ID:-lava-mainnet-1}
+      LAVA_RPC_ENDPOINTS: ${LAVA_RPC_ENDPOINTS}   # comma-separated, falls back to LAVA_RPC_ENDPOINT
+      LAVA_RPC_ENDPOINT: ${LAVA_RPC_ENDPOINT:-}
+      # --- Database (external) ---
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_DATABASE: ${DB_DATABASE:-postgres}
+      DB_SCHEMA: ${DB_SCHEMA:-app}
+      DB_SSLMODE: ${DB_SSLMODE:-require}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-16}
+      # --- Indexing window / tuning ---
+      INDEXER_START_HEIGHT: ${INDEXER_START_HEIGHT:-1}
+      INDEXER_END_HEIGHT: ${INDEXER_END_HEIGHT:-0}
+      INDEXER_FETCH_WORKERS: ${INDEXER_FETCH_WORKERS:-16}
+      INDEXER_FETCH_BATCH_SIZE: ${INDEXER_FETCH_BATCH_SIZE:-10}
+      INDEXER_TIP_CONFIRMATIONS: ${INDEXER_TIP_CONFIRMATIONS:-5}
+      # --- Built-in UI ---
+      WEB_ENABLED: "true"
+      WEB_ADDR: "0.0.0.0:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

@@ -1,0 +1,151 @@
+# Example config. Copy to config.yml and adjust.
+
+network:
+  chain_id: lava-mainnet-1
+
+  # One or more endpoints — the indexer probes each on startup, records
+  # each endpoint's (earliest_block, latest_block) window, and round-robins
+  # fetch requests across the healthy ones. A batch is only routed to an
+  # endpoint whose window covers its heights, so mixing a pruning node
+  # (fast for recent blocks) with an archive (covers history) works out of
+  # the box.
+  #
+  # `kind` is "rpc" (Tendermint/CometBFT JSON-RPC 2.0, recommended — captures
+  # every event type) or "rest" (Cosmos LCD — only tx-scoped events, usually
+  # slower; useful for experimentation).
+  #
+  # `headers` is an optional map of HTTP headers sent with every request to
+  # this endpoint. Typical uses:
+  #   - routing hints: `lava-extension: archive` tells Lava public gateways
+  #     to serve from archive nodes (needed for deep history on
+  #     *.lava.build); other providers have their own flags.
+  #   - authentication for paid / private nodes, e.g. `Authorization:
+  #     Bearer <token>`, `x-api-key: <key>`, or whatever your provider
+  #     expects. Put the value directly in config — the indexer just
+  #     passes it through verbatim.
+  # Content-Type / Accept are always set by the client and can't be overridden
+  # from config, so an error here can't break the wire format.
+  endpoints:
+    - kind: rpc
+      url: https://lava.tendermintrpc.lava.build:443
+      headers:
+        lava-extension: archive
+    - kind: rest
+      url: https://lava.rest.lava.build
+      headers:
+        lava-extension: archive
+    # Paid / private endpoint — auth via headers:
+    # - kind: rpc
+    #   url: https://rpc.my-paid-provider.com
+    #   headers:
+    #     Authorization: "Bearer eyJhbGciOi..."
+    #     x-api-key: "sk_live_..."
+
+indexer:
+  # Height bounds. 0 for end_height means follow tip forever. Use non-zero
+  # end_height for bounded backfills.
+  start_height: 1
+  end_height: 0
+
+  # If true, start_height is ignored and the indexer resolves the start
+  # block at runtime to the MIN earliest block across all healthy
+  # endpoints. Useful with a mixed RPC fleet (e.g. archive + pruning):
+  # fetch back as far as the fleet combined can serve, without hard-coding
+  # a height that will go stale as pruning nodes advance.
+  earliest_mode: false
+
+  # Which event handlers to register. Use ["all"] or leave empty to enable
+  # every compiled-in handler. Otherwise give a list of handler names; ones
+  # not listed are skipped entirely (they won't record coverage either).
+  # Also settable via env: INDEXER_HANDLERS=lava_relay_payment,...
+  handlers: ["all"]
+
+  # How many blocks to keep below the chain tip while live-following, for
+  # reorg safety. Cosmos/CometBFT chains (like Lava) have deterministic
+  # finality — every block is final the moment it's committed by ⅔+ of
+  # validators — so 0 is correct for them and tracks the head with zero
+  # lag. Raise only for probabilistic-finality chains where late reorgs
+  # are possible.
+  tip_confirmations: 0
+
+  # Fetcher pool size. Positive integer = explicit worker count. 0 =
+  # ADAPTIVE: on startup the indexer sizes the pool to Σ endpoint max
+  # concurrency (default 64 per endpoint). With per-endpoint AIMD gating
+  # actual concurrent calls, extra workers just backpressure gracefully
+  # instead of overloading any single node — it's a safe default.
+  fetch_workers: 0
+
+  # How many blocks per JSON-RPC batch. Each batch = one HTTP POST with
+  # 2*N method calls (block + block_results). 5–20 is a sensible range.
+  fetch_batch_size: 10
+
+  # Rows per COPY. Higher = fewer round-trips, more memory.
+  write_batch_rows: 20000
+
+  # Max blocks queued between fetchers and the writer. Backpressure knob.
+  queue_depth: 200
+
+  # How often the tip-follower polls /status after catching up.
+  tip_poll_interval: 3s
+
+  # Dead-letter retry loop: how often the pipeline sweeps app.indexer_failures
+  # and re-enqueues failed heights. 0 disables (dead-letters then only get
+  # another chance on restart or when tip-follow re-picks them up). Default
+  # 60s catches transient saturation without churning the DB.
+  failure_retry_interval: 60s
+
+  # Max failed heights retried per sweep. Smaller = gentler on the RPC fleet,
+  # larger = faster drain.
+  failure_retry_batch: 200
+
+  # If true, on startup delete indexer_ranges + indexer_failures rows for
+  # heights OUTSIDE [start_height, end_height|tip]. Useful when narrowing
+  # start_height after a previous wider run — otherwise the stale state
+  # shows up as zombie "covered ranges" on the timeline that will never
+  # be touched again.
+  prune_outside_window: false
+
+  # Gap scheduler interleave. Most batches go to the highest-cursor gap
+  # (tip-first) but every Nth batch goes to the LOWEST-cursor gap — so a
+  # big historical-backfill gap can't starve behind thousands of
+  # tip-close fragments. 0 or 1 = pure tip-first (fine if you only ever
+  # have one gap). Default 5 ≈ 80/20 split in favour of tip work.
+  backfill_interleave: 5
+
+database:
+  host: postgres
+  port: 5432
+  user: postgres
+  password: postgres
+  database: postgres
+  schema: app
+  # pgxpool max connections. Writer uses one; rest are for aggregates/queries.
+  pool_size: 8
+
+# Aggregates directory. All *.sql files applied in filename order on startup
+# (idempotent — use CREATE ... IF NOT EXISTS). aggregates.yml in this directory
+# declares refresh schedules that get scheduled via pg_cron.
+aggregates_dir: ./aggregates
+
+web:
+  # Built-in progress UI + JSON status API. Exposed by the indexer itself —
+  # no extra container needed. See / in a browser; /api/status for the raw
+  # JSON; /healthz for a liveness check.
+  enabled: true
+  addr: ":8080"
+
+log:
+  # "json" is what structured log pipelines (CloudWatch Logs Insights, Loki,
+  # Datadog) want. "text" is friendlier for a local terminal. Override at
+  # runtime with LOG_FORMAT=json|text and LOG_LEVEL=debug|info|warn|error.
+  format: "json"
+  level:  "info"
+
+graphql:
+  # Reverse-proxy /graphql and /graphiql on the web port to an upstream
+  # GraphQL server (PostGraphile by default). With this enabled, the UI
+  # shows a "GraphQL" tab that iframes /graphiql — same origin, no CORS,
+  # only one exposed port.
+  # Disable with graphql.enabled: false or env GRAPHQL_ENABLED=false.
+  enabled: true
+  upstream: "http://graphql:5000"
