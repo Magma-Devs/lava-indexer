@@ -3,3 +3,5 @@
 /indexer
 /bin/
 *.log
+/_workspace/
+/_workspace_prev_*/
