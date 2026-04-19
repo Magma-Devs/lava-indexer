@@ -37,27 +37,35 @@ func New(pool *pgxpool.Pool, schema string) *State {
 func (s *State) Schema() string { return s.schema }
 
 // Ensure creates the schema + state tables if missing. Idempotent.
+//
+// Wrapped in a single tx so a network blip or syntax mismatch
+// part-way through can't leave the DB half-migrated. Each sub-step
+// (ranges / runs / failures) used to run in its own implicit autocommit
+// tx, which made `IF NOT EXISTS` enough for re-runs but was a landmine
+// the first time a non-additive change lands here.
 func (s *State) Ensure(ctx context.Context) error {
-	sql := fmt.Sprintf(`
-		CREATE SCHEMA IF NOT EXISTS %[1]s;
-		CREATE TABLE IF NOT EXISTS %[1]s.indexer_ranges (
-		  handler     TEXT        NOT NULL,
-		  from_height BIGINT      NOT NULL,
-		  to_height   BIGINT      NOT NULL,
-		  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-		  PRIMARY KEY (handler, from_height),
-		  CHECK (to_height >= from_height)
-		);
-		CREATE INDEX IF NOT EXISTS idx_indexer_ranges_handler_to
-		  ON %[1]s.indexer_ranges (handler, to_height);
-	`, s.schema)
-	if _, err := s.pool.Exec(ctx, sql); err != nil {
-		return err
-	}
-	if err := s.ensureRunsTable(ctx); err != nil {
-		return err
-	}
-	return s.ensureFailuresTable(ctx)
+	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		sql := fmt.Sprintf(`
+			CREATE SCHEMA IF NOT EXISTS %[1]s;
+			CREATE TABLE IF NOT EXISTS %[1]s.indexer_ranges (
+			  handler     TEXT        NOT NULL,
+			  from_height BIGINT      NOT NULL,
+			  to_height   BIGINT      NOT NULL,
+			  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			  PRIMARY KEY (handler, from_height),
+			  CHECK (to_height >= from_height)
+			);
+			CREATE INDEX IF NOT EXISTS idx_indexer_ranges_handler_to
+			  ON %[1]s.indexer_ranges (handler, to_height);
+		`, s.schema)
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			return err
+		}
+		if err := s.ensureRunsTableTx(ctx, tx); err != nil {
+			return err
+		}
+		return s.ensureFailuresTableTx(ctx, tx)
+	})
 }
 
 // ensureFailuresTable creates the dead-letter table for batches that failed
@@ -69,7 +77,7 @@ func (s *State) Ensure(ctx context.Context) error {
 // ranges no endpoint covers, retry-cap exhausted) from the transient pool
 // the retry sweep still churns on. Permanent rows STAY in the table —
 // they're observability data, not forgotten work.
-func (s *State) ensureFailuresTable(ctx context.Context) error {
+func (s *State) ensureFailuresTableTx(ctx context.Context, tx pgx.Tx) error {
 	sql := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %[1]s.indexer_failures (
 		  handler       TEXT        NOT NULL,
@@ -86,7 +94,7 @@ func (s *State) ensureFailuresTable(ctx context.Context) error {
 		  ADD COLUMN IF NOT EXISTS max_retries_reached_at TIMESTAMPTZ;
 		CREATE INDEX IF NOT EXISTS idx_indexer_failures_handler_permanent
 		  ON %[1]s.indexer_failures (handler, permanent);`, s.schema)
-	_, err := s.pool.Exec(ctx, sql)
+	_, err := tx.Exec(ctx, sql)
 	return err
 }
 

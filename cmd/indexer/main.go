@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/KimMachineGun/automemlimit/memlimit"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/magma-devs/lava-indexer/internal/aggregates"
 	"github.com/magma-devs/lava-indexer/internal/config"
@@ -167,12 +168,24 @@ func main() {
 	}
 	register(relay_payment.New(cfg.Database.Schema))
 
-	// Apply every handler's DDL before indexing starts.
+	// Apply every handler's DDL before indexing starts. Each handler's
+	// DDL slice runs inside one tx so a partial failure (network blip,
+	// lock contention, syntax mismatch on a future PG version) leaves the
+	// DB at the pre-bring-up state instead of half-migrated. CREATE
+	// TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS are
+	// transaction-safe in PG.
 	for _, h := range reg.All() {
-		for _, ddl := range h.DDL() {
-			if _, err := pool.Exec(ctx, ddl); err != nil {
-				fatal("apply handler DDL", err)
+		ddls := h.DDL()
+		err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+			for _, ddl := range ddls {
+				if _, err := tx.Exec(ctx, ddl); err != nil {
+					return err
+				}
 			}
+			return nil
+		})
+		if err != nil {
+			fatal("apply handler DDL", fmt.Errorf("%s: %w", h.Name(), err))
 		}
 	}
 

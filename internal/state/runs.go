@@ -25,9 +25,10 @@ type Run struct {
 	EndReason     string     `json:"end_reason,omitempty"`
 }
 
-// ensureRunsTable creates the table on first use. Called from Ensure so the
-// runs table comes up with the rest of the state schema.
-func (s *State) ensureRunsTable(ctx context.Context) error {
+// ensureRunsTableTx creates the table on first use. Called from Ensure
+// inside the schema-bring-up transaction so the runs table comes up with
+// the rest of the state schema atomically.
+func (s *State) ensureRunsTableTx(ctx context.Context, tx pgx.Tx) error {
 	sql := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %[1]s.indexer_runs (
 		  id             BIGSERIAL   PRIMARY KEY,
@@ -41,7 +42,7 @@ func (s *State) ensureRunsTable(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS idx_indexer_runs_started
 		  ON %[1]s.indexer_runs (started_at DESC);
 	`, s.schema)
-	_, err := s.pool.Exec(ctx, sql)
+	_, err := tx.Exec(ctx, sql)
 	return err
 }
 
