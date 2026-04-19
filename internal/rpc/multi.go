@@ -59,9 +59,8 @@ type Endpoint struct {
 	// dashboard can show why an endpoint was taken out of rotation.
 	Reason string
 
-	metrics    *metricsTracker
-	ctrl       *AdaptiveController
-	history    *metricsHistory
+	metrics *metricsTracker
+	history *metricsHistory
 }
 
 // Metrics returns a snapshot of live throughput/latency for this endpoint.
@@ -72,14 +71,6 @@ func (e *Endpoint) Metrics() EndpointMetrics {
 	return e.metrics.snapshot()
 }
 
-// ConcurrencyBudget returns the current AIMD-controlled concurrency cap.
-func (e *Endpoint) ConcurrencyBudget() int {
-	if e.ctrl == nil {
-		return 0
-	}
-	return e.ctrl.Budget()
-}
-
 // MetricHistory returns the recent snapshots for time-series rendering.
 func (e *Endpoint) MetricHistory() []MetricSample {
 	if e.history == nil {
@@ -88,14 +79,23 @@ func (e *Endpoint) MetricHistory() []MetricSample {
 	return e.history.snapshot()
 }
 
-// MultiClientOptions lets the caller tune the adaptive controller without
-// editing the code. Zero values pick sensible defaults.
+// MultiClientOptions tunes the per-endpoint metrics history and the
+// metrics-recorder tick cadence.
+//
+// There is deliberately no per-endpoint concurrency cap here. Earlier
+// iterations ran an AIMD controller that shrank per-endpoint budget on
+// latency spikes and error rate; for operators running owned RPC nodes
+// that they're comfortable overwhelming, the cap became throughput on
+// the table (budgets pinned at Min=4 with 90+ fetch workers idle). The
+// only limit now is the process-wide fetch-worker count, which is
+// already resource-sized by the adaptive sizer (CPU × 8, mem/2 MiB).
+// Operators running against shared public gateways should either set
+// fetch_workers modestly in config, or re-introduce a per-endpoint cap
+// as a config field; the routing layer picks the fastest endpoint, so
+// uneven per-node throughput naturally biases load away from anything
+// that's actively slowing down.
 type MultiClientOptions struct {
-	InitialConcurrency int           // default 8
-	MinConcurrency     int           // default 1
-	MaxConcurrency     int           // default 64
-	TargetP99          time.Duration // default 500ms
-	HistorySeconds     int           // default 1800 (30 min of 1-sec samples)
+	HistorySeconds int // default 1800 (30 min of 1-sec samples)
 }
 
 func NewMulti(eps []*Endpoint) *MultiClient {
@@ -103,24 +103,12 @@ func NewMulti(eps []*Endpoint) *MultiClient {
 }
 
 func NewMultiWithOptions(eps []*Endpoint, opts MultiClientOptions) *MultiClient {
-	if opts.InitialConcurrency == 0 {
-		opts.InitialConcurrency = 8
-	}
-	if opts.MinConcurrency == 0 {
-		opts.MinConcurrency = 4 // never collapse below 4 — we need at least that to measure latency
-	}
-	if opts.MaxConcurrency == 0 {
-		opts.MaxConcurrency = 64
-	}
 	if opts.HistorySeconds == 0 {
 		opts.HistorySeconds = 1800
 	}
 	for _, e := range eps {
 		if e.metrics == nil {
 			e.metrics = newMetricsTracker()
-		}
-		if e.ctrl == nil {
-			e.ctrl = NewAdaptiveController(opts.InitialConcurrency, opts.MinConcurrency, opts.MaxConcurrency, opts.TargetP99)
 		}
 		if e.history == nil {
 			e.history = newMetricsHistory(opts.HistorySeconds)
@@ -129,10 +117,12 @@ func NewMultiWithOptions(eps []*Endpoint, opts MultiClientOptions) *MultiClient 
 	return &MultiClient{endpoints: eps}
 }
 
-// StartController spawns a goroutine that ticks the AIMD controller for each
-// endpoint every `interval` and appends a snapshot to the history ring.
-// Returns when ctx is cancelled.
-func (m *MultiClient) StartController(ctx context.Context, interval time.Duration) {
+// StartMetricsRecorder spawns a goroutine that samples per-endpoint
+// metrics every `interval` and appends to the history ring. Returns
+// when ctx is cancelled. This used to tick an AIMD controller as well;
+// with the controller gone, it's purely an observation feed for the
+// dashboard time-series.
+func (m *MultiClient) StartMetricsRecorder(ctx context.Context, interval time.Duration) {
 	if interval == 0 {
 		interval = 3 * time.Second
 	}
@@ -145,9 +135,7 @@ func (m *MultiClient) StartController(ctx context.Context, interval time.Duratio
 				return
 			case now := <-t.C:
 				for _, ep := range m.endpoints {
-					mm := ep.Metrics()
-					ep.ctrl.Tick(mm)
-					ep.history.add(now, mm, ep.ctrl.Budget())
+					ep.history.add(now, ep.Metrics())
 				}
 			}
 		}
@@ -278,27 +266,34 @@ func (m *MultiClient) Tip(ctx context.Context) (int64, error) {
 }
 
 // FetchBlocks routes the batch to an endpoint whose coverage window covers
-// the requested heights. This is the AUTHORITATIVE "I tried everyone"
-// loop in the system — there is no outer retry wrapper, so once
-// FetchBlocks returns the pipeline either bisects (multi-block batch) or
-// dead-letters (size-1).
+// the requested heights. This is the AUTHORITATIVE "I tried everyone" loop
+// in the system — there is no outer retry wrapper, so once FetchBlocks
+// returns the pipeline either bisects (multi-block batch) or dead-letters
+// (size-1).
 //
-// Policy:
+// Routing policy (uncapped model):
 //
-//   - Pick the eligible endpoint with the most HEADROOM right now
-//     (budget − in_flight). Under contention this packs new work onto
-//     whichever node is least busy, naturally spreading load across nodes
-//     when the system can handle more.
+//   - Filter to endpoints whose coverage window includes every requested
+//     height.
+//   - Rank eligible endpoints by a pending-work score:
+//         score = p50_latency_ms × (1 + in_flight)
+//     lowest wins. This naturally routes new work to the fastest currently-
+//     least-busy endpoint without any explicit concurrency cap. An endpoint
+//     that's slow OR has queued-up requests gets ranked down; an endpoint
+//     that recovers faster than its peers earns back traffic on its next
+//     snapshot. Ties randomise via a round-robin counter for fairness when
+//     metrics aren't yet populated.
 //   - On *ErrRateLimited (429) or *ErrServerError (5xx), fail over
-//     immediately to the next eligible endpoint. The HTTP layer doesn't
-//     retry these in place — sick or throttled nodes don't recover inside
-//     a 200ms backoff, and burning a retry there just delays failover.
+//     immediately to the next candidate. HTTP layer doesn't retry these in
+//     place — sick/throttled nodes don't recover inside a 200 ms backoff.
 //   - On any other error (network err that survived the HTTP layer's one
-//     in-place retry, decode err), also try the next endpoint.
-//   - If every eligible endpoint is at budget, wait up to 5s for headroom
-//     to open up (AIMD ticks every 3s and naturally completing in-flights
-//     free slots). Then fail with "saturated for 5s".
+//     in-place retry, decode err), also try the next candidate.
 //   - Returns the last error if every eligible endpoint failed.
+//
+// No saturation-wait loop: there is no per-endpoint concurrency cap, so
+// "saturated" at the routing layer is no longer a real state. If an
+// upstream is slow enough to make everything queue, that shows up as
+// higher p50 and the score naturally biases load away from it.
 func (m *MultiClient) FetchBlocks(ctx context.Context, heights []int64) ([]*Block, error) {
 	if len(heights) == 0 {
 		return nil, nil
@@ -325,91 +320,55 @@ func (m *MultiClient) FetchBlocks(ctx context.Context, heights []int64) ([]*Bloc
 		return nil, &NoEndpointCoversError{MinHeight: minH, MaxHeight: maxH}
 	}
 
-	// Wait up to ~5s for some endpoint to have budget headroom. This is the
-	// AIMD controller's safety enforcement: even if a bunch of workers fire
-	// at once, they don't all pile onto the same node past its capacity.
+	// Rank by pending-work score. Lower is better.
+	type cand struct {
+		ep    *Endpoint
+		score float64
+	}
+	cands := make([]cand, 0, len(eligible))
+	for _, ep := range eligible {
+		m := ep.Metrics()
+		// No latency data yet → treat as average (100 ms) so the endpoint
+		// gets exploration traffic rather than being starved.
+		p50 := m.LatencyP50Ms
+		if p50 == 0 {
+			p50 = 100
+		}
+		cands = append(cands, cand{ep: ep, score: p50 * float64(1+m.InFlight)})
+	}
 	rr := int(m.next.Add(1) - 1)
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].score != cands[j].score {
+			return cands[i].score < cands[j].score
+		}
+		return (i+rr)%len(cands) < (j+rr)%len(cands)
+	})
+
 	var lastErr error
-	for waited := time.Duration(0); waited < 5*time.Second; {
-		// Pick endpoints with positive headroom, sorted by headroom desc.
-		type cand struct {
-			ep       *Endpoint
-			headroom int
+	for _, c := range cands {
+		ep := c.ep
+		done := ep.metrics.begin()
+		blocks, err := ep.Client.FetchBlocks(ctx, heights)
+		done(err)
+		if err == nil {
+			return blocks, nil
 		}
-		cands := make([]cand, 0, len(eligible))
-		for _, ep := range eligible {
-			headroom := ep.ConcurrencyBudget() - int(ep.Metrics().InFlight)
-			cands = append(cands, cand{ep, headroom})
-		}
-		sort.SliceStable(cands, func(i, j int) bool {
-			if cands[i].headroom != cands[j].headroom {
-				return cands[i].headroom > cands[j].headroom
-			}
-			return (i+rr)%len(cands) < (j+rr)%len(cands)
-		})
-
-		if cands[0].headroom > 0 {
-			// Try candidates in order; failover immediately on 429, retry-
-			// in-place already happened inside Client for 5xx/net errors.
-			for _, c := range cands {
-				if c.headroom <= 0 {
-					break
-				}
-				ep := c.ep
-				done := ep.metrics.begin()
-				blocks, err := ep.Client.FetchBlocks(ctx, heights)
-				done(err)
-				if err == nil {
-					return blocks, nil
-				}
-				lastErr = err
-				var rl *ErrRateLimited
-				var se *ErrServerError
-				switch {
-				case errors.As(err, &rl):
-					slog.Debug("endpoint rate-limited, failing over",
-						"url", ep.URL, "retry_after", rl.RetryAfter)
-				case errors.As(err, &se):
-					slog.Debug("endpoint server-error, failing over",
-						"url", ep.URL, "status", se.Status, "retry_after", se.RetryAfter)
-				default:
-					slog.Warn("fetch failed, trying next endpoint",
-						"url", ep.URL, "err", err)
-				}
-			}
-			return nil, fmt.Errorf("all %d eligible endpoints failed; last: %w", len(cands), lastErr)
-		}
-
-		// Everyone's at budget. Back off briefly and re-check. The AIMD
-		// controller tick (3 s) + naturally-completing in-flight requests
-		// free up slots as we wait.
-		delay := 100 * time.Millisecond
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(delay):
-		}
-		waited += delay
-	}
-	return nil, fmt.Errorf("all %d eligible endpoints saturated for 5s", len(eligible))
-}
-
-// pickEndpointHint returns the endpoint with the most budget headroom right
-// now, or nil if none qualify. Used for soft routing — callers still round-
-// robin but can prefer a less-loaded endpoint under contention. Not wired
-// in yet; keep budget observable while we tune the heuristic.
-func (m *MultiClient) pickEndpointHint(eligible []*Endpoint) *Endpoint {
-	if len(eligible) == 0 {
-		return nil
-	}
-	best := eligible[0]
-	for _, ep := range eligible[1:] {
-		if ep.ConcurrencyBudget()-int(ep.Metrics().InFlight) >
-			best.ConcurrencyBudget()-int(best.Metrics().InFlight) {
-			best = ep
+		lastErr = err
+		var rl *ErrRateLimited
+		var se *ErrServerError
+		switch {
+		case errors.As(err, &rl):
+			slog.Debug("endpoint rate-limited, failing over",
+				"url", ep.URL, "retry_after", rl.RetryAfter)
+		case errors.As(err, &se):
+			slog.Debug("endpoint server-error, failing over",
+				"url", ep.URL, "status", se.Status, "retry_after", se.RetryAfter)
+		default:
+			slog.Warn("fetch failed, trying next endpoint",
+				"url", ep.URL, "err", err)
 		}
 	}
-	return best
+	return nil, fmt.Errorf("all %d eligible endpoints failed; last: %w", len(cands), lastErr)
 }
 
 func (m *MultiClient) Close() {

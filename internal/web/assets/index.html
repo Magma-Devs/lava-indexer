@@ -579,32 +579,25 @@
   // Detailed per-endpoint view. Cards are built ONCE per URL, cached, and
   // on every refresh only their text / SVG path attributes are rewritten.
   // No DOM reflow, no sparkline flicker.
-  const BUDGET_TOOLTIP =
-    "Adaptive concurrency cap for this endpoint.\n\n" +
-    "An AIMD (additive-increase, multiplicative-decrease) controller watches " +
-    "p50/p99 latency and error rate, and adjusts this budget so we push the " +
-    "node as hard as it can take without the tail latency or errors blowing up.\n\n" +
-    "Grows (+2) when p99 < 3× p50, utilisation ≥ 70%, and errors < 1%.\n" +
-    "Shrinks (×0.75) when p99 > 8× p50 or error rate ≥ 5%.\n\n" +
-    "Clamped to [min, max]. The first 20 requests after startup are treated " +
-    "as warm-up and don't trigger shrinks so cold TLS/TCP handshakes can't " +
-    "collapse the budget.";
   const INFLIGHT_TOOLTIP =
     "Requests currently waiting for this endpoint to respond. 'peak' is the " +
-    "high-water mark since this process started.";
+    "high-water mark since this process started.\n\n" +
+    "There is no per-endpoint concurrency cap in this build — in-flight is " +
+    "bounded only by the process-wide fetch-worker count.";
   const RPS_TOOLTIP =
     "Completed requests per second, averaged over the last 60 seconds. " +
     "With N concurrent workers averaging L seconds/request, this equals N/L — " +
     "so 16 workers × 0.5 s latency ≈ 32 req/s.";
   const LATENCY_TOOLTIP =
     "Latency percentiles over the last ~500 completed requests.\n" +
-    "p50 is typical.\n" +
+    "p50 is typical and drives routing — the FetchBlocks dispatcher picks the " +
+    "endpoint with the lowest p50 × (1 + in_flight) score.\n" +
     "p95 tells you what a slow request looks like under normal load.\n" +
     "p99 is the worst-case tail.\n\n" +
     "A p99 much higher than p50 means requests are queueing on the node.";
   const ERRORS_TOOLTIP =
-    "HTTP / RPC failures divided by total requests. Anything persistently " +
-    "above 1 % makes the adaptive controller pull back.";
+    "HTTP / RPC failures divided by total requests. High rates bias routing " +
+    "away from this endpoint by inflating its p50 × in_flight score.";
 
   const detailCards = new Map(); // idx -> refs
 
@@ -657,22 +650,21 @@
     // (display:none) when the endpoint is healthy.
     const reasonBanner = el('div', { class: 'ep-reason-banner', style: { display: 'none' } });
 
-    const budget   = makeStatCard('Budget',   BUDGET_TOOLTIP);
     const inflight = makeStatCard('In flight', INFLIGHT_TOOLTIP);
     const rps      = makeStatCard('Req / s', RPS_TOOLTIP);
     const latency  = makeStatCard('p50 / p95 / p99', LATENCY_TOOLTIP);
     const errors   = makeStatCard('Errors', ERRORS_TOOLTIP);
     const stats = el('div', { class: 'ep-card-row' },
-      budget.root, inflight.root, rps.root, latency.root, errors.root);
+      inflight.root, rps.root, latency.root, errors.root);
 
     const sparks = {
       rps:      makeSparkBox('Throughput · req/s', '#6ee7b7', v => v.toFixed(1)),
       p99:      makeSparkBox('p99 latency · ms',   '#f59e0b', v => v.toFixed(0) + 'ms'),
-      budget:   makeSparkBox('Adaptive budget',    '#8b5cf6', v => String(Math.round(v))),
+      p50:      makeSparkBox('p50 latency · ms',   '#8b5cf6', v => v.toFixed(0) + 'ms'),
       inflight: makeSparkBox('In-flight',          '#60a5fa', v => String(Math.round(v))),
     };
     const charts = el('div', { class: 'sparkline-block' },
-      sparks.rps.root, sparks.p99.root, sparks.budget.root, sparks.inflight.root);
+      sparks.rps.root, sparks.p99.root, sparks.p50.root, sparks.inflight.root);
 
     const root = el('div', { class: 'ep-card' }, head, reasonBanner, stats, charts);
 
@@ -686,7 +678,7 @@
       localStorage.setItem(storeKey, root.classList.contains('collapsed') ? '1' : '0');
     });
 
-    return { root, mark, kind, urlSpan, coverage, reasonBanner, budget, inflight, rps, latency, errors, sparks };
+    return { root, mark, kind, urlSpan, coverage, reasonBanner, inflight, rps, latency, errors, sparks };
   }
 
   function updateDetailCard(card, e) {
@@ -710,7 +702,6 @@
     card.coverage.textContent =
       `${fmt(e.earliest || 0)} → ${fmt(e.latest || 0)}${ef ? '  ·  ' + ef : ''}${lf ? ' → ' + lf : ''}`;
 
-    setStat(card.budget,   String(m.budget || 0),       'max concurrent · AIMD', '');
     setStat(card.inflight, `${m.in_flight || 0} / ${m.max_in_flight || 0}`, 'now / peak', '');
     setStat(card.rps,      (m.requests_per_sec || 0).toFixed(1), 'completed, rolling 60s', '');
     const p99cls = (m.latency_p99_ms || 0) > ((m.latency_p50_ms || 0) * 5 + 500) ? 'bad'
@@ -728,7 +719,7 @@
   function updateSparks(card, history) {
     setSpark(card.sparks.rps,      history.map(s => s.requests_per_sec), v => v.toFixed(1));
     setSpark(card.sparks.p99,      history.map(s => s.latency_p99_ms),   v => v.toFixed(0) + 'ms');
-    setSpark(card.sparks.budget,   history.map(s => s.budget),           v => String(v));
+    setSpark(card.sparks.p50,      history.map(s => s.latency_p50_ms),   v => v.toFixed(0) + 'ms');
     setSpark(card.sparks.inflight, history.map(s => s.in_flight),        v => String(v));
   }
 

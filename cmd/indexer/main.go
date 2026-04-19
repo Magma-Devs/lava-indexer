@@ -68,9 +68,9 @@ func main() {
 		fatal("probe endpoints", err)
 	}
 
-	// Spin up the AIMD controller + history ring per endpoint so the web UI
-	// and the fetchers see the same adaptive-concurrency budget.
-	client.StartController(ctx, 3*time.Second)
+	// Start the metrics recorder so the per-endpoint history ring gets
+	// populated every 3s for the web UI's sparklines.
+	client.StartMetricsRecorder(ctx, 3*time.Second)
 
 	// Adaptive sizer (optional): takes over fetch_workers and/or
 	// fetch_batch_size when either is set to 0. It ticks every 10s,
@@ -411,7 +411,6 @@ func (m multiClientSignals) EndpointSignals() []pipeline.EndpointSignal {
 			RecentErrorRate: er,
 			LatencyP50Ms:    mm.LatencyP50Ms,
 			LatencyP99Ms:    mm.LatencyP99Ms,
-			Budget:          ep.ConcurrencyBudget(),
 		})
 	}
 	return out

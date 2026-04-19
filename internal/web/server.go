@@ -255,7 +255,6 @@ type EndpointMetricsJSON struct {
 	LatencyP50Ms   float64 `json:"latency_p50_ms"`
 	LatencyP95Ms   float64 `json:"latency_p95_ms"`
 	LatencyP99Ms   float64 `json:"latency_p99_ms"`
-	Budget         int     `json:"budget"`         // current AIMD concurrency cap
 	HistoryURL     string  `json:"history_url,omitempty"` // pointer to /api/history?url=...
 }
 
@@ -384,7 +383,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			LatencyP50Ms:   mm.LatencyP50Ms,
 			LatencyP95Ms:   mm.LatencyP95Ms,
 			LatencyP99Ms:   mm.LatencyP99Ms,
-			Budget:         ep.ConcurrencyBudget(),
 		}
 		resp.Endpoints = append(resp.Endpoints, es)
 	}
