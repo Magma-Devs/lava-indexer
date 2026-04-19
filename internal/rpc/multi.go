@@ -322,18 +322,20 @@ func (m *MultiClient) FetchBlocks(ctx context.Context, heights []int64) ([]*Bloc
 
 	// Rank by pending-work score. Lower is better.
 	//
-	//     score = p50 × (1 + in_flight) × (1 + errRate × 10)
+	//     score = p50 × (1 + in_flight) × (1 + errRate × 3)
 	//
 	// The three terms together:
 	//   - p50 captures how fast this endpoint has been completing requests.
 	//   - (1 + in_flight) dampens piling onto an already-queued endpoint.
-	//   - (1 + errRate × 10) dampens piling onto a broken endpoint. Errors
+	//   - (1 + errRate × 3) dampens piling onto a broken endpoint. Errors
 	//     typically complete fast (429 / 5xx fast-fail), so p50 stays low
 	//     even when the endpoint is returning failures — without an
 	//     explicit error penalty, a broken endpoint keeps winning the
-	//     routing decision and self-reinforces its own broken-ness. A
-	//     0.5 error rate makes the score 6× worse; a 1.0 rate makes it
-	//     11× worse, effectively quarantining it.
+	//     routing decision and self-reinforces its own broken-ness. A 0.5
+	//     error rate makes the score 2.5× worse; a 1.0 rate makes it 4×
+	//     worse. Moderate, not quarantining — a briefly-degraded endpoint
+	//     can still earn its way back without waiting for a 500-entry
+	//     latency ring to rotate out of its old slow measurements.
 	type cand struct {
 		ep    *Endpoint
 		score float64
@@ -351,7 +353,7 @@ func (m *MultiClient) FetchBlocks(ctx context.Context, heights []int64) ([]*Bloc
 		}
 		cands = append(cands, cand{
 			ep:    ep,
-			score: p50 * float64(1+m.InFlight) * (1 + errRate*10),
+			score: p50 * float64(1+m.InFlight) * (1 + errRate*3),
 		})
 	}
 	rr := int(m.next.Add(1) - 1)

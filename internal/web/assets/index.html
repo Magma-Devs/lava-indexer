@@ -978,9 +978,11 @@
     card.winPct.textContent = pct(h.window_pct) + ' window';
     card.chainPct.textContent = pct(h.chain_pct) + ' chain';
 
-    // "X / Y blocks indexed" relative to the configured indexing window.
-    // Computed from the ranges array so it matches what the timeline shows
-    // — the API response's window_pct uses the same denominator.
+    // "X / Y blocks indexed · ETA" relative to the configured indexing
+    // window. Computed from the ranges array so it matches what the timeline
+    // shows — the API response's window_pct uses the same denominator.
+    // ETA is (remaining / blocks_per_sec) formatted as a human duration.
+    // Shows "—" when bps is zero or we're at tip.
     const ranges = h.ranges || [];
     let doneInWindow = 0;
     for (const r of ranges) {
@@ -989,7 +991,15 @@
       if (hi >= lo) doneInWindow += (hi - lo + 1);
     }
     const windowTotal = Math.max(0, windowEnd - windowStart + 1);
-    card.blocksLine.textContent = `${fmt(doneInWindow)} / ${fmt(windowTotal)} blocks`;
+    const remaining = Math.max(0, windowTotal - doneInWindow);
+    const bps = s.blocks_per_sec || 0;
+    let etaText = '—';
+    if (remaining === 0) {
+      etaText = 'done';
+    } else if (bps > 0) {
+      etaText = formatEta(remaining / bps);
+    }
+    card.blocksLine.textContent = `${fmt(doneInWindow)} / ${fmt(windowTotal)} blocks · ETA ${etaText}`;
 
     const rowCounts = h.row_counts || {};
     const rowCountsText = Object.entries(rowCounts).map(([t, n]) => `${t}: ${fmt(n)}`).join('   ');
