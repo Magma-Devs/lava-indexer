@@ -121,6 +121,7 @@
   .handler-pct { margin-left: auto; font-variant-numeric: tabular-nums; font-size: 13px; text-align: right; }
   .handler-pct .chain { color: var(--muted); font-size: 11px; }
   .handler-pct .win   { color: var(--accent); font-weight: 600; }
+  .handler-pct .blocks { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
   .handler-row-counts { color: var(--muted); font-size: 11px; margin-top: 6px; }
   .handler-dates { color: var(--muted); font-size: 11px; margin-top: 4px; }
   .handler-dates b { color: var(--fg); font-weight: 600; }
@@ -941,7 +942,11 @@
     const types = el('div', { class: 'handler-types' });
     const winPct = el('div', { class: 'win' });
     const chainPct = el('div', { class: 'chain' });
-    const pctNode = el('div', { class: 'handler-pct' }, winPct, chainPct);
+    // Absolute "X / Y blocks" line — same axis as the percentages so the
+    // operator can see at-a-glance both how much of the window is covered
+    // and the raw block count vs the configured target.
+    const blocksLine = el('div', { class: 'blocks', title: 'blocks indexed in the configured window / total blocks in the window' });
+    const pctNode = el('div', { class: 'handler-pct' }, winPct, chainPct, blocksLine);
     const head = el('div', { class: 'handler-head' }, name, types, pctNode);
 
     const rowCounts = el('div', { class: 'handler-row-counts' });
@@ -968,7 +973,7 @@
 
     const root = el('div', { class: 'handler' }, head, rowCounts, dates, timelineWrap, rangesDetail);
     return {
-      root, name, types, winPct, chainPct, rowCounts, dates,
+      root, name, types, winPct, chainPct, blocksLine, rowCounts, dates,
       timeline, windowOverlay, segments, failures, tipMarker,
       axisHeightL, axisDateL, axisHeightR, axisDateR,
       summary, list,
@@ -981,6 +986,19 @@
     card.types.textContent = (h.event_types || []).join(', ');
     card.winPct.textContent = pct(h.window_pct) + ' window';
     card.chainPct.textContent = pct(h.chain_pct) + ' chain';
+
+    // "X / Y blocks indexed" relative to the configured indexing window.
+    // Computed from the ranges array so it matches what the timeline shows
+    // — the API response's window_pct uses the same denominator.
+    const ranges = h.ranges || [];
+    let doneInWindow = 0;
+    for (const r of ranges) {
+      const lo = Math.max(r.from, windowStart);
+      const hi = Math.min(r.to, windowEnd);
+      if (hi >= lo) doneInWindow += (hi - lo + 1);
+    }
+    const windowTotal = Math.max(0, windowEnd - windowStart + 1);
+    card.blocksLine.textContent = `${fmt(doneInWindow)} / ${fmt(windowTotal)} blocks`;
 
     const rowCounts = h.row_counts || {};
     const rowCountsText = Object.entries(rowCounts).map(([t, n]) => `${t}: ${fmt(n)}`).join('   ');
@@ -1006,7 +1024,7 @@
       card.windowOverlay.style.display = 'none';
     }
 
-    const ranges = h.ranges || [];
+    // `ranges` was declared at the top of the function — reuse it.
     const children = card.segments.children;
     while (children.length > ranges.length) card.segments.removeChild(children[children.length - 1]);
     ranges.forEach((r, i) => {

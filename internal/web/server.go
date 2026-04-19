@@ -22,6 +22,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -61,7 +62,22 @@ type Server struct {
 	End             int64
 	GraphQLEnabled  bool
 	GraphQLUpstream string
+
+	// dbSizeCache memoises pg_total_relation_size for the schema. The
+	// underlying SUM(pg_total_relation_size) is the heaviest query in
+	// handleStatus on a multi-hundred-million-row table — it walks every
+	// relation and TOAST chunk, and under checkpoint/autovacuum pressure
+	// it can spike to multiple seconds, blocking the dashboard. The size
+	// changes by maybe a few MB per second under normal indexing load, so
+	// a 30 s cache is invisible to operators while removing the spike.
+	dbSizeCache struct {
+		mu    sync.Mutex
+		at    time.Time
+		bytes int64
+	}
 }
+
+const dbSizeCacheTTL = 30 * time.Second
 
 func (s *Server) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
@@ -320,15 +336,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// Total schema footprint (tables + MVs + indexes + TOAST).
-	var dbSize int64
-	_ = s.Pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0)::bigint
-		FROM pg_class c
-		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = $1 AND c.relkind IN ('r','m','i','t')
-	`, s.State.Schema()).Scan(&dbSize)
-	resp.DBSizeBytes = dbSize
+	// Total schema footprint (tables + MVs + indexes + TOAST). Cached for
+	// dbSizeCacheTTL — see Server.dbSizeCache godoc for rationale.
+	resp.DBSizeBytes = s.cachedDBSize(ctx)
 
 	if blocks, rows, secs, firstStarted, err := s.State.Totals(ctx); err == nil {
 		resp.Stats = &LifetimeStats{
@@ -479,6 +489,41 @@ func (s *Server) rowCountsFor(ctx context.Context, handler string) map[string]in
 		}
 	}
 	return out
+}
+
+// cachedDBSize returns the schema's pg_total_relation_size, recomputed at
+// most once every dbSizeCacheTTL. On query failure (timeout etc.) it
+// returns the last cached value so the dashboard keeps showing data
+// instead of a zero — the size is observational, not load-bearing.
+func (s *Server) cachedDBSize(ctx context.Context) int64 {
+	s.dbSizeCache.mu.Lock()
+	if time.Since(s.dbSizeCache.at) < dbSizeCacheTTL && s.dbSizeCache.bytes > 0 {
+		out := s.dbSizeCache.bytes
+		s.dbSizeCache.mu.Unlock()
+		return out
+	}
+	s.dbSizeCache.mu.Unlock()
+
+	var size int64
+	if err := s.Pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0)::bigint
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relkind IN ('r','m','i','t')
+	`, s.State.Schema()).Scan(&size); err != nil {
+		// Fall through to whatever's cached. Empty cache → return 0; UI
+		// renders "—" or similar.
+		s.dbSizeCache.mu.Lock()
+		out := s.dbSizeCache.bytes
+		s.dbSizeCache.mu.Unlock()
+		return out
+	}
+
+	s.dbSizeCache.mu.Lock()
+	s.dbSizeCache.at = time.Now()
+	s.dbSizeCache.bytes = size
+	s.dbSizeCache.mu.Unlock()
+	return size
 }
 
 // handleHistory serves time-series metrics for a single endpoint. Clients
