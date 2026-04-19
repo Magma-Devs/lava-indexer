@@ -113,9 +113,40 @@ next batch from there. Consequences:
   behind half a million backfill blocks.
 - Within a single gap the walk is bottom-up, `gap.From → gap.To`.
 
-Concurrent writers to `indexer_ranges` take a
-`pg_advisory_xact_lock(hashtext(handler))` before merging, so two workers
-converging on touching-but-unmerged ranges can't fragment the state.
+Each gap is also sliced at every endpoint's `Earliest` coverage horizon
+so a tier with more eligible endpoints doesn't get starved behind a tier
+only the archive can serve. Example: with `lava-archive (earliest=1)`,
+`rpc1 (earliest=4M)`, and `rpc2 (earliest=4.5M)`, a backfill from block 1
+runs as three tiers (`[1, 4M-1]` archive-only, `[4M, 4.5M-1]` + `[4.5M,
+tip]` each with more eligible endpoints) and the routing layer fans work
+across them in parallel.
+
+#### Fetch / persist are decoupled
+
+A worker isn't one-request-one-commit. The pipeline splits into two pools:
+
+```
+producer → jobs → N fetchers → writeCh → M writers → DB
+```
+
+- **N fetchers** (`fetch_workers`) pull batches, fetch via
+  `MultiClient.FetchBlocks`, parse events, and enqueue a `writeJob` to
+  `writeCh`. Fetch failures bisect (same as before); the fetcher never
+  holds a DB tx.
+- **M writers** (`pool_size - 4`) drain up to 32 `writeJob`s per 50 ms
+  window and commit them in a single Postgres tx — amortising the
+  BEGIN/Heartbeat/COMMIT overhead across many batches. Persist failures
+  record the batch as dead-letter; the sweep re-fetches.
+
+This lets fetch run up to the upstream ceiling and write run up to the DB
+ceiling independently — whichever is slower becomes the bottleneck, not
+both. No more "fast upstream gated on slow commit" or vice versa.
+
+Writers to `indexer_ranges` are **lock-free**: each writer does an
+`INSERT … ON CONFLICT DO UPDATE` and exits. A background compactor ticks
+every 30 s and runs `range_agg(int8range(...))` to collapse overlapping
+or touching raw ranges into the minimum-row representation. Writers never
+block on each other; fragmentation is bounded by one compaction cycle.
 
 ## Space-efficient schema
 
@@ -141,56 +172,68 @@ Rough density: ~100 bytes/row on a dense Lava block = ~180 GB for ~2B rows.
 
 ## How much load are we pushing at each node?
 
-With the defaults (`fetch_workers: 0`, `fetch_batch_size: 0`, both adaptive)
-the indexer sizes itself to the fleet and breathes with the nodes — see
-§ Adaptive concurrency below. With explicit values
-(`fetch_workers: 16`, `fetch_batch_size: 10`) it keeps up to **16
-concurrent HTTP POSTs in flight**, each carrying 20 JSON-RPC method calls
-(block + block_results × 10 heights). Requests are routed across endpoints
-by live headroom, so a saturating node naturally sheds load to a quieter
-peer.
+With the defaults (`fetch_workers: 0`, `fetch_batch_size: 50`) the
+indexer sizes fetch_workers to the host (CPU × 8, memory / 2 MiB, hard
+max from config) and keeps **up to `fetch_workers` HTTP POSTs in flight
+total**, distributed across endpoints by live routing (see below). Each
+POST carries 100 JSON-RPC method calls (block + block_results × 50
+heights).
+
+There is no per-endpoint concurrency cap. The process-wide
+`fetch_workers` count is the only ceiling. Historically the indexer ran
+an AIMD controller that capped each endpoint's in-flight count based on
+latency and errors — useful on shared public RPCs where good-citizen
+throttling matters, over-conservative on owned infra. The cap is gone;
+routing distributes load by speed instead.
 
 The UI's Endpoints tab shows live per-endpoint load and sparkline history
-for rps / p99 / AIMD budget / in-flight:
+for rps / p50 / p99 / in-flight:
 
 ```
 ✓ [RPC] https://rpc1        earliest …  latest …
-  budget 42   in-flight 7 / peak 12   req/s 48.3   p50/p95/p99 65/110/210ms   errors 0/4812
+  in-flight 7 / peak 128   req/s 48.3   p50/p95/p99 65/110/210ms   errors 0/4812
 ```
 
-If p99 climbs past ~8× p50 the AIMD controller pulls the budget back
-automatically; you only need to intervene if the controller is stuck at
-the minimum (= node is too slow to use) or the error rate is persistently
-> 1 % (= node is unhealthy).
+The only feedback signals wired in today are (a) routing score to bias
+load away from slow or erroring endpoints, and (b) the adaptive sizer's
+shrink path on sustained 3%+ error rate (shrinks batch size ×0.5). Tail
+latency alone no longer triggers any reaction — slow-but-healthy is
+different from broken, and routing handles the "slow" case naturally.
 
-## Adaptive concurrency (AIMD)
+## Endpoint routing
 
-Each endpoint has its own **additive-increase / multiplicative-decrease**
-controller gating how many requests the MultiClient will keep in flight
-against it. Why AIMD: different nodes have different capacity — a premium
-private RPC and a public gateway don't deserve the same worker budget,
-and node health varies minute-to-minute (upstream load, GC pauses,
-restarts). A static `fetch_workers` number is always wrong for _some_
-endpoint.
+Every `FetchBlocks` call ranks eligible endpoints and tries them in
+score order (lowest wins):
 
-The tick (every 3s) reads live metrics (rolling p50/p99 latency, error
-rate, utilisation) and moves the per-endpoint `budget`:
+```
+score = p50_ms × (1 + in_flight) × (1 + errRate × 3)
+```
 
-- **grow** (+2) when p99 < 3× p50, utilisation ≥ 70 %, errors < 1 %
-- **shrink** (× 0.75) when p99 > 8× p50 or error rate ≥ 5 %
-- clamped to `[min, max]` (defaults 4 and 64)
-- the first 20 requests after startup count as **warmup** and can't
-  trigger shrinks, so cold TLS/TCP handshakes don't collapse the budget
+Three signals, each independent:
 
-Routing is **headroom-aware**: before dispatching a batch, eligible
-endpoints are sorted by `budget − in_flight` descending, so the least
-loaded node takes new work first and one slow peer can't monopolise the
-queue.
+- `p50_ms` — how fast this endpoint has been completing requests in the
+  recent window. An endpoint that hasn't been sampled yet gets
+  `p50_ms = 100` so new endpoints get exploration traffic rather than
+  starving.
+- `(1 + in_flight)` — dampens piling onto an already-queued endpoint.
+  Grows linearly with outstanding requests, so a saturating endpoint
+  naturally sheds new work to an idle peer.
+- `(1 + errRate × 3)` — dampens piling onto a broken endpoint. Errors
+  typically complete fast (429 / 5xx fast-fail), so `p50_ms` stays low
+  even when the endpoint is returning failures — without the error
+  multiplier a broken endpoint would keep winning routing and
+  self-reinforce. A 50 % error rate makes the score 2.5× worse;
+  100 % makes it 4× worse.
 
-When `fetch_workers: 0` the process picks `Σ endpoint.max_concurrency`
-workers on startup — plenty for every endpoint to hit its AIMD ceiling
-in parallel. Extra workers just backpressure gracefully instead of
-over-loading a node.
+Failover is first-class: on `*ErrRateLimited` (429) or `*ErrServerError`
+(5xx) the client returns immediately and `MultiClient` tries the next
+candidate in score order. No in-place retry against a node that's
+actively failing — wastes latency and doesn't help.
+
+There is no "saturation wait": without a per-endpoint cap, saturation
+isn't a routing-level state. If all eligible endpoints are genuinely
+failing, `FetchBlocks` returns `"all N eligible endpoints failed"` and
+the pipeline bisects (multi-block batch) or dead-letters (size 1).
 
 ## Retry, failover, and dead-letter
 
@@ -201,14 +244,18 @@ of HTTP calls.
 ### Layer map (a request's full lifecycle)
 
 ```
-runWindow          (gap detection + tier slicing)
+runWindow          (gap detection + coverage-tier slicing)
   └── indexGaps    (single producer; tip-first with interleave)
-        └── worker (N goroutines, FIFO from jobs channel)
-              └── processWithSplit  (BISECT — recurses halves on failure)
-                    └── processBatch (fetch + write tx)
-                          └── MultiClient.FetchBlocks   ◄── FAILOVER across endpoints
-                                └── retryableCall       ◄── PER-NODE recovery only
-                                      └── http.Client.Do
+        ├── N fetchers (FIFO from jobs chan)
+        │     └── processWithSplit  (BISECT on fetch failure)
+        │           └── fetchBatch
+        │                 └── MultiClient.FetchBlocks   ◄── FAILOVER by score
+        │                       └── retryableCall       ◄── PER-NODE recovery only
+        │                             └── http.Client.Do (shared Transport, HTTP/2)
+        │     └── writeCh send (hand off parsed events to writers)
+        └── M writers (drain up to 32 writeJobs per tx)
+              └── persistJobs
+                    └── handler.Persist + RecordRange + Heartbeat (all one tx)
 ```
 
 ### What each layer is allowed to retry
@@ -219,7 +266,7 @@ runWindow          (gap detection + tier slicing)
 | `retryableCall` | `5xx` | **0** — returns `*ErrServerError` immediately | sick nodes don't recover in 200 ms; failover is faster than waiting |
 | `retryableCall` | `429` | **0** — returns `*ErrRateLimited` immediately | the node is telling us to back off; retrying it is counterproductive |
 | `retryableCall` | `4xx ≠ 429` | **0** — returns `*HTTPStatusError` (or `*HeightPrunedError`) | request is malformed or the height is gone; no retry can fix it |
-| `MultiClient.FetchBlocks` | every error type above | **N eligible endpoints**, walked in headroom-sorted order | a different node may be healthy; this is the authoritative "I tried everyone" loop |
+| `MultiClient.FetchBlocks` | every error type above | **N eligible endpoints**, walked in score order (see § Endpoint routing) | a different node may be healthy; this is the authoritative "I tried everyone" loop |
 | `processWithSplit` | multi-block batch failure (transient) | **bisect halves until size 1** | isolate one bad block from an otherwise-healthy batch |
 | Dead-letter sweep | size-1 failures still in `indexer_failures` | **`failure_max_retries` × 60 s ticks** (default 3) | slow-time recovery for whole-infra outages; flips `permanent=true` once exhausted |
 | Permanent classifier (`HeightPrunedError`, `NoEndpointCoversError`) | nothing | **0** — short-circuits the bisect, records every height as `permanent=true` in one shot | retrying a pruned height across all endpoints is the same answer every time |
@@ -241,7 +288,7 @@ For a single permanently-bad block hitting fully-saturated infra:
        × failure_max_retries dead-letter cycles
 ```
 
-With `batch_size=20, N=2, failure_max_retries=3`: `5 × 2 × 2 × 3 = 60`
+With `batch_size=50, N=3, failure_max_retries=3`: `~6 × 3 × 2 × 3 ≈ 108`
 HTTP requests across the block's entire lifetime. Healthy blocks are
 one request.
 
@@ -252,8 +299,15 @@ Both 429 (`*ErrRateLimited`) and 5xx (`*ErrServerError`) are returned
 MultiClient's failover loop tries a different node on the next
 iteration. The previous shape retried both error classes 4 times
 against the same node before failing over, which delayed recovery by
-seconds and burned the AIMD budget on a node that was already telling
-us it couldn't help.
+seconds against a node that was already telling us it couldn't help.
+
+Also, **per-request HTTP timeouts are classified correctly** now: Go's
+`http.Client.Timeout` firing wraps `context.Canceled`, which used to
+collide with the shutdown-canceled branch and propagate a fatal error
+out of `processWithSplit`, crashing the whole indexer. The pipeline
+now checks `ctx.Err()` on the OUTER context to distinguish "we're
+shutting down" from "one request took too long" — the latter falls
+through to bisect / dead-letter like any other transient failure.
 
 The fast-fail rule is: **any error class that won't recover in ~200 ms
 is somebody else's problem** — failover, bisect, or the dead-letter
@@ -281,26 +335,39 @@ concurrency   req/s      p50       p99     errors  recommendation
 128           390.4      328ms     2100ms  7       ↘ knee likely passed
 ```
 
-The "≈ flat" rows are where you're at the node's ceiling. Pick the lowest
-`fetch_workers` value that sits on the flat plateau for headroom.
+The "≈ flat" rows are where you're at the node's ceiling. In the owned-
+infra model there's no per-endpoint cap to pin, but the curve still
+informs `fetch_workers`: pick a process-wide value whose share per
+endpoint (roughly `fetch_workers / healthy_endpoints`) sits on the flat
+plateau for the slowest endpoint.
 
 ## Performance knobs
 
-All in `config.yml` under `indexer:`:
+All in `config.yml` under `indexer:` unless noted:
 
-- `fetch_workers` — parallel RPC fetchers. Each worker holds one in-flight
-  HTTP request at a time. **`0` = adaptive** (sized at startup to the sum
-  of per-endpoint AIMD ceilings, and naturally clamped by CPU / memory
-  cgroup limits). 16 is a reasonable fixed value for a dedicated box.
-- `fetch_batch_size` — blocks per JSON-RPC batch POST. 10 = one HTTP round-trip
-  fetches 20 methods (block + block_results for 10 heights). **`0` =
-  adaptive** (AdaptiveSizer shrinks × 0.5 on failure, grows +1 on
-  sustained success). Raise on a fast RPC, lower on a flaky one.
+- `fetch_workers` — parallel fetchers. Each worker holds one in-flight
+  HTTP request at a time; total in-flight across all endpoints is bounded
+  by this. **`0` = adaptive** (sized at startup to `min(CPU×8, mem/2 MiB,
+  hard_max)`; `hard_max` defaults to 256). 16-32 is a reasonable fixed
+  value on a single-endpoint config; 64-128 when you have owned infra
+  with multiple endpoints to spread across.
+- `fetch_batch_size` — heights per JSON-RPC batch POST. 50 = 100 methods
+  per request (block + block_results × 50). **`0` = adaptive** (sizer
+  starts at 20, shrinks ×0.5 when the endpoint error rate exceeds 3 %).
+  Raise toward 100-200 on fast owned archive nodes; the wire savings
+  compound. Drop if your upstream starts returning 5xx at that size.
 - `write_batch_rows` — rows per `CopyFrom`. Higher = fewer tx commits,
   more memory.
-- `queue_depth` — bound on the fetcher→writer channel. Backpressure.
+- `queue_depth` — bound on the producer→fetcher channel. Backpressure.
 - `tip_confirmations` — how many blocks below head to stay at (reorg safety).
   Set to 0 only if you know the chain is reorg-free.
+- `database.pool_size` — Postgres connection-pool upper bound.
+  **Writer count is derived as `pool_size - 4`** (reserving 4 connections
+  for the status handler, dead-letter sweep, and fetcher's
+  `HandlerNeedsRange` probe). Increase alongside `fetch_workers` when
+  throughput is DB-bound; watch `pg_stat_activity` for saturation
+  (`active` count near `pool_size`). Target `max_connections - 10` on the
+  Postgres side so graphile + internals fit.
 
 ## Adding a new event
 
