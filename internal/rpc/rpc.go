@@ -16,24 +16,17 @@ import (
 	"time"
 )
 
-// NewRPC builds a Tendermint/CometBFT JSON-RPC 2.0 client. A single instance
-// reuses one http.Client (keep-alive) and is safe for concurrent use.
+// NewRPC builds a Tendermint/CometBFT JSON-RPC 2.0 client. All RPC and REST
+// clients share one process-wide http.Transport (see transport.go) so the
+// TCP keep-alive pool, HTTP/2 multiplexing, and TLS session cache are all
+// shared — reconstructing a client doesn't lose connection reuse.
 // `headers` are attached to every outbound request (e.g. `lava-extension:
 // archive` for Lava gateways). Safe to pass nil.
 func NewRPC(baseURL string, headers map[string]string) *RPCClient {
-	transport := &http.Transport{
-		MaxIdleConns:        256,
-		MaxIdleConnsPerHost: 256,
-		MaxConnsPerHost:     0,
-		IdleConnTimeout:     90 * time.Second,
-	}
 	return &RPCClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		headers: headers,
-		http: &http.Client{
-			Transport: transport,
-			Timeout:   60 * time.Second,
-		},
+		http:    newHTTPClient(60 * time.Second),
 	}
 }
 
