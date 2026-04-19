@@ -368,12 +368,48 @@ func (s *State) UnionGaps(ctx context.Context, handlers []string, start, end int
 
 // HandlerNeedsRange reports whether [from, to] is entirely or partially
 // missing from the handler's coverage.
+//
+// Implemented as a bounded range scan against the (handler, from_height)
+// PK / (handler, to_height) index — pulling only ranges that OVERLAP
+// [from, to]. Previously this called Gaps→Ranges, which read every
+// indexer_ranges row for the handler and walked the full set client-side;
+// at 50 batches/sec × 10 k handler ranges that's ~8 MB/sec of repeated
+// scans inside the per-batch tx critical path. The bounded scan returns
+// 0-1 row in the typical case (fully covered or fully uncovered),
+// regardless of total ranges count.
 func (s *State) HandlerNeedsRange(ctx context.Context, handler string, from, to int64) (bool, error) {
-	gaps, err := s.Gaps(ctx, handler, from, to)
+	if to < from {
+		return false, nil
+	}
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(
+		`SELECT from_height, to_height FROM %s.indexer_ranges
+		 WHERE handler = $1 AND from_height <= $3 AND to_height >= $2
+		 ORDER BY from_height`, s.schema), handler, from, to)
 	if err != nil {
 		return false, err
 	}
-	return len(gaps) > 0, nil
+	defer rows.Close()
+	cursor := from
+	for rows.Next() {
+		var rfrom, rto int64
+		if err := rows.Scan(&rfrom, &rto); err != nil {
+			return false, err
+		}
+		if rfrom > cursor {
+			// Gap from cursor up to rfrom-1.
+			return true, nil
+		}
+		if rto >= cursor {
+			cursor = rto + 1
+		}
+		if cursor > to {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return cursor <= to, nil
 }
 
 // RecordRange merges [from, to] into the handler's ranges inside the given
