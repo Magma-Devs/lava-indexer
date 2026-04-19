@@ -28,6 +28,11 @@ type Range struct {
 type State struct {
 	pool   *pgxpool.Pool
 	schema string
+
+	// schemaCache memoises SchemaInfo results so the UI's per-poll
+	// pg_catalog reflection (which costs tens of ms of pg CPU per call)
+	// doesn't compound across browser tabs. See schema.go.
+	schemaCache schemaCache
 }
 
 func New(pool *pgxpool.Pool, schema string) *State {
