@@ -280,6 +280,104 @@
   .ep-card.collapsed .chevron { transform: rotate(-90deg); }
   .ep-card.collapsed .ep-card-row,
   .ep-card.collapsed .sparkline-block { display: none; }
+
+  /* ================================================================
+     Mobile. Everything above is the desktop layout (≥640 px). Below,
+     we collapse dense multi-column grids into stacks so a 375 px phone
+     can still read the dashboard without horizontal scroll.
+     ================================================================ */
+  @media (max-width: 640px) {
+    body { font-size: 12px; }
+
+    main { padding: 12px; }
+    header {
+      padding: 10px 12px; gap: 8px; row-gap: 4px;
+    }
+    header h1 { font-size: 14px; }
+    header .meta { font-size: 11px; }
+    header .spacer { display: none; }
+    header .pill { font-size: 10px; padding: 2px 8px; }
+
+    /* Tabs: horizontal scroll when they outgrow the viewport. Touch-
+       drag works; the bar never wraps mid-label. */
+    nav.tabs {
+      padding: 0 12px;
+      overflow-x: auto;
+      white-space: nowrap;
+      scrollbar-width: none;
+    }
+    nav.tabs::-webkit-scrollbar { display: none; }
+    nav.tabs button { padding: 10px 12px; font-size: 11px; }
+
+    /* Stat cards: auto-fit already collapses well at 240 px, but the
+       large value font is wasteful on mobile. */
+    .card { padding: 10px 12px; }
+    .card .v { font-size: 17px; }
+    .card h2 { font-size: 11px; }
+
+    /* Compact endpoint row (Overview tab): stack everything under the
+       health mark in a single column instead of the 5-column desktop
+       grid. Rightmost coverage ranges drop below the URL. */
+    .ep {
+      grid-template-columns: 14px 1fr;
+      gap: 2px 8px;
+      padding: 8px 10px;
+    }
+    .ep > .kind-badge { grid-column: 2; justify-self: start; }
+    .ep > .url        { grid-column: 2; font-size: 11px; }
+    .ep > .range      { grid-column: 2; font-size: 10px; }
+    .ep .ep-metrics   { font-size: 10px; gap: 10px; }
+    .ep-reason        { grid-column: 2; font-size: 10px; }
+
+    /* Handler card: the chain/window percent block drops under the
+       name+types row rather than sitting on the right. */
+    .handler { padding: 12px; }
+    .handler-head { gap: 8px; }
+    .handler-name { font-size: 13px; }
+    .handler-pct  { margin-left: 0; text-align: left; width: 100%; }
+    .handler-pct .blocks { font-size: 10px; }
+
+    /* Endpoint detail tab: stat row was 5 across, now 2 across. */
+    .ep-card { padding: 12px; }
+    .ep-card-head { gap: 8px; }
+    .ep-card-head .coverage { margin-left: 0; width: 100%; }
+    .ep-card-row {
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+    }
+    .ep-stat { padding: 6px 8px; }
+    .ep-stat .value { font-size: 14px; }
+    .ep-stat .label { font-size: 9px; }
+
+    /* Sparklines: was 2 across; one chart per row is more readable on a
+       phone (y-ticks + chart + x-ticks stays legible). */
+    .sparkline-block { grid-template-columns: 1fr; gap: 8px; }
+    .sparkline .plot { height: 80px; }
+
+    /* Ranges detail list: let each span fill the row. */
+    details.ranges-detail .list {
+      grid-template-columns: 1fr;
+    }
+
+    /* Tooltip: cap to viewport-minus-margins so the hover bubble never
+       gets clipped or pushes horizontal scroll. */
+    .tooltip.info-tooltip { max-width: calc(100vw - 24px); }
+
+    /* GraphQL iframe: shorter on mobile so the browser chrome doesn't
+       leave the tab scrollable past the viewport. */
+    #graphql-iframe { height: calc(100vh - 140px) !important; }
+
+    footer { padding: 12px; font-size: 10px; }
+  }
+
+  /* Touch targets on small viewports: 44×44 is the Apple HIG minimum for
+     tap accuracy. Buttons and details summaries already clear this
+     via padding, but we explicitly don't shrink below it on mobile. */
+  @media (pointer: coarse) {
+    nav.tabs button { min-height: 44px; }
+    details.ranges-detail summary { padding: 8px 0; }
+    .ep-card-head { min-height: 44px; }
+  }
 </style>
 </head>
 <body>
