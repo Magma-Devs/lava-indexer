@@ -57,7 +57,7 @@ var SharedTransport = func() *http.Transport {
 		MaxConnsPerHost:       0,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
+		ResponseHeaderTimeout: 120 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 		TLSClientConfig: &tls.Config{

@@ -289,6 +289,13 @@ func splitByEndpointCoverage(gaps []state.Range, eps []*rpc.Endpoint) []state.Ra
 func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 	cfg := p.cfg.Indexer
 	batchOf := func() int64 {
+		// Static batch size wins. The sizer may still exist (because the
+		// operator left fetch_workers adaptive) but its batch state is
+		// only consulted when the operator explicitly chose adaptive for
+		// batch too — fetch_batch_size <= 0 in config.
+		if cfg.FetchBatchSize > 0 {
+			return int64(cfg.FetchBatchSize)
+		}
 		if p.sizer != nil {
 			return int64(p.sizer.BatchSize())
 		}
@@ -300,11 +307,14 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 	}
 	jobs := make(chan job, cfg.QueueDepth)
 
-	// Writer pool size: half the DB pool so writers never fully saturate
-	// the connection pool (leaves room for the status handler, the
-	// dead-letter sweep's pop query, HandlerNeedsRange in fetchers, and
-	// the pg_cron heartbeat). Minimum 8 even on small pools.
-	writerCount := p.cfg.Database.PoolSize / 2
+	// Writer pool size: pool_size - 4 so we reserve a handful of
+	// connections for the status handler, the dead-letter sweep's pop
+	// query, HandlerNeedsRange in fetchers, and the pg_cron heartbeat —
+	// but hand the rest to writers since the DB write path is usually
+	// the bottleneck on a large-table backfill. Minimum 8 even on small
+	// pools. Previously pool_size/2, which left half the pool idle
+	// while writers stacked up on writeCh send.
+	writerCount := p.cfg.Database.PoolSize - 4
 	if writerCount < 8 {
 		writerCount = 8
 	}
@@ -539,8 +549,16 @@ func (p *Pipeline) processWithSplit(ctx context.Context, writeCh chan<- writeJob
 		}
 		return nil
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
+	// A per-request HTTP timeout (Client.Timeout firing on a slow upstream)
+	// wraps context.Canceled too, so errors.Is(err, context.Canceled) returns
+	// true for BOTH "we were shut down" and "one request took too long". The
+	// distinguishing signal is the OUTER ctx — if our own context is still
+	// live, the error is a per-request timeout and should fall through to
+	// bisect/dead-letter like any other transient fetch failure. Only when
+	// our own ctx is cancelled do we propagate, which is the clean-shutdown
+	// path.
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	if isPermanentFetchError(err) {
 		reason := safeFailureReason(err)

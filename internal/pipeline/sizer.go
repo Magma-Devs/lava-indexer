@@ -123,14 +123,16 @@ func (s *AdaptiveSizer) tick() {
 	anyHot := false // any endpoint stressed → shrink
 	allCalm := true // every endpoint healthy → grow
 	for _, sg := range signals {
-		// "hot": the node is actively telling us to slow down.
-		if sg.RecentErrorRate >= 0.03 ||
-			(sg.LatencyP50Ms > 0 && sg.LatencyP99Ms > sg.LatencyP50Ms*10) {
+		// "hot": the node is actively telling us to slow down. Only
+		// error rate counts — tail latency (p99/p50 ratio) used to be
+		// part of this but we dropped it along with the AIMD cap:
+		// for owned-infra operators tail latency is a "slow but healthy"
+		// signal, not "overloaded." Routing handles slow nodes.
+		if sg.RecentErrorRate >= 0.03 {
 			anyHot = true
 		}
-		// "calm": the node has capacity left.
-		if !(sg.RecentErrorRate < 0.005 &&
-			(sg.LatencyP50Ms == 0 || sg.LatencyP99Ms < sg.LatencyP50Ms*3)) {
+		// "calm": the node is error-free. Drop p99 check for same reason.
+		if sg.RecentErrorRate >= 0.005 {
 			allCalm = false
 		}
 	}
