@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -265,11 +266,26 @@ func splitByEndpointCoverage(gaps []state.Range, eps []*rpc.Endpoint) []state.Ra
 	return out
 }
 
-// indexGaps fans out fetch work over N workers across ANY number of
-// disjoint gaps in parallel. Batches from each gap are interleaved
-// round-robin so workers never queue behind one gap's tail before
-// touching another. Each worker still commits its own batch atomically
-// (rows + per-handler range merge) in a single Postgres tx.
+// indexGaps fans out fetch+persist work over two decoupled worker pools:
+//
+//   - FETCH pool (N = p.workers): pulls jobs off the producer channel, calls
+//     MultiClient.FetchBlocks, parses events, bisects on fetch errors. On
+//     success it hands the parsed batch to the writer pool via writeCh and
+//     moves on — no DB work is held by a fetcher.
+//   - WRITE pool (M = writerCount, bounded by pg pool): pulls writeJobs off
+//     writeCh, opens a single tx per batch, persists each handler's events,
+//     merges indexer_ranges, heartbeats run stats, commits.
+//
+// Why the split: previously each worker fetched AND persisted in one go,
+// so a slow persist blocked the fetch it was paired with. Under heavy
+// write load, fetchers sat idle behind COPYs. Splitting lets fetch run
+// at the upstream ceiling while write runs at the DB ceiling — whichever
+// is slower becomes the bottleneck, and neither one gates the other.
+//
+// Bisect policy: stays in the fetcher (unchanged). Persist errors are NOT
+// bisected — they're recorded as failures for the dead-letter sweep,
+// because persist errors are rarely "this specific block is poison" (FKs
+// are dict races, pool exhaustion is a pool problem, etc.).
 func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 	cfg := p.cfg.Indexer
 	batchOf := func() int64 {
@@ -283,6 +299,18 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 		from, to int64
 	}
 	jobs := make(chan job, cfg.QueueDepth)
+
+	// Writer pool size: half the DB pool so writers never fully saturate
+	// the connection pool (leaves room for the status handler, the
+	// dead-letter sweep's pop query, HandlerNeedsRange in fetchers, and
+	// the pg_cron heartbeat). Minimum 8 even on small pools.
+	writerCount := p.cfg.Database.PoolSize / 2
+	if writerCount < 8 {
+		writerCount = 8
+	}
+	// Small buffer for rate smoothing without unbounded memory. Each
+	// writeJob holds the parsed events for its batch.
+	writeCh := make(chan writeJob, 2*writerCount)
 
 	g, ctx := errgroup.WithContext(ctx)
 
@@ -412,27 +440,56 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 						}
 						// Swallow errors: processWithSplit only returns ctx
 						// errors; real failures re-insert into indexer_failures.
-						_ = p.processWithSplit(ctx, h, h)
+						_ = p.processWithSplit(ctx, writeCh, h, h)
 					}
 				}
 			}
 		})
 	}
 
-	// Consumers.
-	start := time.Now()
-	var progressBlocks atomic.Int64
+	// Fetchers. Track completion with a WaitGroup so we can close writeCh
+	// after the last fetcher exits — writers drain, then exit.
+	var fetchWg sync.WaitGroup
 	for i := 0; i < p.workers; i++ {
+		fetchWg.Add(1)
 		g.Go(func() error {
+			defer fetchWg.Done()
 			for j := range jobs {
-				if err := p.processWithSplit(ctx, j.from, j.to); err != nil {
+				if err := p.processWithSplit(ctx, writeCh, j.from, j.to); err != nil {
 					return fmt.Errorf("batch %d-%d: %w", j.from, j.to, err)
 				}
-				n := j.to - j.from + 1
+			}
+			return nil
+		})
+	}
+	g.Go(func() error {
+		fetchWg.Wait()
+		close(writeCh)
+		return nil
+	})
+
+	// Writers. Progress log moves here — "blocks done" means COMMITTED,
+	// not just fetched. Honest rate reporting for the dashboard.
+	start := time.Now()
+	var progressBlocks atomic.Int64
+	for i := 0; i < writerCount; i++ {
+		g.Go(func() error {
+			for w := range writeCh {
+				if err := p.persist(ctx, w); err != nil {
+					// persist errors don't bisect — a single block isn't
+					// usually the cause. Record the whole batch as failure
+					// so the dead-letter sweep retries it later; keep the
+					// pipeline moving.
+					reason := safeFailureReason(err)
+					slog.Error("persist failed; batch recorded as dead-letter",
+						"from", w.from, "to", w.to, "err", reason)
+					p.recordBatchFailure(ctx, w.from, w.to, reason)
+					continue
+				}
+				n := w.to - w.from + 1
 				done := progressBlocks.Add(n)
 				total := p.totalBlocks.Add(n)
 				p.rate.Record(total)
-				// Coarse progress log every ~1k blocks.
 				if done%1000 < int64(batchOf()) {
 					elapsed := time.Since(start).Seconds()
 					bps := float64(done) / elapsed
@@ -450,20 +507,36 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 	return g.Wait()
 }
 
-// processWithSplit runs processBatch. On a terminal transient failure it
-// bisects the range and retries each half, continuing down to size 1. A
-// size-1 range that STILL fails is recorded in indexer_failures and
-// skipped — its height stays absent from indexer_ranges so the next
-// indexer run picks it up automatically.
+// writeJob is the handoff between fetch workers and writer workers. Holds
+// the parsed events plus enough context for the writer to decide which
+// handlers still need this batch and to update indexer_ranges atomically.
+type writeJob struct {
+	from, to        int64
+	dispatched      map[events.Handler][]events.HandledEvent
+	needs           map[string]bool // handler.Name() → still-needed
+	rowsThisBatch   int64
+	blocksThisBatch int64
+}
+
+// processWithSplit fetches [from, to] and hands the parsed events off to
+// the writer pool via writeCh. On a transient fetch failure it bisects
+// and recurses; on a permanent fetch failure it records every height as
+// permanent in one shot (no bisect, no wait); on the size-1 still-failing
+// case it records a dead-letter for the sweep to retry.
 //
-// Permanent failures short-circuit the bisect: if no endpoint covers the
-// range or the node has pruned the heights, splitting the range can't
-// change that — every sub-range will hit the same error. In that case
-// every height in [from, to] is recorded as permanent in one shot and
-// the function returns without bisecting.
-func (p *Pipeline) processWithSplit(ctx context.Context, from, to int64) error {
-	err := p.processBatch(ctx, from, to)
+// Returns nil on success and on recorded-failure (pipeline keeps moving).
+// Only returns a non-nil error on ctx cancellation.
+//
+// Persist errors are NOT handled here — they surface in the writer, which
+// records the batch as failure via recordBatchFailure.
+func (p *Pipeline) processWithSplit(ctx context.Context, writeCh chan<- writeJob, from, to int64) error {
+	wj, err := p.fetchBatch(ctx, from, to)
 	if err == nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case writeCh <- wj:
+		}
 		return nil
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -483,9 +556,6 @@ func (p *Pipeline) processWithSplit(ctx context.Context, from, to int64) error {
 		return nil
 	}
 	if from == to {
-		// Single block and still failing transiently → dead-letter for the
-		// sweep to retry. RecordFailure flips the row to permanent when
-		// retries hit the configured cap so the sweep eventually stops.
 		reason := safeFailureReason(err)
 		maxRetries := p.cfg.Indexer.FailureMaxRetries
 		for _, h := range p.registry.All() {
@@ -495,15 +565,29 @@ func (p *Pipeline) processWithSplit(ctx context.Context, from, to int64) error {
 		}
 		slog.Error("giving up on block after all retries, recorded in dead-letter",
 			"height", from, "err", reason)
-		return nil // swallow — pipeline continues
+		return nil
 	}
 	mid := from + (to-from)/2
 	slog.Warn("batch failed, bisecting and retrying halves",
 		"from", from, "to", to, "mid", mid, "err", err)
-	if e1 := p.processWithSplit(ctx, from, mid); e1 != nil {
+	if e1 := p.processWithSplit(ctx, writeCh, from, mid); e1 != nil {
 		return e1
 	}
-	return p.processWithSplit(ctx, mid+1, to)
+	return p.processWithSplit(ctx, writeCh, mid+1, to)
+}
+
+// recordBatchFailure records every height in [from, to] as a transient
+// failure — used when persist throws on a batch that fetched
+// successfully. The dead-letter sweep will re-fetch and re-persist these.
+func (p *Pipeline) recordBatchFailure(ctx context.Context, from, to int64, reason string) {
+	maxRetries := p.cfg.Indexer.FailureMaxRetries
+	for h := from; h <= to; h++ {
+		for _, handler := range p.registry.All() {
+			if rerr := p.state.RecordFailure(ctx, handler.Name(), h, reason, maxRetries); rerr != nil {
+				slog.Warn("could not record persist failure", "height", h, "err", rerr)
+			}
+		}
+	}
 }
 
 func truncate(s string, n int) string {
@@ -539,79 +623,80 @@ func safeFailureReason(err error) string {
 	return truncate(err.Error(), 250)
 }
 
-func (p *Pipeline) processBatch(ctx context.Context, from, to int64) error {
+// fetchBatch pulls blocks from MultiClient, dispatches events to handlers,
+// and computes which handlers still need this range. Returns a writeJob
+// the caller can hand off to the writer pool. Does NOT touch the DB for
+// writes — only the HandlerNeedsRange read, which uses its own brief
+// pool connection outside any tx.
+func (p *Pipeline) fetchBatch(ctx context.Context, from, to int64) (writeJob, error) {
 	heights := make([]int64, 0, to-from+1)
 	for h := from; h <= to; h++ {
 		heights = append(heights, h)
 	}
 
-	// MultiClient.FetchBlocks IS the failover loop — it walks every
-	// eligible endpoint with headroom and only returns once they've all
-	// failed (or saturated for 5 s). We used to wrap that in another 4×
-	// outer retry, which just re-hit the same exhausted set and amplified
-	// every transient hiccup by 4×. The pipeline's bisect + dead-letter
-	// sweep handle multi-block and slow-time recovery respectively, so
-	// nothing is gained by retrying the whole MultiClient call here.
+	// MultiClient.FetchBlocks is the authoritative failover loop.
 	blocks, err := p.client.FetchBlocks(ctx, heights)
 	if err != nil {
-		return fmt.Errorf("fetch: %w", err)
+		return writeJob{}, fmt.Errorf("fetch: %w", err)
 	}
 
 	dispatched := p.registry.Dispatch(blocks)
-	// Count rows for progress log (only rough — counts events, not DB rows).
-	for _, evs := range dispatched {
-		p.totalRows.Add(int64(len(evs)))
-	}
-
-	// Determine which handlers need this batch BEFORE acquiring a tx.
-	// HandlerNeedsRange issues a pool query; running it inside BeginTxFunc
-	// means every worker holds one pool connection for its tx while trying
-	// to acquire a second one for the gap read. Under N workers > pool_size
-	// that self-deadlocks — every connection is held by a tx waiting on a
-	// gap-read connection that will never come (observed at pool_size=16,
-	// workers=64). The result was thousands of "idle in transaction" rows
-	// in pg_stat_activity and /api/status timing out on its own pool acquire.
-	// The read is idempotent and safe to run without a tx — a concurrent
-	// writer's changes between now and tx-begin are handled by the advisory
-	// lock + merge semantics in RecordRange.
-	needs := make(map[string]bool, len(p.registry.All()))
-	anyNeeds := false
-	for _, h := range p.registry.All() {
-		n, err := p.state.HandlerNeedsRange(ctx, h.Name(), from, to)
-		if err != nil {
-			return fmt.Errorf("needs-range: %w", err)
-		}
-		needs[h.Name()] = n
-		if n {
-			anyNeeds = true
-		}
-	}
-
 	var rowsThisBatch int64
 	for _, evs := range dispatched {
 		rowsThisBatch += int64(len(evs))
 	}
-	blocksThisBatch := to - from + 1
+	p.totalRows.Add(rowsThisBatch)
 
-	// If no handler needs this batch, still commit a heartbeat so the run's
-	// progress counters advance and the dashboard shows the batch as work
-	// done (fetched but nothing to write). Skip the per-handler section.
+	// HandlerNeedsRange is read-only and MUST run outside any tx —
+	// calling it inside BeginTxFunc pool-deadlocks at
+	// workers > pool_size.
+	needs := make(map[string]bool, len(p.registry.All()))
+	for _, h := range p.registry.All() {
+		n, err := p.state.HandlerNeedsRange(ctx, h.Name(), from, to)
+		if err != nil {
+			return writeJob{}, fmt.Errorf("needs-range: %w", err)
+		}
+		needs[h.Name()] = n
+	}
+
+	return writeJob{
+		from:            from,
+		to:              to,
+		dispatched:      dispatched,
+		needs:           needs,
+		rowsThisBatch:   rowsThisBatch,
+		blocksThisBatch: to - from + 1,
+	}, nil
+}
+
+// persist runs the writer half of the pipeline: one tx per batch,
+// applies each still-needed handler's Persist + RecordRange, plus the
+// run heartbeat. Returns an error when the tx fails; the caller records
+// the whole batch as a dead-letter.
+func (p *Pipeline) persist(ctx context.Context, w writeJob) error {
+	anyNeeds := false
+	for _, v := range w.needs {
+		if v {
+			anyNeeds = true
+			break
+		}
+	}
 	return pgx.BeginTxFunc(ctx, p.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		if anyNeeds {
 			for _, handler := range p.registry.All() {
-				if !needs[handler.Name()] {
+				if !w.needs[handler.Name()] {
 					continue
 				}
-				if err := handler.Persist(ctx, tx, dispatched[handler]); err != nil {
+				if err := handler.Persist(ctx, tx, w.dispatched[handler]); err != nil {
 					return fmt.Errorf("%s persist: %w", handler.Name(), err)
 				}
-				if err := p.state.RecordRange(ctx, tx, handler.Name(), from, to); err != nil {
+				if err := p.state.RecordRange(ctx, tx, handler.Name(), w.from, w.to); err != nil {
 					return fmt.Errorf("%s record range: %w", handler.Name(), err)
 				}
 			}
 		}
 		if p.runID != 0 {
-			if err := p.state.Heartbeat(ctx, tx, p.runID, blocksThisBatch, rowsThisBatch); err != nil {
+			if err := p.state.Heartbeat(ctx, tx, p.runID, w.blocksThisBatch, w.rowsThisBatch); err != nil {
 				return fmt.Errorf("heartbeat: %w", err)
 			}
 		}
