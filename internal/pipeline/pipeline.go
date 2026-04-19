@@ -416,7 +416,7 @@ func (p *Pipeline) processWithSplit(ctx context.Context, from, to int64) error {
 		return err
 	}
 	if isPermanentFetchError(err) {
-		reason := truncate(err.Error(), 250)
+		reason := safeFailureReason(err)
 		for h := from; h <= to; h++ {
 			for _, handler := range p.registry.All() {
 				if rerr := p.state.RecordPermanentFailure(ctx, handler.Name(), h, reason); rerr != nil {
@@ -432,7 +432,7 @@ func (p *Pipeline) processWithSplit(ctx context.Context, from, to int64) error {
 		// Single block and still failing transiently → dead-letter for the
 		// sweep to retry. RecordFailure flips the row to permanent when
 		// retries hit the configured cap so the sweep eventually stops.
-		reason := truncate(err.Error(), 250)
+		reason := safeFailureReason(err)
 		maxRetries := p.cfg.Indexer.FailureMaxRetries
 		for _, h := range p.registry.All() {
 			if rerr := p.state.RecordFailure(ctx, h.Name(), from, reason, maxRetries); rerr != nil {
@@ -457,6 +457,32 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// safeFailureReason returns a dead-letter-safe one-line reason string
+// for err. Typed RPC errors that carry URLs or upstream response bodies
+// (rpc.HeightPrunedError, rpc.HTTPStatusError) are stripped down to
+// status-only forms — operators put bearer tokens in URL paths and
+// providers echo query strings in error bodies, and indexer_failures.reason
+// is surfaced unauthenticated on /api/status. Generic errors fall through
+// to the truncated err.Error() and should not contain credentials.
+func safeFailureReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	var hp *rpc.HeightPrunedError
+	if errors.As(err, &hp) {
+		return fmt.Sprintf("height %d pruned (http %d)", hp.Height, hp.Status)
+	}
+	var hs *rpc.HTTPStatusError
+	if errors.As(err, &hs) {
+		return fmt.Sprintf("http %d", hs.Status)
+	}
+	var nec *rpc.NoEndpointCoversError
+	if errors.As(err, &nec) {
+		return fmt.Sprintf("no endpoint covers heights %d-%d", nec.MinHeight, nec.MaxHeight)
+	}
+	return truncate(err.Error(), 250)
 }
 
 func (p *Pipeline) processBatch(ctx context.Context, from, to int64) error {
