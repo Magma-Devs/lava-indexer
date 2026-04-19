@@ -1020,7 +1020,7 @@
       card.windowOverlay.style.display = 'none';
     }
 
-    // `ranges` was declared at the top of the function — reuse it.
+    const ranges = h.ranges || [];
     const children = card.segments.children;
     while (children.length > ranges.length) card.segments.removeChild(children[children.length - 1]);
     ranges.forEach((r, i) => {
