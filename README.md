@@ -194,28 +194,70 @@ over-loading a node.
 
 ## Retry, failover, and dead-letter
 
-Three layers, each doing exactly one job:
+Each layer of the request path does ONE distinct job, with deliberately
+narrow retry budgets so a single bad block doesn't amplify into hundreds
+of HTTP calls.
 
-1. **Per-request retries inside the HTTP client** — 5xx and network
-   errors (connection reset, EOF, TLS, DNS, i/o timeout) get up to 4
-   retries with exponential backoff + ±25 % jitter, capped at 5 s.
-   `Retry-After` (seconds or HTTP-date) is honoured when provided.
-   4xx ≠ 429 is **not** retried — it means the request is malformed.
+### Layer map (a request's full lifecycle)
 
-2. **Fast failover on 429** — rate-limited responses don't burn the
-   retry budget. The client returns an `ErrRateLimited` immediately and
-   the MultiClient tries the next eligible endpoint. This is essential
-   when mixing a premium and a public gateway: the public one tells us
-   to slow down, we route around it rather than hammering it harder.
+```
+runWindow          (gap detection + tier slicing)
+  └── indexGaps    (single producer; tip-first with interleave)
+        └── worker (N goroutines, FIFO from jobs channel)
+              └── processWithSplit  (BISECT — recurses halves on failure)
+                    └── processBatch (fetch + write tx)
+                          └── MultiClient.FetchBlocks   ◄── FAILOVER across endpoints
+                                └── retryableCall       ◄── PER-NODE recovery only
+                                      └── http.Client.Do
+```
 
-3. **Batch bisect + dead-letter** — when every endpoint has failed a
-   batch, the pipeline splits it in half and retries the halves
-   independently. Eventually any offending height is isolated to a
-   size-1 batch; if that still fails across all endpoints the height
-   is recorded in `app.indexer_failures` and the rest of the run
-   continues. One corrupt block on an archive node can't stall the
-   indexer, and a sparse list of permanent failures is easy to inspect
-   and replay later.
+### What each layer is allowed to retry
+
+| layer | retries on | budget | why |
+|---|---|---|---|
+| `retryableCall` (per-node HTTP) | network err only (TCP reset, EOF, TLS, broken pipe, i/o timeout) | **1 in-place retry** (`httpRetryNetwork`) | covers the keep-alive-closed race; if the second attempt fails the node is genuinely sick |
+| `retryableCall` | `5xx` | **0** — returns `*ErrServerError` immediately | sick nodes don't recover in 200 ms; failover is faster than waiting |
+| `retryableCall` | `429` | **0** — returns `*ErrRateLimited` immediately | the node is telling us to back off; retrying it is counterproductive |
+| `retryableCall` | `4xx ≠ 429` | **0** — returns `*HTTPStatusError` (or `*HeightPrunedError`) | request is malformed or the height is gone; no retry can fix it |
+| `MultiClient.FetchBlocks` | every error type above | **N eligible endpoints**, walked in headroom-sorted order | a different node may be healthy; this is the authoritative "I tried everyone" loop |
+| `processWithSplit` | multi-block batch failure (transient) | **bisect halves until size 1** | isolate one bad block from an otherwise-healthy batch |
+| Dead-letter sweep | size-1 failures still in `indexer_failures` | **`failure_max_retries` × 60 s ticks** (default 3) | slow-time recovery for whole-infra outages; flips `permanent=true` once exhausted |
+| Permanent classifier (`HeightPrunedError`, `NoEndpointCoversError`) | nothing | **0** — short-circuits the bisect, records every height as `permanent=true` in one shot | retrying a pruned height across all endpoints is the same answer every time |
+
+### Why we don't retry the whole `MultiClient` call
+
+There is no outer retry wrapper. `MultiClient.FetchBlocks` already
+exhausts every eligible endpoint before returning, so re-running it
+just re-hits the same exhausted set. The pipeline gains parallelism
+through workers + bisect and slow-time recovery through the dead-letter
+sweep — neither needs an immediate retry of the failover loop.
+
+### Worst-case amplification
+
+For a single permanently-bad block hitting fully-saturated infra:
+
+```
+1 block × log₂(batch_size) bisect levels × N endpoints × (1 same-node retry on net err)
+       × failure_max_retries dead-letter cycles
+```
+
+With `batch_size=20, N=2, failure_max_retries=3`: `5 × 2 × 2 × 3 = 60`
+HTTP requests across the block's entire lifetime. Healthy blocks are
+one request.
+
+### Failover semantics — switch nodes, don't wait
+
+Both 429 (`*ErrRateLimited`) and 5xx (`*ErrServerError`) are returned
+**immediately** from the HTTP layer with no in-place retry, so
+MultiClient's failover loop tries a different node on the next
+iteration. The previous shape retried both error classes 4 times
+against the same node before failing over, which delayed recovery by
+seconds and burned the AIMD budget on a node that was already telling
+us it couldn't help.
+
+The fast-fail rule is: **any error class that won't recover in ~200 ms
+is somebody else's problem** — failover, bisect, or the dead-letter
+sweep, depending on the error class.
 
 ### Finding the capacity of a node
 

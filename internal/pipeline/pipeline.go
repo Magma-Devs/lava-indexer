@@ -545,8 +545,14 @@ func (p *Pipeline) processBatch(ctx context.Context, from, to int64) error {
 		heights = append(heights, h)
 	}
 
-	// Fetch w/ retries for transient network errors.
-	blocks, err := fetchWithRetry(ctx, p.client, heights, 4)
+	// MultiClient.FetchBlocks IS the failover loop — it walks every
+	// eligible endpoint with headroom and only returns once they've all
+	// failed (or saturated for 5 s). We used to wrap that in another 4×
+	// outer retry, which just re-hit the same exhausted set and amplified
+	// every transient hiccup by 4×. The pipeline's bisect + dead-letter
+	// sweep handle multi-block and slow-time recovery respectively, so
+	// nothing is gained by retrying the whole MultiClient call here.
+	blocks, err := p.client.FetchBlocks(ctx, heights)
 	if err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
@@ -613,30 +619,3 @@ func (p *Pipeline) processBatch(ctx context.Context, from, to int64) error {
 	})
 }
 
-func fetchWithRetry(ctx context.Context, c rpc.Client, heights []int64, attempts int) ([]*rpc.Block, error) {
-	var lastErr error
-	backoff := 200 * time.Millisecond
-	for i := 0; i < attempts; i++ {
-		if i > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff):
-			}
-			backoff *= 2
-			if backoff > 5*time.Second {
-				backoff = 5 * time.Second
-			}
-		}
-		blocks, err := c.FetchBlocks(ctx, heights)
-		if err == nil {
-			return blocks, nil
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, err
-		}
-		lastErr = err
-		slog.Warn("fetch failed, retrying", "attempt", i+1, "err", err)
-	}
-	return nil, lastErr
-}

@@ -217,12 +217,13 @@ func classifyLCDStatus(err error, height int64, url string) error {
 	return nil
 }
 
-// retryableGet mirrors retryableCall but for GETs. Sharing would be nice
-// but GET has no body to pass in, and adding an option for that just
-// muddies the RPC hot path.
+// retryableGet mirrors retryableCall but for GETs. Same retry policy:
+// network err uses httpRetryNetwork; 5xx → *ErrServerError; 429 →
+// *ErrRateLimited; other 4xx → *HTTPStatusError. MultiClient handles
+// failover.
 func retryableGet(ctx context.Context, httpc *http.Client, url string, extraHeaders map[string]string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; attempt <= httpRetryNetwork; attempt++ {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -267,12 +268,11 @@ func retryableGet(ctx context.Context, httpc *http.Client, url string, extraHead
 			}
 		}
 		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
-			lastErr = fmt.Errorf("http %d", resp.StatusCode)
-			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-			if !sleepBackoff(ctx, attempt, retryAfter) {
-				return nil, ctx.Err()
+			return nil, &ErrServerError{
+				Status:     resp.StatusCode,
+				Body:       truncate(string(data), 200),
+				RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 			}
-			continue
 		}
 		// 4xx other than 429 — terminal. Wrap so callers can classify
 		// pruned-height responses (Cosmos LCD returns 400/404 for blocks
@@ -283,5 +283,5 @@ func retryableGet(ctx context.Context, httpc *http.Client, url string, extraHead
 			URL:    url,
 		}
 	}
-	return nil, fmt.Errorf("exceeded %d retries: %w", maxRetries, lastErr)
+	return nil, fmt.Errorf("exceeded %d retries: %w", httpRetryNetwork, lastErr)
 }
