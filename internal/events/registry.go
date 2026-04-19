@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/magma-devs/lava-indexer/internal/rpc"
 )
 
@@ -32,6 +33,15 @@ type Handler interface {
 	EventTypes() []string
 	DDL() []string
 	Persist(ctx context.Context, tx pgx.Tx, events []HandledEvent) error
+}
+
+// Warmer is an optional interface a Handler can implement to pre-load
+// in-process state (typically Dict caches) from the database after DDL
+// has been applied. Called once at startup, before the first batch.
+// Errors are non-fatal — handlers should treat warmup as a best-effort
+// optimisation.
+type Warmer interface {
+	Warmup(ctx context.Context, pool *pgxpool.Pool) error
 }
 
 // HandledEvent is one event paired with its block context (for timestamp,

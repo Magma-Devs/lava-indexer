@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/KimMachineGun/automemlimit/memlimit"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/magma-devs/lava-indexer/internal/aggregates"
 	"github.com/magma-devs/lava-indexer/internal/config"
@@ -54,12 +58,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := newPool(ctx, cfg)
-	if err != nil {
-		fatal("connect postgres", err)
-	}
-	defer pool.Close()
-
 	client, err := newClient(cfg)
 	if err != nil {
 		fatal("build rpc client", err)
@@ -80,8 +78,15 @@ func main() {
 	//   - shrinks batch ×0.5 on hot signals, grows +1 on calm signals
 	//   - sizes worker cap to min(Σ budgets × 2, CPU × 8, mem / 2 MiB)
 	// Explicit positive values in config bypass the sizer entirely.
+	//
+	// Resolved values are kept in local variables and passed into the
+	// pipeline / pool via constructors — cfg.Indexer is never mutated, so
+	// /api/status and any future "effective config" surface still show
+	// what the operator typed.
 	workersAdaptive := cfg.Indexer.FetchWorkers <= 0
 	batchAdaptive := cfg.Indexer.FetchBatchSize <= 0
+	resolvedBatchMax := cfg.Indexer.FetchBatchSize
+	resolvedWorkers := cfg.Indexer.FetchWorkers
 	var sizer *pipeline.AdaptiveSizer
 	if workersAdaptive || batchAdaptive {
 		// Pick bounds: if the user set a positive batch size, treat it
@@ -93,7 +98,7 @@ func main() {
 		sizer = pipeline.NewAdaptiveSizer(1, batchMax, 256, 10*time.Second, multiClientSignals{client})
 		sizer.Start(ctx)
 		if batchAdaptive {
-			cfg.Indexer.FetchBatchSize = batchMax // floor for the pipeline's config read path
+			resolvedBatchMax = batchMax
 		}
 	}
 	if workersAdaptive {
@@ -112,8 +117,19 @@ func main() {
 			}
 		}
 		slog.Info("adaptive fetch_workers resolved", "workers", workers)
-		cfg.Indexer.FetchWorkers = workers
+		resolvedWorkers = workers
 	}
+
+	// Pool is built AFTER fetch_workers is resolved so newPool can size
+	// MaxConns to the actual worker count (+ web/aggregates headroom).
+	// With pool_size=8 vs adaptive workers≈100, a stale default starves
+	// every worker past the 8th and silently caps throughput at ~8% of
+	// what the operator configured.
+	pool, err := newPool(ctx, cfg, resolvedWorkers)
+	if err != nil {
+		fatal("connect postgres", err)
+	}
+	defer pool.Close()
 
 	if benchmark {
 		runBenchmark(ctx, client)
@@ -159,12 +175,36 @@ func main() {
 	}
 	register(relay_payment.New(cfg.Database.Schema))
 
-	// Apply every handler's DDL before indexing starts.
+	// Apply every handler's DDL before indexing starts. Each handler's
+	// DDL slice runs inside one tx so a partial failure (network blip,
+	// lock contention, syntax mismatch on a future PG version) leaves the
+	// DB at the pre-bring-up state instead of half-migrated. CREATE
+	// TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS are
+	// transaction-safe in PG.
 	for _, h := range reg.All() {
-		for _, ddl := range h.DDL() {
-			if _, err := pool.Exec(ctx, ddl); err != nil {
-				fatal("apply handler DDL", err)
+		ddls := h.DDL()
+		err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+			for _, ddl := range ddls {
+				if _, err := tx.Exec(ctx, ddl); err != nil {
+					return err
+				}
 			}
+			return nil
+		})
+		if err != nil {
+			fatal("apply handler DDL", fmt.Errorf("%s: %w", h.Name(), err))
+		}
+	}
+
+	// Warm any handler dictionaries so steady-state IDs() lookups hit
+	// the in-process cache instead of round-tripping to PG every batch.
+	for _, h := range reg.All() {
+		w, ok := h.(events.Warmer)
+		if !ok {
+			continue
+		}
+		if err := w.Warmup(ctx, pool); err != nil {
+			slog.Warn("handler warmup failed (non-fatal)", "name", h.Name(), "err", err)
 		}
 	}
 
@@ -201,7 +241,8 @@ func main() {
 		}
 	}
 
-	pipe := pipeline.New(cfg, pool, client, st, reg)
+	pipe := pipeline.New(cfg, pool, client, st, reg).
+		WithRuntimeKnobs(resolvedWorkers, resolvedBatchMax)
 	if sizer != nil {
 		pipe = pipe.WithSizer(sizer)
 	}
@@ -210,8 +251,8 @@ func main() {
 		"endpoints", len(cfg.Network.Endpoints),
 		"start", cfg.Indexer.StartHeight,
 		"end", cfg.Indexer.EndHeight,
-		"workers", cfg.Indexer.FetchWorkers,
-		"fetch_batch", cfg.Indexer.FetchBatchSize,
+		"workers", resolvedWorkers,
+		"fetch_batch", resolvedBatchMax,
 	)
 
 	// Run the pipeline and web UI side-by-side. Either exiting with an error
@@ -259,14 +300,32 @@ func main() {
 	slog.Info("shutdown")
 }
 
-func newPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
+// webPoolHeadroom reserves connections on top of fetch_workers for the
+// embedded web UI's /api/status (~14 round-trips per request) plus
+// aggregates and ad-hoc queries. Without headroom a busy pipeline
+// makes the dashboard unresponsive and aggregate refreshes block.
+const webPoolHeadroom = 4
+
+func newPool(ctx context.Context, cfg *config.Config, resolvedWorkers int) (*pgxpool.Pool, error) {
 	pc, err := pgxpool.ParseConfig(cfg.Database.ConnString())
 	if err != nil {
-		return nil, err
+		return nil, redactSecret(err, cfg.Database.Password)
 	}
-	if cfg.Database.PoolSize > 0 {
-		pc.MaxConns = int32(cfg.Database.PoolSize)
+	// Derive MaxConns to fit the resolved fetch_workers. Each worker holds
+	// a connection for the full per-batch tx, so anything below
+	// fetch_workers is a hard concurrency ceiling regardless of pool_size.
+	want := resolvedWorkers + webPoolHeadroom
+	max := cfg.Database.PoolSize
+	if max < want {
+		if max > 0 {
+			slog.Warn("pool_size too small for fetch_workers; growing",
+				"configured_pool_size", max,
+				"fetch_workers", resolvedWorkers,
+				"resolved_pool_size", want)
+		}
+		max = want
 	}
+	pc.MaxConns = int32(max)
 	return pgxpool.NewWithConfig(ctx, pc)
 }
 
@@ -289,6 +348,27 @@ func newClient(cfg *config.Config) (*rpc.MultiClient, error) {
 
 func isContextDone(err error) bool {
 	return err == context.Canceled || err == context.DeadlineExceeded
+}
+
+// redactSecret strips a known secret string from an error message before
+// it's logged. pgxpool.ParseConfig errors include the full DSN — and
+// therefore the password — in their messages; once that error reaches
+// slog.Error("connect postgres", "err", err) the password lands in the
+// JSON log stream where shippers (CloudWatch, Loki, Datadog) index it
+// for full-text search forever. Triggered by any malformed DB_PORT or
+// DB_HOST env var, which is a common operational mistake.
+func redactSecret(err error, secret string) error {
+	if err == nil || secret == "" {
+		return err
+	}
+	msg := strings.ReplaceAll(err.Error(), secret, "***")
+	// Also catch percent-encoded variants since ConnString URL-escapes
+	// the password — pgx may report either form depending on the parse
+	// failure mode.
+	if escaped := url.QueryEscape(secret); escaped != secret {
+		msg = strings.ReplaceAll(msg, escaped, "***")
+	}
+	return errors.New(msg)
 }
 
 // pipelineStatsAdapter converts pipeline.Stats to web.Stats to keep the two

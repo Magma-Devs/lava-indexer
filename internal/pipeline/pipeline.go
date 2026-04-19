@@ -30,12 +30,22 @@ type Pipeline struct {
 	state    *state.State
 	registry *events.Registry
 
+	// Resolved runtime knobs. main.go computes these (mixing operator
+	// values, adaptive sizer output, and per-endpoint probe results) and
+	// passes them in via WithRuntimeKnobs so the pipeline never reaches
+	// back into cfg for them. Treating *config.Config as input-only after
+	// Load means anyone reading the config (logs, /api/status, future
+	// "show effective config" handler) sees what the operator actually
+	// typed, not main's resolution.
+	workers  int
+	batchMax int
+
 	totalBlocks atomic.Int64
 	totalRows   atomic.Int64
 	rate        *RateTracker
 
-	runID     int64     // 0 until Run() assigns one
-	runStart  time.Time // wall-clock at StartRun
+	runID    int64     // 0 until Run() assigns one
+	runStart time.Time // wall-clock at StartRun
 
 	sizer *AdaptiveSizer // nil when all knobs are explicit
 }
@@ -44,6 +54,20 @@ type Pipeline struct {
 // batch instead of using the static config value. Optional.
 func (p *Pipeline) WithSizer(s *AdaptiveSizer) *Pipeline {
 	p.sizer = s
+	return p
+}
+
+// WithRuntimeKnobs overrides the worker and batch-size values the
+// pipeline uses at run time. Set by main.go after the adaptive sizer
+// resolves them, so the pipeline doesn't have to re-discover them and
+// cfg.Indexer keeps reflecting what the operator actually configured.
+func (p *Pipeline) WithRuntimeKnobs(workers, batchMax int) *Pipeline {
+	if workers > 0 {
+		p.workers = workers
+	}
+	if batchMax > 0 {
+		p.batchMax = batchMax
+	}
 	return p
 }
 
@@ -60,9 +84,19 @@ type Stats struct {
 func New(cfg *config.Config, pool *pgxpool.Pool, client rpc.Client, st *state.State, reg *events.Registry) *Pipeline {
 	return &Pipeline{
 		cfg: cfg, pool: pool, client: client, state: st, registry: reg,
-		rate: NewRateTracker(60 * time.Second),
+		// Default to operator-supplied values. main.go overrides via
+		// WithRuntimeKnobs once it's resolved adaptive ones.
+		workers:  cfg.Indexer.FetchWorkers,
+		batchMax: cfg.Indexer.FetchBatchSize,
+		rate:     NewRateTracker(60 * time.Second),
 	}
 }
+
+// Workers returns the resolved fetch-worker count.
+func (p *Pipeline) Workers() int { return p.workers }
+
+// BatchMax returns the resolved per-fetch batch-size cap.
+func (p *Pipeline) BatchMax() int { return p.batchMax }
 
 // Stats returns a snapshot of the current indexing progress.
 func (p *Pipeline) Stats() Stats {
@@ -242,7 +276,7 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 		if p.sizer != nil {
 			return int64(p.sizer.BatchSize())
 		}
-		return int64(cfg.FetchBatchSize)
+		return int64(p.batchMax)
 	}
 
 	type job struct {
@@ -341,7 +375,20 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 					return nil
 				case <-ticker.C:
 				}
+				// Cap each sweep at one FailureRetryInterval so the next
+				// tick can't fire on top of an unfinished sweep. Without
+				// this, FailureRetryBatch=200 × ~500 ms/retry = 100 s of
+				// work would overlap a 60 s tick — sweeps stack, share
+				// the per-handler advisory lock with the producer, and
+				// degrade the entire indexer's commit loop. Heights left
+				// over from this tick stay in indexer_failures and the
+				// next tick picks them up.
+				sweepDeadline := time.Now().Add(cfg.FailureRetryInterval)
+				overran := false
 				for _, handler := range p.registry.All() {
+					if overran {
+						break
+					}
 					heights, err := p.state.PopFailures(ctx, handler.Name(), cfg.FailureRetryBatch)
 					if err != nil {
 						slog.Warn("dead-letter sweep: pop failed", "handler", handler.Name(), "err", err)
@@ -352,9 +399,16 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 					}
 					slog.Info("dead-letter sweep: retrying heights",
 						"handler", handler.Name(), "count", len(heights))
-					for _, h := range heights {
+					for i, h := range heights {
 						if ctx.Err() != nil {
 							return nil
+						}
+						if time.Now().After(sweepDeadline) {
+							slog.Warn("dead-letter sweep: time budget exhausted; deferring remainder",
+								"handler", handler.Name(),
+								"completed", i, "remaining", len(heights)-i)
+							overran = true
+							break
 						}
 						// Swallow errors: processWithSplit only returns ctx
 						// errors; real failures re-insert into indexer_failures.
@@ -368,7 +422,7 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 	// Consumers.
 	start := time.Now()
 	var progressBlocks atomic.Int64
-	for i := 0; i < cfg.FetchWorkers; i++ {
+	for i := 0; i < p.workers; i++ {
 		g.Go(func() error {
 			for j := range jobs {
 				if err := p.processWithSplit(ctx, j.from, j.to); err != nil {
@@ -416,7 +470,7 @@ func (p *Pipeline) processWithSplit(ctx context.Context, from, to int64) error {
 		return err
 	}
 	if isPermanentFetchError(err) {
-		reason := truncate(err.Error(), 250)
+		reason := safeFailureReason(err)
 		for h := from; h <= to; h++ {
 			for _, handler := range p.registry.All() {
 				if rerr := p.state.RecordPermanentFailure(ctx, handler.Name(), h, reason); rerr != nil {
@@ -432,7 +486,7 @@ func (p *Pipeline) processWithSplit(ctx context.Context, from, to int64) error {
 		// Single block and still failing transiently → dead-letter for the
 		// sweep to retry. RecordFailure flips the row to permanent when
 		// retries hit the configured cap so the sweep eventually stops.
-		reason := truncate(err.Error(), 250)
+		reason := safeFailureReason(err)
 		maxRetries := p.cfg.Indexer.FailureMaxRetries
 		for _, h := range p.registry.All() {
 			if rerr := p.state.RecordFailure(ctx, h.Name(), from, reason, maxRetries); rerr != nil {
@@ -457,6 +511,32 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// safeFailureReason returns a dead-letter-safe one-line reason string
+// for err. Typed RPC errors that carry URLs or upstream response bodies
+// (rpc.HeightPrunedError, rpc.HTTPStatusError) are stripped down to
+// status-only forms — operators put bearer tokens in URL paths and
+// providers echo query strings in error bodies, and indexer_failures.reason
+// is surfaced unauthenticated on /api/status. Generic errors fall through
+// to the truncated err.Error() and should not contain credentials.
+func safeFailureReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	var hp *rpc.HeightPrunedError
+	if errors.As(err, &hp) {
+		return fmt.Sprintf("height %d pruned (http %d)", hp.Height, hp.Status)
+	}
+	var hs *rpc.HTTPStatusError
+	if errors.As(err, &hs) {
+		return fmt.Sprintf("http %d", hs.Status)
+	}
+	var nec *rpc.NoEndpointCoversError
+	if errors.As(err, &nec) {
+		return fmt.Sprintf("no endpoint covers heights %d-%d", nec.MinHeight, nec.MaxHeight)
+	}
+	return truncate(err.Error(), 250)
 }
 
 func (p *Pipeline) processBatch(ctx context.Context, from, to int64) error {

@@ -1,7 +1,6 @@
 package rpc
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -117,67 +116,3 @@ func (c *AdaptiveController) shrink(budget int) {
 	}
 }
 
-// Acquire reserves a budget slot, blocking until one is free or ctx is done.
-// Uses a simple chan-based sem so it scales with changing budget — when we
-// grow, the next release widens the available slots automatically.
-type EndpointSem struct {
-	ctrl *AdaptiveController
-	mu   sync.Mutex
-	// We can't size a plain channel dynamically, so represent "available"
-	// slots with a counter + cond. Cheap, correct under contention.
-	available int
-	cond      *sync.Cond
-}
-
-func NewEndpointSem(ctrl *AdaptiveController) *EndpointSem {
-	s := &EndpointSem{ctrl: ctrl, available: ctrl.Budget()}
-	s.cond = sync.NewCond(&s.mu)
-	return s
-}
-
-// Resize syncs the available-counter with the controller's latest budget.
-// Called every tick.
-func (s *EndpointSem) Resize() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	newBudget := s.ctrl.Budget()
-	if newBudget > s.available {
-		// We grew: free up extra slots.
-		s.available = newBudget
-		s.cond.Broadcast()
-		return
-	}
-	// Shrinking below available is fine — acquires will just block until
-	// enough outstanding releases bring `available` back above zero.
-	s.available = newBudget
-}
-
-func (s *EndpointSem) Acquire(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for s.available <= 0 {
-		// Lock-drop-wait loop, standard cond pattern with context.
-		done := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				s.cond.Broadcast()
-			case <-done:
-			}
-		}()
-		s.cond.Wait()
-		close(done)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-	}
-	s.available--
-	return nil
-}
-
-func (s *EndpointSem) Release() {
-	s.mu.Lock()
-	s.available++
-	s.cond.Signal()
-	s.mu.Unlock()
-}

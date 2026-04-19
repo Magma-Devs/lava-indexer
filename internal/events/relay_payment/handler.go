@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/magma-devs/lava-indexer/internal/events"
 )
 
@@ -36,6 +37,16 @@ func New(schema string) *Handler {
 
 func (h *Handler) Name() string         { return "lava_relay_payment" }
 func (h *Handler) EventTypes() []string { return []string{EventType} }
+
+// Warmup pre-loads the providers and chains dictionary caches from
+// the DB so steady-state IDs lookups skip the round-trip. Implements
+// events.Warmer.
+func (h *Handler) Warmup(ctx context.Context, pool *pgxpool.Pool) error {
+	if err := h.providers.Warmup(ctx, pool); err != nil {
+		return err
+	}
+	return h.chains.Warmup(ctx, pool)
+}
 
 func (h *Handler) DDL() []string {
 	return []string{

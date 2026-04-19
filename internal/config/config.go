@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -185,10 +186,12 @@ func defaults() *Config {
 			BackfillInterleave:   5,
 		},
 		Database: Database{
-			Host:     "localhost",
-			Port:     5432,
-			User:     "postgres",
-			Password: "postgres",
+			Host: "localhost",
+			Port: 5432,
+			User: "postgres",
+			// Password intentionally has no default — operator must set
+			// it via config or DB_PASSWORD env. A baked-in default would
+			// silently ship as a known credential.
 			Database: "postgres",
 			Schema:   "app",
 			PoolSize: 8,
@@ -203,7 +206,13 @@ func defaults() *Config {
 			Level:  "info",
 		},
 		GraphQL: GraphQL{
-			Enabled:  true,
+			// Off by default. When enabled, the indexer reverse-proxies
+			// /graphql + /graphiql to the upstream Postgraphile container,
+			// which exposes the entire app schema unauthenticated. Operators
+			// must opt-in (graphql.enabled: true or GRAPHQL_ENABLED=true)
+			// after deciding how to gate access — typically via a reverse
+			// proxy with auth, or by binding the indexer to loopback.
+			Enabled:  false,
 			Upstream: "http://graphql:5000",
 		},
 		AggregatesDir: "./aggregates",
@@ -398,11 +407,24 @@ func (c *Config) validate() error {
 	return nil
 }
 
+// ConnString returns a libpq-compatible postgres URL with user/password
+// properly URL-escaped via url.UserPassword. Passwords containing `@`,
+// `?`, `/`, `#`, `%` are common in cloud-managed-DB credentials (RDS,
+// Cloud SQL) — naive %s interpolation corrupts the URL parse and can
+// silently downgrade SSL when, e.g., a password ends with `?sslmode=`.
 func (d Database) ConnString() string {
 	ssl := d.SSLMode
 	if ssl == "" {
 		ssl = "disable"
 	}
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
-		d.User, d.Password, d.Host, d.Port, d.Database, ssl)
+	q := url.Values{}
+	q.Set("sslmode", ssl)
+	u := url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(d.User, d.Password),
+		Host:     fmt.Sprintf("%s:%d", d.Host, d.Port),
+		Path:     "/" + d.Database,
+		RawQuery: q.Encode(),
+	}
+	return u.String()
 }

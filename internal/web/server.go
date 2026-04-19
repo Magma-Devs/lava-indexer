@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -72,14 +73,14 @@ func (s *Server) Mux() *http.ServeMux {
 	// When enabled, /graphql and /graphiql on this port proxy to the
 	// upstream, so the embedded UI can iframe /graphiql without CORS.
 	if s.GraphQLEnabled && s.GraphQLUpstream != "" {
-		if target, err := url.Parse(s.GraphQLUpstream); err == nil {
+		if target, err := parseProxyUpstream(s.GraphQLUpstream); err == nil {
 			proxy := httputil.NewSingleHostReverseProxy(target)
 			mux.Handle("/graphql", proxy)
 			mux.Handle("/graphql/", proxy)
 			mux.Handle("/graphiql", proxy)
 			mux.Handle("/graphiql/", proxy)
 		} else {
-			slog.Warn("graphql.upstream is not a valid URL, skipping proxy", "upstream", s.GraphQLUpstream, "err", err)
+			slog.Warn("graphql.upstream rejected, skipping proxy", "upstream", s.GraphQLUpstream, "err", err)
 		}
 	}
 	mux.HandleFunc("/api/ui-config", s.handleUIConfig)
@@ -90,6 +91,52 @@ func (s *Server) Mux() *http.ServeMux {
 	}
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	return mux
+}
+
+// parseProxyUpstream parses and validates the GraphQL reverse-proxy
+// upstream URL. Reject anything that isn't http/https and anything that
+// resolves outside loopback or RFC1918/ULA private space — without this
+// the indexer becomes a SSRF proxy: a misconfigured GRAPHQL_UPSTREAM
+// could be aimed at the AWS metadata service or an arbitrary attacker
+// host, and any unauthenticated client of the indexer's web port could
+// proxy through it.
+func parseProxyUpstream(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("scheme must be http or https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("missing host")
+	}
+	host := u.Hostname()
+	// Resolve the host. ResolveIPAddr returns a single IP — fine for the
+	// validation gate; we're checking that no public IP is reachable, so
+	// any single resolved address tells us whether the host points at a
+	// safe range. For multi-A-record hostnames Go uses LookupIP elsewhere
+	// in the stack, but the proxy only needs to know if the *target* is
+	// allowed to be reached.
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %q: %w", host, err)
+	}
+	for _, ip := range ips {
+		if !isPrivateOrLoopback(ip) {
+			return nil, fmt.Errorf("upstream host %q resolves to public IP %s — refusing to proxy",
+				host, ip)
+		}
+	}
+	return u, nil
+}
+
+func isPrivateOrLoopback(ip net.IP) bool {
+	// Allow loopback + RFC1918/ULA. Explicitly DENY link-local — the
+	// IPv4 link-local range 169.254.0.0/16 includes the cloud metadata
+	// service (169.254.169.254 on AWS/GCP/Azure), which is the canonical
+	// SSRF target.
+	return ip.IsLoopback() || ip.IsPrivate()
 }
 
 // handleUIConfig exposes tiny bits of config the UI needs to know at
