@@ -65,7 +65,12 @@ services:
       postgres: { condition: service_healthy }
     restart: unless-stopped
     ports:
-      - "${INDEXER_PORT:-8080}:8080"    # progress UI + /api/status
+      # Bind to loopback by default — the UI / /api/status / GraphQL proxy
+      # are UNAUTHENTICATED and disclose endpoint URLs (which can carry
+      # tokens), failure reasons, and per-handler row counts. Override
+      # INDEXER_BIND=0.0.0.0 only when you've put a reverse proxy with auth
+      # in front, or in a network where the host port is otherwise gated.
+      - "${INDEXER_BIND:-127.0.0.1}:${INDEXER_PORT:-8080}:8080"
     environment:
       DB_HOST: postgres
       DB_USER: ${DB_USER:-postgres}
