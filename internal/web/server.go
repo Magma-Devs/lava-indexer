@@ -132,7 +132,11 @@ func parseProxyUpstream(raw string) (*url.URL, error) {
 }
 
 func isPrivateOrLoopback(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+	// Allow loopback + RFC1918/ULA. Explicitly DENY link-local — the
+	// IPv4 link-local range 169.254.0.0/16 includes the cloud metadata
+	// service (169.254.169.254 on AWS/GCP/Azure), which is the canonical
+	// SSRF target.
+	return ip.IsLoopback() || ip.IsPrivate()
 }
 
 // handleUIConfig exposes tiny bits of config the UI needs to know at
