@@ -304,11 +304,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	resp := StatusResponse{
 		ChainID:      s.ChainID,
-		ChainGenesis: 1,
+		ChainGenesis: s.Client.Genesis(),
 		Start:        s.Start,
 		End:          s.End,
 		Tip:          tip,
 		GeneratedAt:  time.Now(),
+	}
+	if gt := s.Client.GenesisTime(); !gt.IsZero() {
+		t := gt
+		resp.ChainGenesisTime = &t
 	}
 	if s.Stats != nil {
 		resp.BlocksPerSec = s.Stats.Stats().BlocksPerSec
@@ -349,7 +353,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var tipTime *time.Time
-	var genesisTime *time.Time
+	// genesisTime: prefer the authoritative /genesis response resolved at
+	// startup (populated above from s.Client.GenesisTime()). Fall back to
+	// per-endpoint earliest-block-time inference only when the RPC
+	// /genesis lookup failed at startup (e.g. REST-only deploy).
+	genesisTime := resp.ChainGenesisTime
 	for _, ep := range s.Client.Endpoints() {
 		es := EndpointStatus{
 			URL: ep.URL, Kind: ep.Kind,
@@ -360,9 +368,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		if !ep.EarliestTime.IsZero() {
 			t := ep.EarliestTime
 			es.EarliestTime = &t
-			// If an endpoint serves from block 1, its earliest_time is the
-			// chain's genesis time.
-			if ep.Earliest == 1 && (genesisTime == nil || t.Before(*genesisTime)) {
+			// Only infer from earliest==1 if we didn't already resolve
+			// genesis via /genesis. Chains that don't start at 1 (Lava
+			// testnet-2 starts at 340,778) would produce the wrong
+			// timestamp here otherwise.
+			if genesisTime == nil && ep.Earliest == 1 {
 				genesisTime = &t
 			}
 		}
@@ -399,11 +409,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		for _, rg := range all[h.Name()] {
 			hs.Ranges = append(hs.Ranges, RangeJSON{From: rg.From, To: rg.To})
 		}
-		// Coverage % within the configured window [start, windowEnd] and the
-		// full chain [1, tip] — the UI renders both.
+		// Coverage % within the configured window [start, windowEnd] and
+		// the full chain [genesis, tip]. `genesis` comes from /genesis —
+		// not every chain starts at 1 (Lava testnet-2 starts at 340,778
+		// because of a net reset, not a fork), and using 1 as the
+		// denominator under-reports chain_pct by up to 7 %.
 		hs.WindowPct = coverageRatio(hs.Ranges, s.Start, windowEnd) * 100
 		if tip > 0 {
-			hs.ChainPct = coverageRatio(hs.Ranges, 1, tip) * 100
+			hs.ChainPct = coverageRatio(hs.Ranges, resp.ChainGenesis, tip) * 100
 		}
 		if len(hs.Ranges) > 0 {
 			hs.CoveredStart = hs.Ranges[0].From
