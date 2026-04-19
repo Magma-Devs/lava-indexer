@@ -43,16 +43,34 @@ func (d *Dict) DDL() string {
 		);`, d.Schema, d.Table, d.Column)
 }
 
-// IDs returns id for every value in `values`, inserting new ones via a
-// single bulk UPSERT. Must be called with an active transaction so that
-// dict writes commit (or roll back) atomically with the caller's batch.
+// IDs returns id for every value in `values`, inserting new ones as
+// needed. Must be called with an active transaction so that dict writes
+// commit (or roll back) atomically with the caller's batch.
+//
+// Implemented as two queries (INSERT … DO NOTHING, then SELECT for the
+// conflicting rows) rather than one INSERT … DO UPDATE … RETURNING. The
+// one-round-trip form sounds nicer, but DO UPDATE acquires a row-level
+// exclusive lock on every conflicting row and holds it until the caller's
+// tx commits. Under N parallel workers each inserting the same ~60
+// dictionary rows in a batch tx that also contains a heavy COPY, every
+// worker serialised on those locks for the full batch duration — ~30 s
+// under fresh-backfill load, pushing pg_stat_activity to 100% active and
+// starving any other query (the /api/status handler, the dead-letter
+// sweep) of a pool connection.
+//
+// DO NOTHING takes the lock only for the brief conflict check and
+// releases on the spot; we then fetch the existing ids with a plain
+// read. MVCC means concurrent tx's inserts we couldn't see still surface
+// via the fallback SELECT once they commit — i.e. correctness is
+// preserved while the lock contention is eliminated.
 func (d *Dict) IDs(ctx context.Context, tx pgx.Tx, values []string) (map[string]int32, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
 
-	// Dedup before round-tripping. unnest+DISTINCT would handle this
-	// server-side, but trimming the arg array first keeps the wire smaller.
+	// Dedup before round-tripping. unnest+DISTINCT would dedup server-side
+	// too, but trimming the arg array first keeps the wire smaller and
+	// makes the fallback `missing` calculation straightforward.
 	seen := make(map[string]struct{}, len(values))
 	dedup := make([]string, 0, len(values))
 	for _, v := range values {
@@ -63,29 +81,63 @@ func (d *Dict) IDs(ctx context.Context, tx pgx.Tx, values []string) (map[string]
 		dedup = append(dedup, v)
 	}
 
-	// ON CONFLICT DO UPDATE ... RETURNING returns the id for BOTH new and
-	// pre-existing rows in one round-trip. The DO UPDATE is a no-op write
-	// whose sole purpose is to trigger RETURNING; without it, ON CONFLICT
-	// DO NOTHING would skip RETURNING for the conflict rows.
-	sql := fmt.Sprintf(`
+	out := make(map[string]int32, len(dedup))
+
+	// Step 1: INSERT anything new. ON CONFLICT DO NOTHING means a conflict
+	// skips without grabbing the conflicting row's lock past the check.
+	// Returned rows are the ones WE inserted.
+	insSQL := fmt.Sprintf(`
 		INSERT INTO %[1]s.%[2]s (%[3]s)
 		SELECT DISTINCT v FROM unnest($1::text[]) AS t(v)
-		ON CONFLICT (%[3]s) DO UPDATE SET %[3]s = EXCLUDED.%[3]s
+		ON CONFLICT (%[3]s) DO NOTHING
 		RETURNING id, %[3]s`, d.Schema, d.Table, d.Column)
-	rows, err := tx.Query(ctx, sql, dedup)
+	insRows, err := tx.Query(ctx, insSQL, dedup)
 	if err != nil {
-		return nil, fmt.Errorf("%s.%s upsert: %w", d.Schema, d.Table, err)
+		return nil, fmt.Errorf("%s.%s insert: %w", d.Schema, d.Table, err)
 	}
-	defer rows.Close()
-
-	out := make(map[string]int32, len(dedup))
-	for rows.Next() {
+	for insRows.Next() {
 		var id int32
 		var v string
-		if err := rows.Scan(&id, &v); err != nil {
+		if err := insRows.Scan(&id, &v); err != nil {
+			insRows.Close()
 			return nil, err
 		}
 		out[v] = id
 	}
-	return out, rows.Err()
+	insRows.Close()
+	if err := insRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Step 2: anything still missing was skipped by DO NOTHING — either
+	// because it already existed (common) or because a concurrent tx just
+	// committed its insert (rare, benign). Fetch their ids with a plain
+	// read; PG's unique-index conflict resolution guarantees the committed
+	// row is visible to this transaction by the time Step 1 returned.
+	missing := dedup[:0]
+	for _, v := range dedup {
+		if _, ok := out[v]; !ok {
+			missing = append(missing, v)
+		}
+	}
+	if len(missing) == 0 {
+		return out, nil
+	}
+	selSQL := fmt.Sprintf(
+		`SELECT id, %[3]s FROM %[1]s.%[2]s WHERE %[3]s = ANY($1::text[])`,
+		d.Schema, d.Table, d.Column)
+	selRows, err := tx.Query(ctx, selSQL, missing)
+	if err != nil {
+		return nil, fmt.Errorf("%s.%s select-existing: %w", d.Schema, d.Table, err)
+	}
+	defer selRows.Close()
+	for selRows.Next() {
+		var id int32
+		var v string
+		if err := selRows.Scan(&id, &v); err != nil {
+			return nil, err
+		}
+		out[v] = id
+	}
+	return out, selRows.Err()
 }
