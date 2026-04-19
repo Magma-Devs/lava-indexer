@@ -54,12 +54,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := newPool(ctx, cfg)
-	if err != nil {
-		fatal("connect postgres", err)
-	}
-	defer pool.Close()
-
 	client, err := newClient(cfg)
 	if err != nil {
 		fatal("build rpc client", err)
@@ -114,6 +108,17 @@ func main() {
 		slog.Info("adaptive fetch_workers resolved", "workers", workers)
 		cfg.Indexer.FetchWorkers = workers
 	}
+
+	// Pool is built AFTER fetch_workers is resolved so newPool can size
+	// MaxConns to the actual worker count (+ web/aggregates headroom).
+	// With pool_size=8 vs adaptive workers≈100, a stale default starves
+	// every worker past the 8th and silently caps throughput at ~8% of
+	// what the operator configured.
+	pool, err := newPool(ctx, cfg)
+	if err != nil {
+		fatal("connect postgres", err)
+	}
+	defer pool.Close()
 
 	if benchmark {
 		runBenchmark(ctx, client)
@@ -259,14 +264,32 @@ func main() {
 	slog.Info("shutdown")
 }
 
+// webPoolHeadroom reserves connections on top of fetch_workers for the
+// embedded web UI's /api/status (~14 round-trips per request) plus
+// aggregates and ad-hoc queries. Without headroom a busy pipeline
+// makes the dashboard unresponsive and aggregate refreshes block.
+const webPoolHeadroom = 4
+
 func newPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 	pc, err := pgxpool.ParseConfig(cfg.Database.ConnString())
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Database.PoolSize > 0 {
-		pc.MaxConns = int32(cfg.Database.PoolSize)
+	// Derive MaxConns to fit the resolved fetch_workers. Each worker holds
+	// a connection for the full per-batch tx, so anything below
+	// fetch_workers is a hard concurrency ceiling regardless of pool_size.
+	want := cfg.Indexer.FetchWorkers + webPoolHeadroom
+	max := cfg.Database.PoolSize
+	if max < want {
+		if max > 0 {
+			slog.Warn("pool_size too small for fetch_workers; growing",
+				"configured_pool_size", max,
+				"fetch_workers", cfg.Indexer.FetchWorkers,
+				"resolved_pool_size", want)
+		}
+		max = want
 	}
+	pc.MaxConns = int32(max)
 	return pgxpool.NewWithConfig(ctx, pc)
 }
 
