@@ -278,17 +278,26 @@ func (m *MultiClient) Tip(ctx context.Context) (int64, error) {
 }
 
 // FetchBlocks routes the batch to an endpoint whose coverage window covers
-// the requested heights. Policy:
+// the requested heights. This is the AUTHORITATIVE "I tried everyone"
+// loop in the system — there is no outer retry wrapper, so once
+// FetchBlocks returns the pipeline either bisects (multi-block batch) or
+// dead-letters (size-1).
 //
-//   - Start with the eligible endpoint that has the most HEADROOM right now
+// Policy:
+//
+//   - Pick the eligible endpoint with the most HEADROOM right now
 //     (budget − in_flight). Under contention this packs new work onto
 //     whichever node is least busy, naturally spreading load across nodes
 //     when the system can handle more.
-//   - On 429 (*ErrRateLimited), fail over IMMEDIATELY to the next
-//     eligible endpoint — don't burn retries against a node telling us to
-//     back off when another node might be fine.
-//   - On any other error, also try the next endpoint. Per-endpoint HTTP
-//     retry for 5xx / network errors already happens inside Client.
+//   - On *ErrRateLimited (429) or *ErrServerError (5xx), fail over
+//     immediately to the next eligible endpoint. The HTTP layer doesn't
+//     retry these in place — sick or throttled nodes don't recover inside
+//     a 200ms backoff, and burning a retry there just delays failover.
+//   - On any other error (network err that survived the HTTP layer's one
+//     in-place retry, decode err), also try the next endpoint.
+//   - If every eligible endpoint is at budget, wait up to 5s for headroom
+//     to open up (AIMD ticks every 3s and naturally completing in-flights
+//     free slots). Then fail with "saturated for 5s".
 //   - Returns the last error if every eligible endpoint failed.
 func (m *MultiClient) FetchBlocks(ctx context.Context, heights []int64) ([]*Block, error) {
 	if len(heights) == 0 {
@@ -355,10 +364,15 @@ func (m *MultiClient) FetchBlocks(ctx context.Context, heights []int64) ([]*Bloc
 				}
 				lastErr = err
 				var rl *ErrRateLimited
-				if errors.As(err, &rl) {
+				var se *ErrServerError
+				switch {
+				case errors.As(err, &rl):
 					slog.Debug("endpoint rate-limited, failing over",
 						"url", ep.URL, "retry_after", rl.RetryAfter)
-				} else {
+				case errors.As(err, &se):
+					slog.Debug("endpoint server-error, failing over",
+						"url", ep.URL, "status", se.Status, "retry_after", se.RetryAfter)
+				default:
 					slog.Warn("fetch failed, trying next endpoint",
 						"url", ep.URL, "err", err)
 				}

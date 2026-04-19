@@ -70,30 +70,42 @@ type rpcResp struct {
 // call does a POST with an arbitrary JSON body (single request or batch array)
 // and returns the raw response body.
 //
-// Retry semantics:
-//   - HTTP 429 and 5xx: retried up to `maxRetries` times with
-//     exponential backoff + jitter. Retry-After (seconds or HTTP-date) is
-//     honoured when the server provides it.
-//   - Network errors (connection refused, reset, timeout awaiting headers):
-//     retried the same way.
-//   - 4xx other than 429: treated as terminal — the body is malformed or
-//     we're being told the request is wrong, retrying won't fix that.
+// Retry semantics — kept deliberately narrow at this layer; the MultiClient
+// is the authoritative "I tried everyone" loop, so anything we can't fix
+// in-place (5xx, 429, body-decode) becomes a typed error and the failover
+// happens one level up:
+//
+//   - 2xx: return body.
+//   - Network errors (connection refused, reset, timeout, EOF, broken pipe):
+//     retried `httpRetryNetwork` times. Cheap recovery for the closed-keepalive
+//     race; if it doesn't help on the first retry it isn't going to help, so
+//     we hand off to MultiClient for a different node.
+//   - HTTP 5xx: returned as *ErrServerError immediately, no in-place retry.
+//     If this node is sick, retrying here just delays failover. Retry-After
+//     is preserved on the typed error so the caller can apply it if it ever
+//     loops back to this same endpoint.
+//   - HTTP 429: returned as *ErrRateLimited immediately. Same reasoning.
+//   - HTTP 4xx ≠ 429: terminal — *HTTPStatusError with the body so the
+//     pipeline can classify (404 → height pruned, etc.). No retry.
+//   - Body-decode errors after a 2xx: retried `httpRetryNetwork` times in
+//     case of a transient stream cut.
 //   - Context cancellation always wins immediately.
 func (c *RPCClient) call(ctx context.Context, body []byte) ([]byte, error) {
 	return retryableCall(ctx, c.http, c.baseURL+"/", body, c.headers)
 }
 
 const (
-	maxRetries = 4
-	baseDelay  = 200 * time.Millisecond
-	maxDelay   = 5 * time.Second
+	// httpRetryNetwork bounds same-endpoint retries on transient network
+	// errors only. One retry covers the keep-alive-closed race; more is
+	// just pointless waiting before MultiClient fails over.
+	httpRetryNetwork = 1
+	baseDelay        = 200 * time.Millisecond
+	maxDelay         = 5 * time.Second
 )
 
-// ErrRateLimited is returned when an endpoint 429's us. The MultiClient
-// recognises it and fails over to another endpoint immediately instead of
-// burning the retry budget on a node that is actively telling us to slow
-// down. If all endpoints return ErrRateLimited, the outer caller's
-// retry-with-backoff catches it.
+// ErrRateLimited is returned when an endpoint 429's us. MultiClient
+// recognises it and fails over immediately instead of holding a worker
+// here.
 type ErrRateLimited struct {
 	RetryAfter time.Duration
 	Status     int
@@ -107,13 +119,32 @@ func (e *ErrRateLimited) Error() string {
 	return fmt.Sprintf("http %d rate-limited", e.Status)
 }
 
-// retryableCall is the shared HTTP-retry loop for both the RPC and REST
-// clients. Returns the raw response body on 2xx. Retries 5xx/network errors
-// with exponential backoff + jitter. 429 bails immediately with
-// ErrRateLimited so the caller can fail over to another endpoint.
+// ErrServerError is returned for any 5xx response. Like ErrRateLimited it
+// signals MultiClient to fail over rather than retrying the same node —
+// a sick node is rarely going to recover inside the few hundred ms an
+// in-place retry would wait. RetryAfter is preserved if the upstream sent
+// one.
+type ErrServerError struct {
+	Status     int
+	Body       string
+	RetryAfter time.Duration
+}
+
+func (e *ErrServerError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("http %d server error; retry-after %s", e.Status, e.RetryAfter)
+	}
+	return fmt.Sprintf("http %d server error", e.Status)
+}
+
+// retryableCall is the shared HTTP loop for both the RPC and REST
+// clients. See RPCClient.call for the full retry policy. Anything that
+// can't recover in place (5xx, 429, 4xx, repeated network err) is
+// returned as a typed error so MultiClient can fail over to a different
+// endpoint instead of burning a budget here.
 func retryableCall(ctx context.Context, httpc *http.Client, url string, body []byte, extraHeaders map[string]string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; attempt <= httpRetryNetwork; attempt++ {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -153,8 +184,6 @@ func retryableCall(ctx context.Context, httpc *http.Client, url string, body []b
 			return data, nil
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
-			// Don't retry the same node. Fail fast and let MultiClient
-			// route around it.
 			return nil, &ErrRateLimited{
 				RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 				Status:     resp.StatusCode,
@@ -162,12 +191,13 @@ func retryableCall(ctx context.Context, httpc *http.Client, url string, body []b
 			}
 		}
 		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
-			lastErr = fmt.Errorf("http %d: %s", resp.StatusCode, truncate(string(data), 200))
-			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-			if !sleepBackoff(ctx, attempt, retryAfter) {
-				return nil, ctx.Err()
+			// Fail fast: MultiClient will try a different endpoint.
+			// In-place retry against a sick node is wasted time.
+			return nil, &ErrServerError{
+				Status:     resp.StatusCode,
+				Body:       truncate(string(data), 200),
+				RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 			}
-			continue
 		}
 		// 4xx other than 429 — don't retry, the request is malformed and
 		// hitting again won't help. Wrap as a typed error so the pipeline
@@ -179,7 +209,7 @@ func retryableCall(ctx context.Context, httpc *http.Client, url string, body []b
 			URL:    url,
 		}
 	}
-	return nil, fmt.Errorf("exceeded %d retries: %w", maxRetries, lastErr)
+	return nil, fmt.Errorf("exceeded %d retries: %w", httpRetryNetwork, lastErr)
 }
 
 // sleepBackoff waits for the next attempt's delay. If retryAfter > 0 it wins
