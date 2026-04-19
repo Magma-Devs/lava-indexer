@@ -375,7 +375,20 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 					return nil
 				case <-ticker.C:
 				}
+				// Cap each sweep at one FailureRetryInterval so the next
+				// tick can't fire on top of an unfinished sweep. Without
+				// this, FailureRetryBatch=200 × ~500 ms/retry = 100 s of
+				// work would overlap a 60 s tick — sweeps stack, share
+				// the per-handler advisory lock with the producer, and
+				// degrade the entire indexer's commit loop. Heights left
+				// over from this tick stay in indexer_failures and the
+				// next tick picks them up.
+				sweepDeadline := time.Now().Add(cfg.FailureRetryInterval)
+				overran := false
 				for _, handler := range p.registry.All() {
+					if overran {
+						break
+					}
 					heights, err := p.state.PopFailures(ctx, handler.Name(), cfg.FailureRetryBatch)
 					if err != nil {
 						slog.Warn("dead-letter sweep: pop failed", "handler", handler.Name(), "err", err)
@@ -386,9 +399,16 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 					}
 					slog.Info("dead-letter sweep: retrying heights",
 						"handler", handler.Name(), "count", len(heights))
-					for _, h := range heights {
+					for i, h := range heights {
 						if ctx.Err() != nil {
 							return nil
+						}
+						if time.Now().After(sweepDeadline) {
+							slog.Warn("dead-letter sweep: time budget exhausted; deferring remainder",
+								"handler", handler.Name(),
+								"completed", i, "remaining", len(heights)-i)
+							overran = true
+							break
 						}
 						// Swallow errors: processWithSplit only returns ctx
 						// errors; real failures re-insert into indexer_failures.
