@@ -173,6 +173,18 @@ func main() {
 		}
 	}
 
+	// Warm any handler dictionaries so steady-state IDs() lookups hit
+	// the in-process cache instead of round-tripping to PG every batch.
+	for _, h := range reg.All() {
+		w, ok := h.(events.Warmer)
+		if !ok {
+			continue
+		}
+		if err := w.Warmup(ctx, pool); err != nil {
+			slog.Warn("handler warmup failed (non-fatal)", "name", h.Name(), "err", err)
+		}
+	}
+
 	// Apply user-defined aggregates + schedule refresh jobs.
 	if err := aggregates.Apply(ctx, pool, cfg.AggregatesDir); err != nil {
 		slog.Warn("aggregates apply failed (non-fatal)", "err", err)
