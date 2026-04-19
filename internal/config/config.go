@@ -205,7 +205,13 @@ func defaults() *Config {
 			Level:  "info",
 		},
 		GraphQL: GraphQL{
-			Enabled:  true,
+			// Off by default. When enabled, the indexer reverse-proxies
+			// /graphql + /graphiql to the upstream Postgraphile container,
+			// which exposes the entire app schema unauthenticated. Operators
+			// must opt-in (graphql.enabled: true or GRAPHQL_ENABLED=true)
+			// after deciding how to gate access — typically via a reverse
+			// proxy with auth, or by binding the indexer to loopback.
+			Enabled:  false,
 			Upstream: "http://graphql:5000",
 		},
 		AggregatesDir: "./aggregates",

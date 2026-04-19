@@ -154,7 +154,9 @@ graphql:
   # Reverse-proxy /graphql and /graphiql on the web port to an upstream
   # GraphQL server (PostGraphile by default). With this enabled, the UI
   # shows a "GraphQL" tab that iframes /graphiql — same origin, no CORS,
-  # only one exposed port.
-  # Disable with graphql.enabled: false or env GRAPHQL_ENABLED=false.
-  enabled: true
+  # only one exposed port. The upstream Postgraphile is unauthenticated
+  # and exposes the entire `app` schema, so leave this off unless you've
+  # gated the indexer's web port (loopback bind, reverse-proxy auth).
+  # Enable with graphql.enabled: true or env GRAPHQL_ENABLED=true.
+  enabled: false
   upstream: "http://graphql:5000"
