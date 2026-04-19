@@ -335,7 +335,15 @@
     if (n === 0) return '0';
     return new Intl.NumberFormat('en-US').format(n);
   };
-  const pct = (n) => (n == null ? '–' : n.toFixed(2) + '%');
+  const pct = (n) => {
+    if (n == null) return '–';
+    // Floor to 2 decimals so 99.9995 displays as 99.99, not "100.00" from
+    // half-up rounding. 100.00% shown only when coverage genuinely hits
+    // 100 — otherwise the dashboard lies about being done when ~25 stuck
+    // blocks remain.
+    const floored = Math.floor(n * 100) / 100;
+    return floored.toFixed(2) + '%';
+  };
   const fmtBytes = (n) => {
     if (n == null) return '–';
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
