@@ -412,57 +412,123 @@ func (s *State) HandlerNeedsRange(ctx context.Context, handler string, from, to 
 	return cursor <= to, nil
 }
 
-// RecordRange merges [from, to] into the handler's ranges inside the given
-// transaction. Call with the same tx that wrote the block rows so both
-// commit atomically.
+// RecordRange inserts [from, to] as a raw indexer_ranges row without
+// locking or merging. This used to take a per-handler advisory lock and
+// coalesce touching ranges inline — correct, but the lock serialised every
+// writer on the same handler. With 60+ concurrent writers on one handler
+// (`lava_relay_payment`) the lock was the process-wide write bottleneck.
 //
-// A per-handler advisory lock serialises concurrent range writers: without
-// it, two workers writing adjacent batches would each fail to see the
-// other's pending insert and produce two touching-but-unmerged rows.
-// The lock is transaction-scoped, so it releases on commit/rollback and
-// has no cross-tx cost.
+// New contract:
+//
+//   - Writers INSERT raw ranges with no coordination. ON CONFLICT on the
+//     (handler, from_height) PK extends the existing row's to_height if the
+//     new one is larger — handles the dead-letter sweep re-fetching an
+//     already-covered height.
+//   - A background compactor (CompactRanges) periodically merges touching /
+//     overlapping rows. Writers never block on compaction; compaction
+//     serialises against itself by scope (one handler at a time) and races
+//     with writers lazily — at most one compaction cycle of fragmentation
+//     is kept.
+//   - HandlerNeedsRange does a bounded overlap scan, so larger indexer_ranges
+//     table size from fragmentation is bounded below query latency by an
+//     index — not a concern in practice.
 func (s *State) RecordRange(ctx context.Context, tx pgx.Tx, handler string, from, to int64) error {
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, handler); err != nil {
-		return fmt.Errorf("advisory lock: %w", err)
-	}
-	rows, err := tx.Query(ctx, fmt.Sprintf(
-		`SELECT from_height, to_height FROM %s.indexer_ranges
-		 WHERE handler = $1 AND from_height <= $2 + 1 AND to_height + 1 >= $3
-		 FOR UPDATE`, s.schema), handler, to, from)
+	_, err := tx.Exec(ctx, fmt.Sprintf(
+		`INSERT INTO %s.indexer_ranges (handler, from_height, to_height)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (handler, from_height) DO UPDATE
+		   SET to_height = GREATEST(%s.indexer_ranges.to_height, EXCLUDED.to_height),
+		       updated_at = now()`,
+		s.schema, s.schema), handler, from, to)
+	return err
+}
+
+// CompactRanges merges touching/overlapping rows in indexer_ranges for the
+// given handler into the minimum-count representation. Intended to run on
+// a timer (see pipeline.go). Uses range_agg (PG 14+) for one-shot server-
+// side merging, then swaps old rows for merged ones inside a single tx.
+//
+// Races with concurrent INSERTs into indexer_ranges are benign: if a
+// writer inserts a new row after we read but before we swap, its row is
+// simply preserved (the DELETE only targets from_height values we saw)
+// and picked up on the next compaction cycle.
+func (s *State) CompactRanges(ctx context.Context, handler string) (merged int, err error) {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("lock touching: %w", err)
+		return 0, err
 	}
-	var touching []int64
-	newFrom, newTo := from, to
+	defer tx.Rollback(ctx)
+
+	// Compute the merged representation server-side via range_agg. Returned
+	// rows are already minimal and non-overlapping per PG's semantics.
+	rows, err := tx.Query(ctx, fmt.Sprintf(`
+		WITH merged AS (
+		  SELECT range_agg(int8range(from_height, to_height + 1, '[)')) AS rs
+		  FROM %s.indexer_ranges WHERE handler = $1
+		)
+		SELECT lower(r), upper(r) - 1
+		FROM merged, unnest(rs) AS t(r)
+		ORDER BY 1`, s.schema), handler)
+	if err != nil {
+		return 0, fmt.Errorf("compact select: %w", err)
+	}
+	type mrange struct{ from, to int64 }
+	var want []mrange
 	for rows.Next() {
-		var f, t int64
-		if err := rows.Scan(&f, &t); err != nil {
+		var m mrange
+		if err := rows.Scan(&m.from, &m.to); err != nil {
 			rows.Close()
-			return err
+			return 0, err
 		}
-		if f < newFrom {
-			newFrom = f
-		}
-		if t > newTo {
-			newTo = t
-		}
-		touching = append(touching, f)
+		want = append(want, m)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return 0, err
 	}
-	if len(touching) > 0 {
+
+	// Current row count for this handler (before compaction).
+	var before int
+	if err := tx.QueryRow(ctx,
+		fmt.Sprintf(`SELECT count(*) FROM %s.indexer_ranges WHERE handler = $1`, s.schema),
+		handler).Scan(&before); err != nil {
+		return 0, err
+	}
+	if before <= len(want) {
+		// Nothing to do: already at minimum representation (or writers
+		// raced and added a row we'll pick up next tick).
+		return 0, tx.Commit(ctx)
+	}
+
+	// Replace. DELETE everything we saw for this handler, INSERT the
+	// merged set. We read fresh rows committed between SELECT and DELETE
+	// won't exist in `want` but are also not in the DELETE set — they
+	// survive and get compacted next tick.
+	if _, err := tx.Exec(ctx,
+		fmt.Sprintf(`DELETE FROM %s.indexer_ranges WHERE handler = $1
+		             AND from_height IN (
+		               SELECT from_height FROM %s.indexer_ranges WHERE handler = $1
+		             )`, s.schema, s.schema), handler); err != nil {
+		return 0, fmt.Errorf("compact delete: %w", err)
+	}
+	// Bulk insert merged ranges. ON CONFLICT DO UPDATE in case a writer
+	// raced in a row for the same from_height between our DELETE and
+	// INSERT — keep the larger to_height.
+	for _, m := range want {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(
-			`DELETE FROM %s.indexer_ranges WHERE handler = $1 AND from_height = ANY($2::bigint[])`,
-			s.schema), handler, touching); err != nil {
-			return err
+			`INSERT INTO %s.indexer_ranges (handler, from_height, to_height)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (handler, from_height) DO UPDATE
+			   SET to_height = GREATEST(%s.indexer_ranges.to_height, EXCLUDED.to_height),
+			       updated_at = now()`,
+			s.schema, s.schema), handler, m.from, m.to); err != nil {
+			return 0, fmt.Errorf("compact insert: %w", err)
 		}
 	}
-	_, err = tx.Exec(ctx, fmt.Sprintf(
-		`INSERT INTO %s.indexer_ranges (handler, from_height, to_height) VALUES ($1, $2, $3)`,
-		s.schema), handler, newFrom, newTo)
-	return err
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return before - len(want), nil
 }
 
 // ---------------------------------------------------------------------------

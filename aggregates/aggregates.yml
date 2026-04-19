@@ -9,6 +9,11 @@
 # via SELECT refresh_materialized_view(...).
 
 refresh:
+  # Refresh every 30 min. Previously */5 — too aggressive: on a 400M+
+  # row relay_payments table the refresh itself takes 5-10 min, so a
+  # 5-min schedule piled overlapping refreshes that serialised on the
+  # MV's row-level locks and starved writers. Downstream consumers
+  # read the MV for daily aggregates, so ~30 min freshness is plenty.
   mv_relay_daily:
     sql: "REFRESH MATERIALIZED VIEW CONCURRENTLY app.mv_relay_daily"
-    schedule: "*/5 * * * *"
+    schedule: "*/30 * * * *"

@@ -176,7 +176,13 @@ func defaults() *Config {
 			EndHeight:            0,
 			TipConfirmations:     0, // Cosmos/CometBFT has deterministic finality
 			FetchWorkers:         16,
-			FetchBatchSize:       10,
+			// Bumped from 10 to 50. With the fetch/persist split and the
+			// uncapped per-endpoint routing, roundtrip overhead matters more
+			// than queue depth; 50 heights per JSON-RPC batch cuts per-
+			// request overhead ~5× on the wire. Tendermint batch responses at
+			// this size are still <2 MB, comfortably within any upstream's
+			// buffers.
+			FetchBatchSize:       50,
 			WriteBatchRows:       20000,
 			QueueDepth:           200,
 			TipPollInterval:      3 * time.Second,

@@ -6,11 +6,15 @@ import (
 )
 
 // MetricSample is one timestamped snapshot appended to the per-endpoint
-// history ring. One sample per controller tick; ~3s apart.
+// history ring. One sample per recorder tick; ~3s apart.
+//
+// The Budget field is retained (always 0) for backward compatibility with
+// dashboards that may still reference it — the UI shipped with this
+// change drops it from the rendering, but API consumers that haven't
+// updated keep working.
 type MetricSample struct {
 	At             time.Time `json:"at"`
 	InFlight       int64     `json:"in_flight"`
-	Budget         int       `json:"budget"`           // AIMD-chosen concurrency cap at this moment
 	RequestsPerSec float64   `json:"requests_per_sec"`
 	LatencyP50Ms   float64   `json:"latency_p50_ms"`
 	LatencyP99Ms   float64   `json:"latency_p99_ms"`
@@ -18,16 +22,16 @@ type MetricSample struct {
 }
 
 type metricsHistory struct {
-	mu     sync.Mutex
-	buf    []MetricSample
-	cap    int
+	mu  sync.Mutex
+	buf []MetricSample
+	cap int
 }
 
 func newMetricsHistory(capacity int) *metricsHistory {
 	return &metricsHistory{cap: capacity}
 }
 
-func (h *metricsHistory) add(at time.Time, m EndpointMetrics, budget int) {
+func (h *metricsHistory) add(at time.Time, m EndpointMetrics) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if len(h.buf) >= h.cap {
@@ -37,7 +41,6 @@ func (h *metricsHistory) add(at time.Time, m EndpointMetrics, budget int) {
 	h.buf = append(h.buf, MetricSample{
 		At:             at,
 		InFlight:       m.InFlight,
-		Budget:         budget,
 		RequestsPerSec: m.RequestsPerSec,
 		LatencyP50Ms:   m.LatencyP50Ms,
 		LatencyP99Ms:   m.LatencyP99Ms,

@@ -17,21 +17,16 @@ import (
 // doesn't expose those uniformly. For lava_relay_payment this is fine because
 // the event is emitted from MsgRelayPayment transactions.
 //
+// Shares the process-wide http.Transport (see transport.go) with every RPC
+// and REST client for keep-alive + TLS session cache reuse.
+//
 // If you add handlers that need block-scope events later, switch the endpoint
 // kind back to "rpc".
 func NewREST(baseURL string, headers map[string]string) *RESTClient {
-	transport := &http.Transport{
-		MaxIdleConns:        256,
-		MaxIdleConnsPerHost: 256,
-		IdleConnTimeout:     90 * time.Second,
-	}
 	return &RESTClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		headers: headers,
-		http: &http.Client{
-			Transport: transport,
-			Timeout:   60 * time.Second,
-		},
+		http:    newHTTPClient(60 * time.Second),
 	}
 }
 
