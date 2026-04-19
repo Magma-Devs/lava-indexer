@@ -78,8 +78,15 @@ func main() {
 	//   - shrinks batch ×0.5 on hot signals, grows +1 on calm signals
 	//   - sizes worker cap to min(Σ budgets × 2, CPU × 8, mem / 2 MiB)
 	// Explicit positive values in config bypass the sizer entirely.
+	//
+	// Resolved values are kept in local variables and passed into the
+	// pipeline / pool via constructors — cfg.Indexer is never mutated, so
+	// /api/status and any future "effective config" surface still show
+	// what the operator typed.
 	workersAdaptive := cfg.Indexer.FetchWorkers <= 0
 	batchAdaptive := cfg.Indexer.FetchBatchSize <= 0
+	resolvedBatchMax := cfg.Indexer.FetchBatchSize
+	resolvedWorkers := cfg.Indexer.FetchWorkers
 	var sizer *pipeline.AdaptiveSizer
 	if workersAdaptive || batchAdaptive {
 		// Pick bounds: if the user set a positive batch size, treat it
@@ -91,7 +98,7 @@ func main() {
 		sizer = pipeline.NewAdaptiveSizer(1, batchMax, 256, 10*time.Second, multiClientSignals{client})
 		sizer.Start(ctx)
 		if batchAdaptive {
-			cfg.Indexer.FetchBatchSize = batchMax // floor for the pipeline's config read path
+			resolvedBatchMax = batchMax
 		}
 	}
 	if workersAdaptive {
@@ -110,7 +117,7 @@ func main() {
 			}
 		}
 		slog.Info("adaptive fetch_workers resolved", "workers", workers)
-		cfg.Indexer.FetchWorkers = workers
+		resolvedWorkers = workers
 	}
 
 	// Pool is built AFTER fetch_workers is resolved so newPool can size
@@ -118,7 +125,7 @@ func main() {
 	// With pool_size=8 vs adaptive workers≈100, a stale default starves
 	// every worker past the 8th and silently caps throughput at ~8% of
 	// what the operator configured.
-	pool, err := newPool(ctx, cfg)
+	pool, err := newPool(ctx, cfg, resolvedWorkers)
 	if err != nil {
 		fatal("connect postgres", err)
 	}
@@ -234,7 +241,8 @@ func main() {
 		}
 	}
 
-	pipe := pipeline.New(cfg, pool, client, st, reg)
+	pipe := pipeline.New(cfg, pool, client, st, reg).
+		WithRuntimeKnobs(resolvedWorkers, resolvedBatchMax)
 	if sizer != nil {
 		pipe = pipe.WithSizer(sizer)
 	}
@@ -243,8 +251,8 @@ func main() {
 		"endpoints", len(cfg.Network.Endpoints),
 		"start", cfg.Indexer.StartHeight,
 		"end", cfg.Indexer.EndHeight,
-		"workers", cfg.Indexer.FetchWorkers,
-		"fetch_batch", cfg.Indexer.FetchBatchSize,
+		"workers", resolvedWorkers,
+		"fetch_batch", resolvedBatchMax,
 	)
 
 	// Run the pipeline and web UI side-by-side. Either exiting with an error
@@ -298,7 +306,7 @@ func main() {
 // makes the dashboard unresponsive and aggregate refreshes block.
 const webPoolHeadroom = 4
 
-func newPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
+func newPool(ctx context.Context, cfg *config.Config, resolvedWorkers int) (*pgxpool.Pool, error) {
 	pc, err := pgxpool.ParseConfig(cfg.Database.ConnString())
 	if err != nil {
 		return nil, redactSecret(err, cfg.Database.Password)
@@ -306,13 +314,13 @@ func newPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 	// Derive MaxConns to fit the resolved fetch_workers. Each worker holds
 	// a connection for the full per-batch tx, so anything below
 	// fetch_workers is a hard concurrency ceiling regardless of pool_size.
-	want := cfg.Indexer.FetchWorkers + webPoolHeadroom
+	want := resolvedWorkers + webPoolHeadroom
 	max := cfg.Database.PoolSize
 	if max < want {
 		if max > 0 {
 			slog.Warn("pool_size too small for fetch_workers; growing",
 				"configured_pool_size", max,
-				"fetch_workers", cfg.Indexer.FetchWorkers,
+				"fetch_workers", resolvedWorkers,
 				"resolved_pool_size", want)
 		}
 		max = want
