@@ -478,25 +478,61 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 		return nil
 	})
 
-	// Writers. Progress log moves here — "blocks done" means COMMITTED,
-	// not just fetched. Honest rate reporting for the dashboard.
+	// Writers. Each drains up to writeAggregateMax writeJobs (or waits
+	// writeAggregateWait) before opening a tx, and commits the whole
+	// batch as one — amortising per-tx overhead (BEGIN, advisory no-op,
+	// Heartbeat, COMMIT) across many batches. Progress log records
+	// COMMITTED blocks (honest rate reporting).
 	start := time.Now()
 	var progressBlocks atomic.Int64
+	const (
+		writeAggregateMax  = 32                    // max writeJobs per tx
+		writeAggregateWait = 50 * time.Millisecond // wait for more jobs to arrive before flushing
+	)
 	for i := 0; i < writerCount; i++ {
 		g.Go(func() error {
-			for w := range writeCh {
-				if err := p.persist(ctx, w); err != nil {
-					// persist errors don't bisect — a single block isn't
-					// usually the cause. Record the whole batch as failure
-					// so the dead-letter sweep retries it later; keep the
-					// pipeline moving.
+			for {
+				// Block on first job.
+				w, ok := <-writeCh
+				if !ok {
+					return nil
+				}
+				batch := []writeJob{w}
+				// Drain more without blocking indefinitely — small time
+				// budget lets sparse arrivals through while dense bursts
+				// aggregate.
+				timer := time.NewTimer(writeAggregateWait)
+			drain:
+				for len(batch) < writeAggregateMax {
+					select {
+					case w, ok := <-writeCh:
+						if !ok {
+							// channel closed — flush what we have and exit after
+							timer.Stop()
+							break drain
+						}
+						batch = append(batch, w)
+					case <-timer.C:
+						break drain
+					}
+				}
+				timer.Stop()
+
+				if err := p.persistJobs(ctx, batch); err != nil {
+					// Whole-tx failure → record every job's range as dead-letter.
 					reason := safeFailureReason(err)
 					slog.Error("persist failed; batch recorded as dead-letter",
-						"from", w.from, "to", w.to, "err", reason)
-					p.recordBatchFailure(ctx, w.from, w.to, reason)
+						"count", len(batch), "err", reason)
+					for _, j := range batch {
+						p.recordBatchFailure(ctx, j.from, j.to, reason)
+					}
 					continue
 				}
-				n := w.to - w.from + 1
+				// Success: update progress counters summed across the batch.
+				var n int64
+				for _, j := range batch {
+					n += j.blocksThisBatch
+				}
 				done := progressBlocks.Add(n)
 				total := p.totalBlocks.Add(n)
 				p.rate.Record(total)
@@ -508,12 +544,39 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 						"blocks_done", done,
 						"bps", fmt.Sprintf("%.1f", bps),
 						"rows_total", p.totalRows.Load(),
+						"agg", len(batch),
 					)
 				}
 			}
-			return nil
 		})
 	}
+
+	// Range compactor: with the advisory lock gone, writers INSERT raw
+	// ranges and fragmentation accumulates. A periodic tick collapses
+	// touching ranges per handler via range_agg so indexer_ranges stays
+	// tight and HandlerNeedsRange's bounded-overlap scan stays fast.
+	g.Go(func() error {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+			}
+			for _, h := range p.registry.All() {
+				reduced, err := p.state.CompactRanges(ctx, h.Name())
+				if err != nil {
+					slog.Warn("range compactor failed", "handler", h.Name(), "err", err)
+					continue
+				}
+				if reduced > 0 {
+					slog.Info("range compactor", "handler", h.Name(), "rows_merged", reduced)
+				}
+			}
+		}
+	})
+
 	return g.Wait()
 }
 
@@ -687,34 +750,44 @@ func (p *Pipeline) fetchBatch(ctx context.Context, from, to int64) (writeJob, er
 	}, nil
 }
 
-// persist runs the writer half of the pipeline: one tx per batch,
-// applies each still-needed handler's Persist + RecordRange, plus the
-// run heartbeat. Returns an error when the tx fails; the caller records
-// the whole batch as a dead-letter.
-func (p *Pipeline) persist(ctx context.Context, w writeJob) error {
-	anyNeeds := false
-	for _, v := range w.needs {
-		if v {
-			anyNeeds = true
-			break
-		}
-	}
+// persistJobs runs the writer half of the pipeline for N batches in a
+// single tx. For each job: for each handler that still needs this batch,
+// call Persist (skipped entirely when the dispatched event slice for that
+// handler is empty — the common case for historical-empty blocks) and
+// RecordRange. One Heartbeat sums all jobs. Returns an error when the tx
+// fails; the caller records every job's range as dead-letter.
+//
+// Aggregating N jobs per tx amortises BEGIN / Heartbeat / COMMIT overhead
+// across those jobs. At batch=50 and agg=16 that's 800 blocks per tx —
+// one COMMIT instead of sixteen for the same amount of work.
+func (p *Pipeline) persistJobs(ctx context.Context, jobs []writeJob) error {
 	return pgx.BeginTxFunc(ctx, p.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		if anyNeeds {
+		var totalBlocks, totalRows int64
+		for _, w := range jobs {
 			for _, handler := range p.registry.All() {
 				if !w.needs[handler.Name()] {
 					continue
 				}
-				if err := handler.Persist(ctx, tx, w.dispatched[handler]); err != nil {
-					return fmt.Errorf("%s persist: %w", handler.Name(), err)
+				evs := w.dispatched[handler]
+				// Empty-event optimisation: handler.Persist is a no-op
+				// when there are no events, but iterating + calling it
+				// still costs interface dispatch + tx bookkeeping. Skip
+				// directly to RecordRange so the range still gets marked
+				// covered (next producer pass won't re-fetch).
+				if len(evs) > 0 {
+					if err := handler.Persist(ctx, tx, evs); err != nil {
+						return fmt.Errorf("%s persist: %w", handler.Name(), err)
+					}
 				}
 				if err := p.state.RecordRange(ctx, tx, handler.Name(), w.from, w.to); err != nil {
 					return fmt.Errorf("%s record range: %w", handler.Name(), err)
 				}
 			}
+			totalBlocks += w.blocksThisBatch
+			totalRows += w.rowsThisBatch
 		}
 		if p.runID != 0 {
-			if err := p.state.Heartbeat(ctx, tx, p.runID, w.blocksThisBatch, w.rowsThisBatch); err != nil {
+			if err := p.state.Heartbeat(ctx, tx, p.runID, totalBlocks, totalRows); err != nil {
 				return fmt.Errorf("heartbeat: %w", err)
 			}
 		}

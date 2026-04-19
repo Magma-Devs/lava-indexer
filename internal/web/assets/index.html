@@ -978,19 +978,14 @@
     card.winPct.textContent = pct(h.window_pct) + ' window';
     card.chainPct.textContent = pct(h.chain_pct) + ' chain';
 
-    // "X / Y blocks indexed · ETA" relative to the configured indexing
-    // window. Computed from the ranges array so it matches what the timeline
-    // shows — the API response's window_pct uses the same denominator.
-    // ETA is (remaining / blocks_per_sec) formatted as a human duration.
-    // Shows "—" when bps is zero or we're at tip.
-    const ranges = h.ranges || [];
-    let doneInWindow = 0;
-    for (const r of ranges) {
-      const lo = Math.max(r.from, windowStart);
-      const hi = Math.min(r.to, windowEnd);
-      if (hi >= lo) doneInWindow += (hi - lo + 1);
-    }
+    // "X / Y blocks indexed · ETA" — derive absolute counts from the
+    // server's authoritative window_pct. Client-side sum-of-ranges
+    // double-counts overlapping raw ranges briefly (writers INSERT raw,
+    // async compactor merges), producing bogus >100% until compaction
+    // runs.
     const windowTotal = Math.max(0, windowEnd - windowStart + 1);
+    const winPctFrac = Math.max(0, Math.min(100, h.window_pct || 0)) / 100;
+    const doneInWindow = Math.round(windowTotal * winPctFrac);
     const remaining = Math.max(0, windowTotal - doneInWindow);
     const bps = s.blocks_per_sec || 0;
     let etaText = '—';
