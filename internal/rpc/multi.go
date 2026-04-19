@@ -61,7 +61,6 @@ type Endpoint struct {
 
 	metrics    *metricsTracker
 	ctrl       *AdaptiveController
-	sem        *EndpointSem
 	history    *metricsHistory
 }
 
@@ -122,7 +121,6 @@ func NewMultiWithOptions(eps []*Endpoint, opts MultiClientOptions) *MultiClient 
 		}
 		if e.ctrl == nil {
 			e.ctrl = NewAdaptiveController(opts.InitialConcurrency, opts.MinConcurrency, opts.MaxConcurrency, opts.TargetP99)
-			e.sem = NewEndpointSem(e.ctrl)
 		}
 		if e.history == nil {
 			e.history = newMetricsHistory(opts.HistorySeconds)
@@ -149,7 +147,6 @@ func (m *MultiClient) StartController(ctx context.Context, interval time.Duratio
 				for _, ep := range m.endpoints {
 					mm := ep.Metrics()
 					ep.ctrl.Tick(mm)
-					ep.sem.Resize()
 					ep.history.add(now, mm, ep.ctrl.Budget())
 				}
 			}
