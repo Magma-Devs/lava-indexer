@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -285,7 +288,7 @@ const webPoolHeadroom = 4
 func newPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 	pc, err := pgxpool.ParseConfig(cfg.Database.ConnString())
 	if err != nil {
-		return nil, err
+		return nil, redactSecret(err, cfg.Database.Password)
 	}
 	// Derive MaxConns to fit the resolved fetch_workers. Each worker holds
 	// a connection for the full per-batch tx, so anything below
@@ -324,6 +327,27 @@ func newClient(cfg *config.Config) (*rpc.MultiClient, error) {
 
 func isContextDone(err error) bool {
 	return err == context.Canceled || err == context.DeadlineExceeded
+}
+
+// redactSecret strips a known secret string from an error message before
+// it's logged. pgxpool.ParseConfig errors include the full DSN — and
+// therefore the password — in their messages; once that error reaches
+// slog.Error("connect postgres", "err", err) the password lands in the
+// JSON log stream where shippers (CloudWatch, Loki, Datadog) index it
+// for full-text search forever. Triggered by any malformed DB_PORT or
+// DB_HOST env var, which is a common operational mistake.
+func redactSecret(err error, secret string) error {
+	if err == nil || secret == "" {
+		return err
+	}
+	msg := strings.ReplaceAll(err.Error(), secret, "***")
+	// Also catch percent-encoded variants since ConnString URL-escapes
+	// the password — pgx may report either form depending on the parse
+	// failure mode.
+	if escaped := url.QueryEscape(secret); escaped != secret {
+		msg = strings.ReplaceAll(msg, escaped, "***")
+	}
+	return errors.New(msg)
 }
 
 // pipelineStatsAdapter converts pipeline.Stats to web.Stats to keep the two
