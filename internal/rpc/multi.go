@@ -36,7 +36,30 @@ type Prober interface {
 type MultiClient struct {
 	endpoints []*Endpoint
 	next      atomic.Int32
+
+	// Chain-wide genesis info, resolved once via FetchGenesis. Populated
+	// from the first healthy RPC endpoint's /genesis response. Not every
+	// chain starts at block 1 (e.g. Lava testnet-2 starts at 340,778 due
+	// to a net reset), so the dashboard / window-pct math MUST use this
+	// rather than hardcoding 1. Zero until FetchGenesis succeeds.
+	genesisHeight int64
+	genesisTime   time.Time
 }
+
+// Genesis returns the chain's initial block height as reported by /genesis.
+// Returns 1 as a safe default when FetchGenesis hasn't run / failed — the
+// conservative assumption for the (common) case of chains that do start
+// at 1.
+func (m *MultiClient) Genesis() int64 {
+	if m.genesisHeight <= 0 {
+		return 1
+	}
+	return m.genesisHeight
+}
+
+// GenesisTime returns the chain's genesis timestamp as reported by /genesis.
+// Zero value when unresolved.
+func (m *MultiClient) GenesisTime() time.Time { return m.genesisTime }
 
 // Endpoint is one entry in the MultiClient's pool.
 type Endpoint struct {
@@ -212,6 +235,41 @@ func (m *MultiClient) Probe(ctx context.Context, expectedChainID string) error {
 		return fmt.Errorf("no healthy endpoints")
 	}
 	return nil
+}
+
+// FetchGenesis resolves the chain's genesis (initial_height + genesis_time)
+// from the first healthy RPC endpoint. Subsequent access goes via
+// Genesis() / GenesisTime().
+//
+// Idempotent: does nothing once resolved. REST-only clients can't answer
+// /genesis, so if every healthy endpoint is REST we log a warning and
+// leave the genesis at the "assume 1" default — acceptable for chains
+// that actually start at 1, wrong-but-not-catastrophic otherwise.
+func (m *MultiClient) FetchGenesis(ctx context.Context) {
+	if m.genesisHeight > 0 {
+		return
+	}
+	for _, ep := range m.healthy() {
+		rc, ok := ep.Client.(*RPCClient)
+		if !ok {
+			continue
+		}
+		info, err := rc.Genesis(ctx)
+		if err != nil {
+			slog.Warn("genesis fetch failed, trying next endpoint",
+				"url", ep.URL, "err", err)
+			continue
+		}
+		m.genesisHeight = info.InitialHeight
+		m.genesisTime = info.GenesisTime
+		slog.Info("chain genesis resolved",
+			"url", ep.URL,
+			"initial_height", info.InitialHeight,
+			"genesis_time", info.GenesisTime,
+			"chain_id", info.ChainID)
+		return
+	}
+	slog.Warn("no RPC endpoint could answer /genesis; chain_genesis falls back to 1")
 }
 
 // Endpoints returns a copy of the endpoint list for inspection / reporting.
