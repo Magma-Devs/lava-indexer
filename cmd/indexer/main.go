@@ -67,6 +67,10 @@ func main() {
 	if err := client.Probe(ctx, cfg.Network.ChainID); err != nil {
 		fatal("probe endpoints", err)
 	}
+	// Resolve chain genesis once (initial_height + genesis_time) for the
+	// dashboard's coverage percent and timeline axis. Non-fatal on failure;
+	// MultiClient.Genesis() falls back to 1.
+	client.FetchGenesis(ctx)
 
 	// Start the metrics recorder so the per-endpoint history ring gets
 	// populated every 3s for the web UI's sparklines.

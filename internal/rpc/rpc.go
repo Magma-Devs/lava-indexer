@@ -313,6 +313,65 @@ func (c *RPCClient) Probe(ctx context.Context) (StatusInfo, error) {
 	return info, nil
 }
 
+// GenesisInfo is what Genesis returns: the chain's initial_height +
+// genesis_time, parsed out of the node's /genesis response. Used to
+// correctly render chain coverage on the dashboard — not every chain
+// starts at block 1 (e.g. Lava testnet-2 starts at 340,778 because of
+// a net reset, not a fork at height 0).
+type GenesisInfo struct {
+	InitialHeight int64
+	GenesisTime   time.Time
+	ChainID       string
+}
+
+// Genesis fetches the chain's genesis document via the RPC /genesis
+// endpoint and extracts initial_height + genesis_time. The full
+// response can be several MB on mainnet chains; we stream-decode via
+// json.Decoder and cap the body read at 64 MiB as a safety valve —
+// anything larger likely indicates a mis-pointed upstream rather than
+// a legitimate genesis.
+func (c *RPCClient) Genesis(ctx context.Context) (GenesisInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/genesis", nil)
+	if err != nil {
+		return GenesisInfo{}, err
+	}
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return GenesisInfo{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return GenesisInfo{}, fmt.Errorf("genesis: http %d", resp.StatusCode)
+	}
+	const maxGenesis = 64 << 20 // 64 MiB
+	lr := io.LimitReader(resp.Body, maxGenesis)
+	var parsed struct {
+		Result struct {
+			Genesis struct {
+				GenesisTime   time.Time `json:"genesis_time"`
+				ChainID       string    `json:"chain_id"`
+				InitialHeight string    `json:"initial_height"`
+			} `json:"genesis"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(lr).Decode(&parsed); err != nil {
+		return GenesisInfo{}, fmt.Errorf("genesis decode: %w", err)
+	}
+	h, _ := strconv.ParseInt(parsed.Result.Genesis.InitialHeight, 10, 64)
+	if h <= 0 {
+		return GenesisInfo{}, fmt.Errorf("genesis: initial_height missing or zero")
+	}
+	return GenesisInfo{
+		InitialHeight: h,
+		GenesisTime:   parsed.Result.Genesis.GenesisTime,
+		ChainID:       parsed.Result.Genesis.ChainID,
+	}, nil
+}
+
 // ---------------------------------------------------------------------------
 // Batched block + block_results
 // ---------------------------------------------------------------------------
