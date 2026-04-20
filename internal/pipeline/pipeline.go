@@ -114,12 +114,25 @@ func (p *Pipeline) Stats() Stats {
 // main.go can call state.EndRun on shutdown.
 func (p *Pipeline) RunID() int64 { return p.runID }
 
+// errBoundedComplete is returned by the producer goroutine when
+// cfg.EndHeight > 0 and all requested gaps are emitted. It cancels the
+// errgroup's context so sweep + compactor exit, after which Run()
+// translates it back to nil.
+var errBoundedComplete = errors.New("bounded window complete")
+
 // Run executes the pipeline until the requested window is complete (when
 // end_height > 0) or the context is cancelled (when end_height == 0,
 // i.e. tip-following mode).
+//
+// All long-running goroutines (producer, fetchers, writers, dead-letter
+// sweep, range compactor) share a single errgroup for the whole process
+// lifetime. Earlier iterations spawned sweep + compactor fresh on every
+// runWindow call and expected indexGaps to return between tip polls —
+// but the sweep and compactor are designed as perpetual loops that only
+// exit on ctx cancellation, so g.Wait() never returned and the tip
+// follower never ran past the initial backfill. Running everything as
+// one unified errgroup fixes that.
 func (p *Pipeline) Run(ctx context.Context) error {
-	cfg := p.cfg.Indexer
-
 	// Open a fresh run row — atomic counters get written into it by every
 	// batch commit, giving us persistent "blocks indexed this run" that
 	// survives across restarts.
@@ -131,58 +144,19 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	p.runStart = time.Now()
 	slog.Info("run started", "run_id", runID)
 
-	// Initial tip — also defines the effective end when end_height == 0.
-	tip, err := p.client.Tip(ctx)
-	if err != nil {
+	// Initial tip probe — validates the MultiClient is actually usable.
+	if _, err := p.client.Tip(ctx); err != nil {
 		return fmt.Errorf("initial tip: %w", err)
 	}
-	end := cfg.EndHeight
-	effectiveEnd := end
-	if end == 0 {
-		effectiveEnd = tip - cfg.TipConfirmations
-	}
-	if effectiveEnd < cfg.StartHeight {
-		slog.Info("nothing to do yet", "start", cfg.StartHeight, "tip", tip, "confirmations", cfg.TipConfirmations)
-	}
 
-	// Seed: backfill any gaps in [start, effectiveEnd].
-	if effectiveEnd >= cfg.StartHeight {
-		if err := p.runWindow(ctx, cfg.StartHeight, effectiveEnd); err != nil {
-			return err
-		}
-	}
-
-	// Done if the user asked for a bounded window.
-	if end > 0 {
-		slog.Info("bounded window complete", "blocks_indexed", p.totalBlocks.Load(), "rows_written", p.totalRows.Load())
+	err = p.indexForever(ctx)
+	if errors.Is(err, errBoundedComplete) {
+		slog.Info("bounded window complete",
+			"blocks_indexed", p.totalBlocks.Load(),
+			"rows_written", p.totalRows.Load())
 		return nil
 	}
-
-	// Tip-following loop: poll until cancelled.
-	slog.Info("switching to tip-follower", "poll_interval", cfg.TipPollInterval)
-	t := time.NewTicker(cfg.TipPollInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.C:
-			newTip, err := p.client.Tip(ctx)
-			if err != nil {
-				slog.Warn("tip poll failed", "err", err)
-				continue
-			}
-			target := newTip - cfg.TipConfirmations
-			if target < cfg.StartHeight {
-				continue
-			}
-			// Drop down to the highest covered height+1 as the new start of
-			// the gap search, or cfg.StartHeight if no coverage yet.
-			if err := p.runWindow(ctx, cfg.StartHeight, target); err != nil {
-				return err
-			}
-		}
-	}
+	return err
 }
 
 // runWindow fetches and writes only the heights in [start, end] NOT covered
@@ -196,37 +170,24 @@ func (p *Pipeline) Run(ctx context.Context) error {
 // B. Also naturally balances load across endpoints when different gaps
 // have different eligibility (e.g. old heights = archive only, recent =
 // both).
-func (p *Pipeline) runWindow(ctx context.Context, start, end int64) error {
+// computeGaps polls state for the current gap list across all handlers
+// in [start, end], then slices them at each endpoint's Earliest coverage
+// horizon so pruning endpoints can serve upper tiers in parallel with
+// archive endpoints walking the historical tail. Called every
+// TipPollInterval from the producer inside indexForever.
+func (p *Pipeline) computeGaps(ctx context.Context, start, end int64) ([]state.Range, error) {
 	names := make([]string, 0, len(p.registry.All()))
 	for _, h := range p.registry.All() {
 		names = append(names, h.Name())
 	}
 	gaps, err := p.state.UnionGaps(ctx, names, start, end)
 	if err != nil {
-		return fmt.Errorf("compute gaps: %w", err)
+		return nil, fmt.Errorf("compute gaps: %w", err)
 	}
-	if len(gaps) == 0 {
-		slog.Info("window fully covered by prior runs, nothing to fetch", "start", start, "end", end)
-		return nil
-	}
-	// Slice any gap that crosses an endpoint's Earliest horizon into
-	// sub-gaps — otherwise the producer walks a single giant gap bottom-up
-	// and the tier's only eligible endpoint (usually the archive) does all
-	// the work while pruning endpoints sit idle until the cursor crosses
-	// their horizon. Splitting lets indexGaps' interleave producer dispatch
-	// across tiers in parallel from block zero of the backfill.
 	if multi, ok := p.client.(*rpc.MultiClient); ok {
 		gaps = splitByEndpointCoverage(gaps, multi.Endpoints())
 	}
-	total := int64(0)
-	for _, g := range gaps {
-		total += g.To - g.From + 1
-	}
-	slog.Info("indexing window",
-		"start", start, "end", end,
-		"gap_blocks", total, "gap_count", len(gaps))
-
-	return p.indexGaps(ctx, gaps)
+	return gaps, nil
 }
 
 // splitByEndpointCoverage slices every gap at each endpoint's Earliest
@@ -266,27 +227,37 @@ func splitByEndpointCoverage(gaps []state.Range, eps []*rpc.Endpoint) []state.Ra
 	return out
 }
 
-// indexGaps fans out fetch+persist work over two decoupled worker pools:
+// indexForever is the unified pipeline loop: one errgroup running the
+// tip-polling producer, fetcher + writer pools, the dead-letter sweep,
+// and the range compactor for the entire process lifetime. All exit
+// on ctx cancellation.
 //
-//   - FETCH pool (N = p.workers): pulls jobs off the producer channel, calls
-//     MultiClient.FetchBlocks, parses events, bisects on fetch errors. On
-//     success it hands the parsed batch to the writer pool via writeCh and
-//     moves on — no DB work is held by a fetcher.
-//   - WRITE pool (M = writerCount, bounded by pg pool): pulls writeJobs off
-//     writeCh, opens a single tx per batch, persists each handler's events,
-//     merges indexer_ranges, heartbeats run stats, commits.
+// Workers:
 //
-// Why the split: previously each worker fetched AND persisted in one go,
-// so a slow persist blocked the fetch it was paired with. Under heavy
-// write load, fetchers sat idle behind COPYs. Splitting lets fetch run
-// at the upstream ceiling while write runs at the DB ceiling — whichever
-// is slower becomes the bottleneck, and neither one gates the other.
+//   - PRODUCER (1 goroutine): every TipPollInterval polls tip, recomputes
+//     gaps via state.UnionGaps + splitByEndpointCoverage, then emits
+//     batches tip-first (with interleave). When current gaps drain it
+//     loops back to poll tip again. Bounded runs (cfg.EndHeight > 0)
+//     exit via errBoundedComplete once fully covered.
+//   - FETCH pool (N = p.workers): pulls jobs off the producer channel,
+//     calls MultiClient.FetchBlocks, parses events, bisects on fetch
+//     errors. Hands the parsed batch to the writer pool via writeCh.
+//   - WRITE pool (M = writerCount, bounded by pg pool): aggregates up
+//     to 32 writeJobs per tx, persists each handler's events, merges
+//     indexer_ranges, heartbeats run stats, commits.
+//   - DEAD-LETTER SWEEP (1 goroutine, optional): pops newest-first
+//     failures on a 60s ticker, re-runs them through processWithSplit.
+//   - RANGE COMPACTOR (1 goroutine): every 30s runs range_agg to
+//     collapse the lock-free RecordRange's raw rows into the minimum
+//     representation.
 //
-// Bisect policy: stays in the fetcher (unchanged). Persist errors are NOT
-// bisected — they're recorded as failures for the dead-letter sweep,
-// because persist errors are rarely "this specific block is poison" (FKs
-// are dict races, pool exhaustion is a pool problem, etc.).
-func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
+// Earlier iterations split this across runWindow calls from Run's
+// tip-follower loop, but the sweep and compactor are perpetual loops
+// that never exit until ctx cancellation. g.Wait() inside the old
+// indexGaps never returned, so Run's tip-follower never ran past the
+// initial backfill (system went idle once caught up). Collapsing the
+// whole thing into one long-lived errgroup fixes that.
+func (p *Pipeline) indexForever(ctx context.Context) error {
 	cfg := p.cfg.Indexer
 	batchOf := func() int64 {
 		// Static batch size wins. The sizer may still exist (because the
@@ -324,6 +295,11 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 
 	g, ctx := errgroup.WithContext(ctx)
 
+	// currentGapCount exposes the producer's last-computed gap count to
+	// the writer's progress log. Not a hot-path counter; updated once per
+	// tip-poll cycle.
+	var currentGapCount atomic.Int64
+
 	// Single producer, tip-first with interleave: most batches go to the
 	// gap with the HIGHEST cursor (closest to tip), but every Nth batch
 	// goes to the LOWEST-cursor gap instead, so a big historical gap
@@ -338,52 +314,132 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 	//
 	// BackfillInterleave: 0 or 1 → pure tip-first. Default 5 → ~80/20.
 	// Within a single gap the walk is still bottom-up From → To.
+	//
+	// Tip-polling loop: after draining the current gap set (or failing to
+	// find any), the producer sleeps TipPollInterval and recomputes gaps
+	// against a fresh tip. Bounded runs (cfg.EndHeight > 0) return
+	// errBoundedComplete once all gaps are emitted; the errgroup cancels
+	// and the perpetual sweep + compactor goroutines exit.
 	g.Go(func() error {
 		defer close(jobs)
-		cursors := make([]int64, len(gaps))
-		for i := range gaps {
-			cursors[i] = gaps[i].From
-		}
 		interleave := cfg.BackfillInterleave
+		tickInterval := cfg.TipPollInterval
+		if tickInterval <= 0 {
+			tickInterval = 3 * time.Second
+		}
 		batchIdx := 0
-		for {
-			// Every `interleave`-th batch, pick the LOWEST-cursor gap
-			// (oldest work) instead of the highest.
-			pickLowest := interleave > 1 && (batchIdx%interleave) == interleave-1
-			best := -1
-			for i := range gaps {
-				if cursors[i] > gaps[i].To {
-					continue
-				}
-				if best < 0 {
-					best = i
-					continue
-				}
-				if pickLowest {
-					if cursors[i] < cursors[best] {
-						best = i
-					}
-				} else {
-					if cursors[i] > cursors[best] {
-						best = i
-					}
-				}
-			}
-			if best < 0 {
-				return nil
-			}
-			b := batchOf()
-			to := cursors[best] + b - 1
-			if to > gaps[best].To {
-				to = gaps[best].To
-			}
+		sleep := func() bool {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
-			case jobs <- job{from: cursors[best], to: to}:
+				return false
+			case <-time.After(tickInterval):
+				return true
 			}
-			cursors[best] = to + 1
-			batchIdx++
+		}
+		for {
+			if ctx.Err() != nil {
+				return nil
+			}
+			// Resolve target height. Bounded runs use cfg.EndHeight
+			// directly; tip-following polls the client each cycle.
+			var target int64
+			if cfg.EndHeight > 0 {
+				target = cfg.EndHeight
+			} else {
+				tip, err := p.client.Tip(ctx)
+				if err != nil {
+					if ctx.Err() != nil {
+						return nil
+					}
+					slog.Warn("tip poll failed; will retry", "err", err)
+					if !sleep() {
+						return nil
+					}
+					continue
+				}
+				target = tip
+			}
+			start := cfg.StartHeight
+			if start < 1 {
+				start = 1
+			}
+			if target < start {
+				if !sleep() {
+					return nil
+				}
+				continue
+			}
+			gaps, err := p.computeGaps(ctx, start, target)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				slog.Warn("compute gaps failed; will retry", "err", err)
+				if !sleep() {
+					return nil
+				}
+				continue
+			}
+			currentGapCount.Store(int64(len(gaps)))
+			if len(gaps) == 0 {
+				if cfg.EndHeight > 0 {
+					return errBoundedComplete
+				}
+				if !sleep() {
+					return nil
+				}
+				continue
+			}
+			cursors := make([]int64, len(gaps))
+			for i := range gaps {
+				cursors[i] = gaps[i].From
+			}
+			for {
+				if ctx.Err() != nil {
+					return nil
+				}
+				// Every `interleave`-th batch, pick the LOWEST-cursor
+				// gap (oldest work) instead of the highest.
+				pickLowest := interleave > 1 && (batchIdx%interleave) == interleave-1
+				best := -1
+				for i := range gaps {
+					if cursors[i] > gaps[i].To {
+						continue
+					}
+					if best < 0 {
+						best = i
+						continue
+					}
+					if pickLowest {
+						if cursors[i] < cursors[best] {
+							best = i
+						}
+					} else {
+						if cursors[i] > cursors[best] {
+							best = i
+						}
+					}
+				}
+				if best < 0 {
+					// Current gap set drained; re-poll tip.
+					break
+				}
+				b := batchOf()
+				to := cursors[best] + b - 1
+				if to > gaps[best].To {
+					to = gaps[best].To
+				}
+				select {
+				case <-ctx.Done():
+					return nil
+				case jobs <- job{from: cursors[best], to: to}:
+				}
+				cursors[best] = to + 1
+				batchIdx++
+			}
+			if !sleep() {
+				return nil
+			}
 		}
 	})
 
@@ -540,7 +596,7 @@ func (p *Pipeline) indexGaps(ctx context.Context, gaps []state.Range) error {
 					elapsed := time.Since(start).Seconds()
 					bps := float64(done) / elapsed
 					slog.Info("progress",
-						"gaps", len(gaps),
+						"gaps", currentGapCount.Load(),
 						"blocks_done", done,
 						"bps", fmt.Sprintf("%.1f", bps),
 						"rows_total", p.totalRows.Load(),
