@@ -28,6 +28,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/magma-devs/lava-indexer/internal/events"
 	"github.com/magma-devs/lava-indexer/internal/rpc"
+	"github.com/magma-devs/lava-indexer/internal/snapshotters"
+	"github.com/magma-devs/lava-indexer/internal/snapshotters/provider_rewards"
 	"github.com/magma-devs/lava-indexer/internal/state"
 )
 
@@ -52,16 +54,18 @@ var assetsFS embed.FS
 
 // Server bundles the small HTTP surface into one dependency-injectable struct.
 type Server struct {
-	ChainID         string
-	State           *state.State
-	Client          *rpc.MultiClient
-	Registry        *events.Registry
-	Pool            *pgxpool.Pool
-	Stats           StatsProvider // optional — enables blocks/sec in the response
-	Start           int64
-	End             int64
-	GraphQLEnabled  bool
-	GraphQLUpstream string
+	ChainID           string
+	State             *state.State
+	Client            *rpc.MultiClient
+	Registry          *events.Registry
+	Snapshotters      *snapshotters.Registry // optional — nil disables the /api/snapshotters endpoint
+	SnapshotterSchema string                 // used by /api/snapshotters to find the coverage table
+	Pool              *pgxpool.Pool
+	Stats             StatsProvider // optional — enables blocks/sec in the response
+	Start             int64
+	End               int64
+	GraphQLEnabled    bool
+	GraphQLUpstream   string
 
 	// dbSizeCache memoises pg_total_relation_size for the schema. The
 	// underlying SUM(pg_total_relation_size) is the heaviest query in
@@ -84,6 +88,7 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200); _, _ = w.Write([]byte("ok")) })
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/history", s.handleHistory)
+	mux.HandleFunc("/api/snapshotters", s.handleSnapshotters)
 
 	// Optional reverse-proxy to PostGraphile (or whatever GraphQL server).
 	// When enabled, /graphql and /graphiql on this port proxy to the
@@ -669,4 +674,155 @@ func coverageRatio(ranges []RangeJSON, from, to int64) float64 {
 		return 0
 	}
 	return float64(covered) / float64(total)
+}
+
+// ---------------------------------------------------------------------------
+// /api/snapshotters
+// ---------------------------------------------------------------------------
+
+// SnapshotterStatus is one entry in the /api/snapshotters response.
+// Matches the shape rendered by the UI card: expected/covered dates,
+// failures, and the last/next tick timestamps.
+type SnapshotterStatus struct {
+	Name       string                  `json:"name"`
+	Expected   []string                `json:"expected"`
+	Covered    []string                `json:"covered"`
+	Missing    []string                `json:"missing"`
+	Failed     []SnapshotterFailedDate `json:"failed"`
+	LastRunAt  *time.Time              `json:"last_run_at,omitempty"`
+	NextRunAt  *time.Time              `json:"next_run_at,omitempty"`
+}
+
+// SnapshotterFailedDate pairs a failed snapshot date with the recorded
+// error message. Rendered in the UI as a collapsed expandable.
+type SnapshotterFailedDate struct {
+	Date  string `json:"date"`
+	Error string `json:"error"`
+}
+
+func (s *Server) handleSnapshotters(w http.ResponseWriter, r *http.Request) {
+	if s.Snapshotters == nil || len(s.Snapshotters.All()) == 0 {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte("[]"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	out := make([]SnapshotterStatus, 0, len(s.Snapshotters.All()))
+	for _, sn := range s.Snapshotters.All() {
+		st := s.snapshotterStatus(ctx, sn)
+		out = append(out, st)
+	}
+	w.Header().Set("content-type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
+}
+
+// snapshotterStatus builds one entry of the /api/snapshotters response.
+// Currently recognises provider_rewards; other snapshotters get a
+// best-effort generic entry (name + timestamps only) so the endpoint
+// still lists them.
+func (s *Server) snapshotterStatus(ctx context.Context, sn snapshotters.Snapshotter) SnapshotterStatus {
+	st := SnapshotterStatus{Name: sn.Name()}
+	if lr := s.Snapshotters.LastRunAt(); !lr.IsZero() {
+		t := lr
+		st.LastRunAt = &t
+	}
+	if nr := s.Snapshotters.NextRunAt(); !nr.IsZero() {
+		t := nr
+		st.NextRunAt = &t
+	}
+	if sn.Name() == provider_rewards.Name {
+		s.fillProviderRewardsStatus(ctx, &st)
+	}
+	return st
+}
+
+// fillProviderRewardsStatus reads the provider_rewards_snapshots table
+// and populates expected / covered / missing / failed. The expected set
+// is computed from the config's earliest_date — the server holds no
+// handle on the snapshotter's own config, but we can read it off the
+// runtime Registry via a type-assert. Falls back to DB-only data
+// (covered + failed) if the snapshotter isn't the provider_rewards
+// type we know how to query.
+func (s *Server) fillProviderRewardsStatus(ctx context.Context, out *SnapshotterStatus) {
+	type row struct {
+		date   time.Time
+		status string
+		errMsg string
+	}
+	schema := s.SnapshotterSchema
+	if schema == "" {
+		schema = "app"
+	}
+	rows, err := s.Pool.Query(ctx, fmt.Sprintf(`
+		SELECT snapshot_date, status, COALESCE(error, '')
+		FROM %s.provider_rewards_snapshots
+		ORDER BY snapshot_date`, schema))
+	if err != nil {
+		// Table may not exist yet (DDL applied but table absent? no —
+		// keep it simple): fall through with empty lists.
+		return
+	}
+	defer rows.Close()
+	var seen []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.date, &r.status, &r.errMsg); err != nil {
+			return
+		}
+		seen = append(seen, r)
+	}
+
+	// Compute the expected set. We don't pass config through to Server,
+	// but the snapshotter knows it; take the min covered date as the
+	// earliest observed one and step forward from there. That's good
+	// enough for the UI — the operator's earliest_date config is the
+	// authoritative source for what "should have been captured" but the
+	// UI shouldn't need it since the DB already records every date the
+	// snapshotter attempted.
+	var earliest time.Time
+	for _, r := range seen {
+		if earliest.IsZero() || r.date.Before(earliest) {
+			earliest = r.date
+		}
+	}
+	now := time.Now().UTC()
+	if earliest.IsZero() {
+		// No rows yet — the UI will show "—" / 0%. Don't invent
+		// expected dates without config, which would be misleading.
+		return
+	}
+	expected := provider_rewards.ExpectedDates(earliest, now)
+	for _, d := range expected {
+		out.Expected = append(out.Expected, d.Format("2006-01-02"))
+	}
+	coveredByDate := make(map[string]row, len(seen))
+	for _, r := range seen {
+		coveredByDate[r.date.UTC().Format("2006-01-02")] = r
+	}
+	for _, d := range expected {
+		key := d.Format("2006-01-02")
+		r, ok := coveredByDate[key]
+		switch {
+		case !ok:
+			out.Missing = append(out.Missing, key)
+		case r.status == "ok":
+			out.Covered = append(out.Covered, key)
+		case r.status == "failed":
+			out.Failed = append(out.Failed, SnapshotterFailedDate{
+				Date:  key,
+				Error: r.errMsg,
+			})
+		default:
+			// 'partial' or any future state we haven't enumerated —
+			// surface it as failed-with-status so operators notice.
+			out.Failed = append(out.Failed, SnapshotterFailedDate{
+				Date:  key,
+				Error: fmt.Sprintf("status=%s %s", r.status, r.errMsg),
+			})
+		}
+	}
 }

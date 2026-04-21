@@ -193,6 +193,51 @@
     color: var(--danger); border-color: #3b0d0d;
   }
 
+  /* Snapshotter card: lives under "Snapshotters" section, reuses the
+     .handler card look-and-feel but renders a timeline-strip of dots
+     (one per expected snapshot date) instead of a block-height bar.
+     Dot colours:
+       covered  → green
+       failed   → red
+       missing  → muted grey (retry on next tick)
+       future   → dark grey (not due yet — never rendered client-side
+                   because the API already filters by now())
+  */
+  .snapshotter {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; margin-bottom: 12px;
+  }
+  .snap-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .snap-name { font-size: 14px; font-weight: 600; }
+  .snap-pct  { margin-left: auto; font-variant-numeric: tabular-nums; font-size: 13px; text-align: right; }
+  .snap-pct .win    { color: var(--accent); font-weight: 600; }
+  .snap-pct .counts { color: var(--muted); font-size: 11px; }
+
+  .snap-timeline { display: flex; gap: 3px; flex-wrap: wrap; margin-top: 12px; }
+  .snap-dot {
+    width: 14px; height: 14px; border-radius: 50%; flex: 0 0 auto;
+    border: 1px solid rgba(255,255,255,0.08);
+    cursor: default;
+  }
+  .snap-dot.covered { background: #22c55e; }
+  .snap-dot.failed  { background: var(--danger); }
+  .snap-dot.missing { background: var(--track); }
+  .snap-dot.inprogress { background: var(--warn); }
+
+  .snap-meta { color: var(--muted); font-size: 11px; margin-top: 10px; }
+  .snap-meta b { color: var(--fg); font-weight: 600; }
+  .snap-errors { margin-top: 8px; }
+  .snap-errors summary {
+    cursor: pointer; color: var(--danger); font-size: 11px;
+  }
+  .snap-errors .err-list { margin-top: 6px; display: grid; gap: 4px; }
+  .snap-errors .err {
+    background: var(--panel-2); border: 1px solid rgba(239, 68, 68, 0.35);
+    border-radius: 4px; padding: 6px 8px;
+    font-size: 11px; word-break: break-all; overflow-wrap: anywhere;
+  }
+  .snap-errors .err b { color: var(--danger); }
+
   footer { padding: 18px 24px; color: var(--muted); font-size: 11px; border-top: 1px solid var(--border); margin-top: 40px; text-align: center; }
 
   nav.tabs {
@@ -406,6 +451,10 @@
     <section class="handlers">
       <h2>Handlers</h2>
       <div id="handlers"></div>
+    </section>
+    <section class="handlers" id="snapshotters-section" style="display:none">
+      <h2>Snapshotters</h2>
+      <div id="snapshotters"></div>
     </section>
   </div>
 
@@ -1242,6 +1291,123 @@
     document.getElementById('updated').textContent = 'updated ' + new Date(s.generated_at).toLocaleTimeString();
   }
 
+  // Snapshotters: keyed DOM cache (name → refs) so we update text in
+  // place across polls instead of re-rendering the whole section.
+  const snapshotterCards = new Map();
+
+  async function refreshSnapshotters() {
+    const section = document.getElementById('snapshotters-section');
+    let data;
+    try {
+      const r = await fetch('/api/snapshotters');
+      if (!r.ok) throw new Error(r.status);
+      data = await r.json();
+    } catch (_) {
+      // Endpoint failed — hide the section (may have been momentarily
+      // down on a poll). Server shouldn't ever 5xx here, but a container
+      // restart could blip.
+      section.style.display = 'none';
+      return;
+    }
+    if (!Array.isArray(data) || data.length === 0) {
+      section.style.display = 'none';
+      return;
+    }
+    section.style.display = '';
+
+    const container = document.getElementById('snapshotters');
+    // Drop cards for snapshotters that no longer exist.
+    for (const [name, ref] of snapshotterCards) {
+      if (!data.find(s => s.name === name)) {
+        ref.root.remove();
+        snapshotterCards.delete(name);
+      }
+    }
+    for (const s of data) {
+      let card = snapshotterCards.get(s.name);
+      if (!card) {
+        card = buildSnapshotterCard(s);
+        container.appendChild(card.root);
+        snapshotterCards.set(s.name, card);
+      }
+      updateSnapshotterCard(card, s);
+    }
+  }
+
+  function buildSnapshotterCard(s) {
+    const name = el('div', { class: 'snap-name' }, s.name);
+    const winPct = el('div', { class: 'win' });
+    const counts = el('div', { class: 'counts' });
+    const pctNode = el('div', { class: 'snap-pct' }, winPct, counts);
+    const head = el('div', { class: 'snap-head' }, name, pctNode);
+
+    const timeline = el('div', { class: 'snap-timeline' });
+    const meta = el('div', { class: 'snap-meta' });
+    const errorsDetail = el('details', { class: 'snap-errors', style: { display: 'none' } });
+    const errorsSummary = el('summary', {}, '');
+    const errorsList = el('div', { class: 'err-list' });
+    errorsDetail.appendChild(errorsSummary);
+    errorsDetail.appendChild(errorsList);
+
+    const root = el('div', { class: 'snapshotter' }, head, timeline, meta, errorsDetail);
+    return { root, name, winPct, counts, timeline, meta, errorsDetail, errorsSummary, errorsList };
+  }
+
+  function updateSnapshotterCard(card, s) {
+    const expected = s.expected || [];
+    const covered = new Set(s.covered || []);
+    const failed = s.failed || [];
+    const failedDates = new Set(failed.map(f => f.date));
+
+    // Timeline dots: one per expected date, classified by status.
+    card.timeline.innerHTML = '';
+    for (const d of expected) {
+      let cls = 'snap-dot';
+      if (covered.has(d)) cls += ' covered';
+      else if (failedDates.has(d)) cls += ' failed';
+      else cls += ' missing';
+      const dot = el('span', { class: cls, title: d });
+      dot.addEventListener('mousemove', (e) => {
+        const status = covered.has(d) ? 'covered'
+                     : failedDates.has(d) ? 'failed'
+                     : 'missing';
+        showTooltip(e, `<b>${d}</b><br><span style="color:#6b7a99">${status}</span>`);
+      });
+      dot.addEventListener('mouseleave', hideTooltip);
+      card.timeline.appendChild(dot);
+    }
+
+    const total = expected.length;
+    const coveredN = covered.size;
+    const ratio = total > 0 ? coveredN / total : 0;
+    card.winPct.textContent = total > 0 ? pct(ratio * 100) + ' covered' : '—';
+    card.counts.textContent = total > 0
+      ? `${fmt(coveredN)} / ${fmt(total)} snapshots`
+      : 'no snapshots yet';
+
+    const parts = [];
+    if (s.last_run_at) parts.push(`last run <b>${fmtDateTime(s.last_run_at)}</b>`);
+    if (s.next_run_at) parts.push(`next run <b>${fmtDateTime(s.next_run_at)}</b>`);
+    card.meta.innerHTML = parts.join(' · ');
+    card.meta.style.display = parts.length ? '' : 'none';
+
+    if (failed.length > 0) {
+      card.errorsDetail.style.display = '';
+      card.errorsSummary.textContent = `${fmt(failed.length)} failed snapshot${failed.length === 1 ? '' : 's'} — view errors`;
+      card.errorsList.innerHTML = '';
+      for (const f of failed) {
+        const row = el('div', { class: 'err' },
+          el('b', {}, f.date + ':'),
+          ' ',
+          document.createTextNode(f.error || '(no error message)')
+        );
+        card.errorsList.appendChild(row);
+      }
+    } else {
+      card.errorsDetail.style.display = 'none';
+    }
+  }
+
   let currentView = 'overview';
   document.querySelectorAll('#tabs button').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -1273,6 +1439,10 @@
     } catch (err) {
       console.error(err);
     }
+    // Snapshotters live on a separate endpoint so their payload cost
+    // doesn't regress the main /api/status latency when the snapshots
+    // table is large. Fetched alongside but independently.
+    refreshSnapshotters().catch(err => console.error('snapshotters', err));
   }
   refresh();
   setInterval(refresh, 3000);

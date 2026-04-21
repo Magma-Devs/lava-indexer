@@ -12,13 +12,60 @@ import (
 )
 
 type Config struct {
-	Network       Network  `yaml:"network"`
-	Indexer       Indexer  `yaml:"indexer"`
-	Database      Database `yaml:"database"`
-	Web           Web      `yaml:"web"`
-	Log           Log      `yaml:"log"`
-	GraphQL       GraphQL  `yaml:"graphql"`
-	AggregatesDir string   `yaml:"aggregates_dir"`
+	Network       Network      `yaml:"network"`
+	Indexer       Indexer      `yaml:"indexer"`
+	Database      Database     `yaml:"database"`
+	Web           Web          `yaml:"web"`
+	Log           Log          `yaml:"log"`
+	GraphQL       GraphQL      `yaml:"graphql"`
+	Snapshotters  Snapshotters `yaml:"snapshotters"`
+	AggregatesDir string       `yaml:"aggregates_dir"`
+}
+
+// Snapshotters configures the snapshotter seam — periodic, calendar-
+// driven ingestion jobs that run in-process (vs. pg_cron-scheduled
+// aggregates, which run inside Postgres). Each snapshotter has its own
+// subsection; CheckInterval gates how often the RunLoop scans for due
+// work across all of them.
+type Snapshotters struct {
+	// CheckInterval is the tick period for the snapshotter RunLoop.
+	// Default 10m — each tick is cheap (one DB roundtrip per
+	// snapshotter to compute due targets) so "check often" is fine.
+	CheckInterval time.Duration `yaml:"check_interval"`
+
+	ProviderRewards ProviderRewardsSnapshotter `yaml:"provider_rewards"`
+}
+
+// ProviderRewardsSnapshotter configures the provider_rewards
+// snapshotter (see internal/snapshotters/provider_rewards).
+type ProviderRewardsSnapshotter struct {
+	// Enabled is the master switch. When false, no DDL is applied, no
+	// goroutine is spawned, and the snapshotter is invisible to
+	// /api/snapshotters.
+	Enabled bool `yaml:"enabled"`
+
+	// EarliestDate is the first monthly-17th we attempt to snapshot.
+	// Format: "2006-01-02". Must be a 17th (the RunLoop will error at
+	// config validation if not — forces the operator to notice a
+	// misconfiguration).
+	EarliestDate string `yaml:"earliest_date"`
+
+	// Concurrency caps per-provider chain calls during a single
+	// snapshot. Default 25 — matches the public Lava gateway's
+	// comfortable per-IP concurrency ceiling.
+	Concurrency int `yaml:"concurrency"`
+
+	// RESTURL optionally overrides the main REST endpoint used for
+	// this snapshotter. When empty, the snapshotter falls back to the
+	// first `kind: rest` endpoint in network.endpoints. Set this when
+	// you want to route snapshotter work through a dedicated
+	// archive-backed endpoint (rewards queries require archive mode).
+	RESTURL string `yaml:"rest_url"`
+
+	// RESTHeaders attaches extra HTTP headers to every snapshotter
+	// call to RESTURL. Typical use: `lava-extension: archive` to hint
+	// archive-mode on Lava's public gateway.
+	RESTHeaders map[string]string `yaml:"rest_headers,omitempty"`
 }
 
 // Web configures the built-in progress UI + status JSON API.
@@ -121,6 +168,21 @@ type Indexer struct {
 	BackfillInterleave int `yaml:"backfill_interleave"`
 }
 
+// ParsedEarliestDate returns the earliest_date parsed as a UTC date.
+// Relies on validate() having rejected invalid strings — returns the
+// zero time.Time only for a disabled snapshotter or misuse of the
+// parsed result without checking Enabled first.
+func (p ProviderRewardsSnapshotter) ParsedEarliestDate() time.Time {
+	if strings.TrimSpace(p.EarliestDate) == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse("2006-01-02", p.EarliestDate)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
 // WantsHandler reports whether `name` should be registered given the
 // handlers config. Empty list or ["all"] means "every handler".
 func (i Indexer) WantsHandler(name string) bool {
@@ -220,6 +282,14 @@ func defaults() *Config {
 			// proxy with auth, or by binding the indexer to loopback.
 			Enabled:  false,
 			Upstream: "http://graphql:5000",
+		},
+		Snapshotters: Snapshotters{
+			CheckInterval: 10 * time.Minute,
+			ProviderRewards: ProviderRewardsSnapshotter{
+				Enabled:      false,
+				EarliestDate: "2025-01-17",
+				Concurrency:  25,
+			},
 		},
 		AggregatesDir: "./aggregates",
 	}
@@ -355,6 +425,25 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("GRAPHQL_UPSTREAM"); v != "" {
 		cfg.GraphQL.Upstream = v
 	}
+
+	// Snapshotters
+	if v := os.Getenv("SNAPSHOTTERS_CHECK_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Snapshotters.CheckInterval = d
+		}
+	}
+	if v := os.Getenv("PROVIDER_REWARDS_ENABLED"); v != "" {
+		cfg.Snapshotters.ProviderRewards.Enabled = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv("PROVIDER_REWARDS_EARLIEST_DATE"); v != "" {
+		cfg.Snapshotters.ProviderRewards.EarliestDate = v
+	}
+	if v, ok := envInt("PROVIDER_REWARDS_CONCURRENCY"); ok {
+		cfg.Snapshotters.ProviderRewards.Concurrency = v
+	}
+	if v := os.Getenv("PROVIDER_REWARDS_REST_URL"); v != "" {
+		cfg.Snapshotters.ProviderRewards.RESTURL = v
+	}
 }
 
 func envInt(name string) (int, bool) {
@@ -409,6 +498,24 @@ func (c *Config) validate() error {
 	}
 	if c.Database.Schema == "" {
 		c.Database.Schema = "app"
+	}
+	// Snapshotters: validate provider_rewards earliest_date when enabled.
+	// Fail fast here so a typo surfaces at startup rather than on the
+	// first scheduled tick ~10 minutes in. Disabled snapshotters are
+	// skipped — we don't force operators to keep fields valid for
+	// something they've turned off.
+	if c.Snapshotters.ProviderRewards.Enabled {
+		ed := strings.TrimSpace(c.Snapshotters.ProviderRewards.EarliestDate)
+		if ed == "" {
+			return fmt.Errorf("snapshotters.provider_rewards.earliest_date is required when enabled")
+		}
+		t, err := time.Parse("2006-01-02", ed)
+		if err != nil {
+			return fmt.Errorf("snapshotters.provider_rewards.earliest_date: %w", err)
+		}
+		if t.Day() != 17 {
+			return fmt.Errorf("snapshotters.provider_rewards.earliest_date must be a 17th (got %s)", ed)
+		}
 	}
 	return nil
 }

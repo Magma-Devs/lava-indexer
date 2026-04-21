@@ -160,3 +160,44 @@ graphql:
   # Enable with graphql.enabled: true or env GRAPHQL_ENABLED=true.
   enabled: false
   upstream: "http://graphql:5000"
+
+# Snapshotters are the periodic-ingestion seam: scheduled jobs that
+# query the chain at specific block heights and write rows into their
+# own tables. Unlike event handlers (which consume the block stream),
+# snapshotters own their cadence and RPC work.
+#
+# Disabled snapshotters incur zero cost — no DDL is applied, no
+# goroutine is spawned, and the /api/snapshotters endpoint doesn't
+# surface them. Turn on only the ones your operator use case needs.
+snapshotters:
+  # How often the snapshotter loop checks whether there's work to do.
+  # Each tick is one DB query per snapshotter (cheap); short intervals
+  # are fine. Default 10m.
+  check_interval: 10m
+
+  provider_rewards:
+    # Master switch. When false, no DDL / no goroutine / no UI card.
+    enabled: false
+
+    # First monthly-17th we attempt to snapshot. Must be a 17th of
+    # some month (validated at startup). Every subsequent 17th whose
+    # 15:00 UTC slot is in the past is eligible; covered dates are
+    # subtracted.
+    earliest_date: "2025-01-17"
+
+    # Max concurrent per-provider REST calls during one snapshot.
+    # Default 25 — matches the public Lava gateway's comfortable
+    # per-IP ceiling. Drop if your upstream returns 5xx under load.
+    concurrency: 25
+
+    # Optional: dedicated REST URL for this snapshotter. When empty,
+    # falls back to the first `network.endpoints` entry whose kind
+    # is `rest`. Set when you want to route reward queries through a
+    # known-archive upstream while the main indexer uses a pruning
+    # fleet.
+    rest_url: ""
+
+    # Optional: headers attached to every snapshotter request. When
+    # empty, inherits the headers from the chosen REST endpoint.
+    # Typical use: `lava-extension: archive` on Lava's public gateway.
+    rest_headers: {}
