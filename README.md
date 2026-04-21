@@ -430,7 +430,7 @@ Operator setup:
 
 ```yaml
 snapshotters:
-  list: ["all"]           # same pattern as indexer.handlers; omit or []=all
+  handlers: ["all"]       # same shape as indexer.handlers; [] also means all
   check_interval: 10m
   provider_rewards:
     earliest_date: "2025-01-17"
@@ -447,9 +447,10 @@ Progress is visible in the web UI's "Snapshotters" card (one dot per
 expected date — green covered / red failed / grey missing) and via
 `GET /api/snapshotters`.
 
-Env overrides: `SNAPSHOTTERS` (comma-separated list — `all` / `provider_rewards`),
-`SNAPSHOTTERS_CHECK_INTERVAL`, `PROVIDER_REWARDS_EARLIEST_DATE`,
-`PROVIDER_REWARDS_CONCURRENCY`, `PROVIDER_REWARDS_REST_URL`.
+Env overrides: `SNAPSHOTTERS_HANDLERS` (comma-separated — `all` /
+`provider_rewards`), `SNAPSHOTTERS_CHECK_INTERVAL`,
+`PROVIDER_REWARDS_EARLIEST_DATE`, `PROVIDER_REWARDS_CONCURRENCY`,
+`PROVIDER_REWARDS_REST_URL`.
 
 ### Adding a new snapshotter
 

@@ -33,24 +33,25 @@ type Snapshotters struct {
 	// snapshotter to compute due targets) so "check often" is fine.
 	CheckInterval time.Duration `yaml:"check_interval"`
 
-	// List selects which snapshotters to register. Use ["all"] (or leave
-	// empty) to enable every compiled-in snapshotter. Otherwise name
-	// them explicitly (e.g. ["provider_rewards"]). Mirrors the handler
-	// selection pattern in Indexer.Handlers — snapshotters not listed
-	// are never constructed: no DDL, no goroutine, no UI entry.
-	List []string `yaml:"list"`
+	// Handlers selects which snapshotters to register. Use ["all"] (or
+	// leave empty) to enable every compiled-in snapshotter. Otherwise
+	// name them explicitly (e.g. ["provider_rewards"]). Field name
+	// matches indexer.handlers so both selectors read the same to an
+	// operator — snapshotters not listed are never constructed: no
+	// DDL, no goroutine, no UI entry.
+	Handlers []string `yaml:"handlers"`
 
 	ProviderRewards ProviderRewardsSnapshotter `yaml:"provider_rewards"`
 }
 
 // WantsSnapshotter reports whether `name` should be registered given
-// the snapshotters.list config. Empty list or ["all"] means "every
+// the snapshotters.handlers config. Empty list or ["all"] means "every
 // snapshotter" — same semantics as Indexer.WantsHandler.
 func (s Snapshotters) WantsSnapshotter(name string) bool {
-	if len(s.List) == 0 {
+	if len(s.Handlers) == 0 {
 		return true
 	}
-	for _, n := range s.List {
+	for _, n := range s.Handlers {
 		if strings.EqualFold(n, "all") || strings.EqualFold(n, name) {
 			return true
 		}
@@ -304,10 +305,10 @@ func defaults() *Config {
 		},
 		Snapshotters: Snapshotters{
 			CheckInterval: 10 * time.Minute,
-			// Default: no snapshotters — operator opts in by listing
-			// names (or ["all"]). Matches the handler default of
-			// ["all"] being explicit, not implicit.
-			List: nil,
+			// Default ["all"] mirrors indexer.handlers' default —
+			// every compiled-in snapshotter runs unless the operator
+			// narrows the list.
+			Handlers: []string{"all"},
 			ProviderRewards: ProviderRewardsSnapshotter{
 				EarliestDate: "2025-01-17",
 				Concurrency:  25,
@@ -454,7 +455,7 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Snapshotters.CheckInterval = d
 		}
 	}
-	if v := os.Getenv("SNAPSHOTTERS"); v != "" {
+	if v := os.Getenv("SNAPSHOTTERS_HANDLERS"); v != "" {
 		// Comma-separated names, e.g. "all" or "provider_rewards".
 		// Mirrors INDEXER_HANDLERS exactly.
 		out := make([]string, 0, 4)
@@ -464,7 +465,7 @@ func applyEnvOverrides(cfg *Config) {
 				out = append(out, p)
 			}
 		}
-		cfg.Snapshotters.List = out
+		cfg.Snapshotters.Handlers = out
 	}
 	if v := os.Getenv("PROVIDER_REWARDS_EARLIEST_DATE"); v != "" {
 		cfg.Snapshotters.ProviderRewards.EarliestDate = v
