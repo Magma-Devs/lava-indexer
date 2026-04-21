@@ -169,6 +169,21 @@ graphql:
 # Unlisted snapshotters incur zero cost — no DDL is applied, no
 # goroutine is spawned, and the /api/snapshotters endpoint doesn't
 # surface them. Turn on only the ones your operator use case needs.
+# ----------------------------------------------------------------------------
+# Denoms deriver: auto-discovers raw denoms from provider_rewards and upserts
+# into app.priced_denoms. Seeds known base_denom → coingecko_id mappings at
+# startup. New denoms land with coingecko_id=NULL — operators fill mappings
+# via SQL (`UPDATE app.priced_denoms SET coingecko_id = '…' WHERE
+# base_denom = '…'`), no redeploy.
+# ----------------------------------------------------------------------------
+denoms:
+  deriver:
+    enabled: true
+    interval: 5m
+    resolve_timeout: 10s
+    # rest_url / rest_headers are optional — falls back to the
+    # snapshotters.provider_rewards REST URL for IBC trace lookups.
+
 snapshotters:
   # Which snapshotters to register. Same shape as indexer.handlers:
   # ["all"] enables every compiled-in snapshotter; empty also means

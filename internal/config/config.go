@@ -19,7 +19,39 @@ type Config struct {
 	Log           Log          `yaml:"log"`
 	GraphQL       GraphQL      `yaml:"graphql"`
 	Snapshotters  Snapshotters `yaml:"snapshotters"`
+	Denoms        Denoms       `yaml:"denoms"`
 	AggregatesDir string       `yaml:"aggregates_dir"`
+}
+
+// Denoms configures derived dictionaries of on-chain denoms observed
+// in ingestion data. Today that's just the priced_denoms deriver
+// (internal/denoms) which feeds an eventual price-snapshotter; future
+// derivers (e.g. a chain-registry dictionary) would get their own
+// subsection here.
+type Denoms struct {
+	Deriver DenomsDeriver `yaml:"deriver"`
+}
+
+// DenomsDeriver configures the priced_denoms derivation loop. Enabled
+// by default — the loop is cheap (one SELECT DISTINCT + up-to-N
+// upserts per tick) and the output table is a prerequisite for the
+// price snapshotter.
+type DenomsDeriver struct {
+	// Enabled is the master switch. When false, no DDL is applied and
+	// no goroutine is spawned.
+	Enabled bool `yaml:"enabled"`
+	// Interval is the tick period. Default 5m.
+	Interval time.Duration `yaml:"interval"`
+	// ResolveTimeout is the per-raw-denom timeout when looking up an
+	// IBC trace against the chain REST. Default 10s.
+	ResolveTimeout time.Duration `yaml:"resolve_timeout"`
+	// RESTURL is the base URL for IBC trace lookups. When empty,
+	// inherits from snapshotters.provider_rewards.rest_url (or its
+	// fallback to the first kind:rest endpoint).
+	RESTURL string `yaml:"rest_url"`
+	// RESTHeaders attaches extra HTTP headers (e.g. lava-extension:
+	// archive) to every trace lookup.
+	RESTHeaders map[string]string `yaml:"rest_headers,omitempty"`
 }
 
 // Snapshotters configures the snapshotter seam — periodic, calendar-
@@ -338,6 +370,13 @@ func defaults() *Config {
 				Concurrency:  25,
 			},
 		},
+		Denoms: Denoms{
+			Deriver: DenomsDeriver{
+				Enabled:        true,
+				Interval:       5 * time.Minute,
+				ResolveTimeout: 10 * time.Second,
+			},
+		},
 		AggregatesDir: "./aggregates",
 	}
 }
@@ -499,6 +538,24 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("PROVIDER_REWARDS_REST_URL"); v != "" {
 		cfg.Snapshotters.ProviderRewards.RESTURL = v
+	}
+
+	// Denoms
+	if v := os.Getenv("DENOMS_DERIVER_ENABLED"); v != "" {
+		cfg.Denoms.Deriver.Enabled = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv("DENOMS_DERIVER_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Denoms.Deriver.Interval = d
+		}
+	}
+	if v := os.Getenv("DENOMS_DERIVER_RESOLVE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Denoms.Deriver.ResolveTimeout = d
+		}
+	}
+	if v := os.Getenv("DENOMS_DERIVER_REST_URL"); v != "" {
+		cfg.Denoms.Deriver.RESTURL = v
 	}
 }
 

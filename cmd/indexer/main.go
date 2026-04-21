@@ -19,6 +19,7 @@ import (
 	"github.com/magma-devs/lava-indexer/internal/aggregates"
 	"github.com/magma-devs/lava-indexer/internal/config"
 	"github.com/magma-devs/lava-indexer/internal/events"
+	"github.com/magma-devs/lava-indexer/internal/denoms"
 	"github.com/magma-devs/lava-indexer/internal/events/relay_payment"
 	"github.com/magma-devs/lava-indexer/internal/pipeline"
 	"github.com/magma-devs/lava-indexer/internal/rpc"
@@ -343,13 +344,45 @@ func main() {
 			return snapReg.RunLoop(gctx, pool, cfg.Snapshotters.CheckInterval)
 		})
 	}
+
+	// Denoms deriver — reads provider_rewards, upserts priced_denoms.
+	// Falls back to the snapshotter's REST URL for IBC trace lookups
+	// so operators don't have to reconfigure the same archive endpoint
+	// twice.
+	var denomDeriver *denoms.Deriver
+	if cfg.Denoms.Deriver.Enabled {
+		dcfg := denoms.DeriverConfig{
+			Schema:         cfg.Database.Schema,
+			Interval:       cfg.Denoms.Deriver.Interval,
+			ResolveTimeout: cfg.Denoms.Deriver.ResolveTimeout,
+			RESTURL:        cfg.Denoms.Deriver.RESTURL,
+			RESTHeaders:    cfg.Denoms.Deriver.RESTHeaders,
+		}
+		if dcfg.RESTURL == "" {
+			dcfg.RESTURL = resolveSnapshotterRESTURL(cfg)
+		}
+		if len(dcfg.RESTHeaders) == 0 {
+			dcfg.RESTHeaders = resolveSnapshotterRESTHeaders(cfg)
+		}
+		denomDeriver = denoms.New(pool, dcfg)
+		if err := denomDeriver.ApplyDDL(ctx); err != nil {
+			fatal("apply priced_denoms DDL", err)
+		}
+		slog.Info("denoms deriver registered",
+			"interval", dcfg.Interval, "rest_url", dcfg.RESTURL)
+		g.Go(func() error { return denomDeriver.Run(gctx) })
+	} else {
+		slog.Info("denoms deriver disabled")
+	}
+
 	if cfg.Web.Enabled {
 		srv := &web.Server{
-			ChainID:           cfg.Network.ChainID,
-			State:             st,
+			ChainID:         cfg.Network.ChainID,
+			State:           st,
 			Client:          client,
 			Registry:        reg,
 			Snapshotters:    snapReg,
+			DenomDeriver:    denomDeriver,
 			Pool:            pool,
 			Stats:           pipelineStatsAdapter{pipe},
 			Start:           cfg.Indexer.StartHeight,

@@ -28,6 +28,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/magma-devs/lava-indexer/internal/events"
 	"github.com/magma-devs/lava-indexer/internal/rpc"
+	"github.com/magma-devs/lava-indexer/internal/denoms"
 	"github.com/magma-devs/lava-indexer/internal/snapshotters"
 	"github.com/magma-devs/lava-indexer/internal/state"
 )
@@ -53,17 +54,18 @@ var assetsFS embed.FS
 
 // Server bundles the small HTTP surface into one dependency-injectable struct.
 type Server struct {
-	ChainID           string
-	State             *state.State
-	Client            *rpc.MultiClient
-	Registry          *events.Registry
-	Snapshotters      *snapshotters.Registry // optional — nil disables the /api/snapshotters endpoint
-	Pool              *pgxpool.Pool
-	Stats             StatsProvider // optional — enables blocks/sec in the response
-	Start             int64
-	End               int64
-	GraphQLEnabled    bool
-	GraphQLUpstream   string
+	ChainID         string
+	State           *state.State
+	Client          *rpc.MultiClient
+	Registry        *events.Registry
+	Snapshotters    *snapshotters.Registry // optional — nil disables the /api/snapshotters endpoint
+	DenomDeriver    *denoms.Deriver        // optional — nil disables the /api/denoms endpoint
+	Pool            *pgxpool.Pool
+	Stats           StatsProvider // optional — enables blocks/sec in the response
+	Start           int64
+	End             int64
+	GraphQLEnabled  bool
+	GraphQLUpstream string
 
 	// dbSizeCache memoises pg_total_relation_size for the schema. The
 	// underlying SUM(pg_total_relation_size) is the heaviest query in
@@ -87,6 +89,7 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/history", s.handleHistory)
 	mux.HandleFunc("/api/snapshotters", s.handleSnapshotters)
+	mux.HandleFunc("/api/denoms", s.handleDenoms)
 
 	// Optional reverse-proxy to PostGraphile (or whatever GraphQL server).
 	// When enabled, /graphql and /graphiql on this port proxy to the
@@ -785,3 +788,23 @@ func (s *Server) snapshotterStatus(ctx context.Context, sn snapshotters.Snapshot
 	return st
 }
 
+
+// ---------------------------------------------------------------------------
+// /api/denoms
+// ---------------------------------------------------------------------------
+
+// handleDenoms returns the current priced_denoms deriver snapshot:
+// counts of mapped / unmapped base denoms plus the unmapped list (so
+// the dashboard can surface an actionable "these need a coingecko_id"
+// signal). When the deriver isn't running, returns null.
+func (s *Server) handleDenoms(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	if s.DenomDeriver == nil {
+		_, _ = w.Write([]byte("null"))
+		return
+	}
+	st := s.DenomDeriver.Status()
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(st)
+}

@@ -465,6 +465,39 @@ Env overrides: `SNAPSHOTTERS_HANDLERS` (comma-separated — `all` /
 4. DDL applies at startup; RunLoop runs `BlocksDue` + `Snapshot` on
    every tick.
 
+## Priced denoms deriver
+
+`internal/denoms` keeps `app.priced_denoms` populated from whatever
+raw denoms land in `app.provider_rewards`. One goroutine, 5 min
+ticker, idempotent on every pass.
+
+- **What it does.** `SELECT DISTINCT denom FROM app.provider_rewards`,
+  resolve each raw denom to a base form (`ulava` → `lava`,
+  `ibc/<hash>` → IBC trace lookup → base, otherwise lowercase-trimmed),
+  upsert into `app.priced_denoms`. New denoms land with
+  `coingecko_id = NULL`; existing ones just bump `last_seen_at`.
+- **Seeded mappings.** 23 known Cosmos tokens ship with
+  `base_denom → coingecko_id` applied on startup (`ON CONFLICT DO
+  UPDATE`). Adding a new mapping later is one SQL statement — no
+  redeploy.
+- **Adding a coingecko_id for a new denom.**
+
+  ```sql
+  UPDATE app.priced_denoms
+     SET coingecko_id = 'some-new-token'
+   WHERE base_denom = 'snt';
+  ```
+
+- **`coingecko_id IS NULL` is a monitoring hook.** The deriver logs a
+  WARN every time it lands a new base denom without a mapping, and
+  the dashboard's **Priced denoms** card renders an "N unmapped"
+  expandable list for a direct ops view. Alert on
+  `SELECT COUNT(*) FROM app.priced_denoms WHERE coingecko_id IS NULL`
+  if you care about price coverage.
+- **Disable.** `denoms.deriver.enabled: false` (or
+  `DENOMS_DERIVER_ENABLED=false`) skips DDL entirely and runs no
+  goroutine.
+
 ## Aggregates: MVs and rollups
 
 Every `*.sql` file under `aggregates/` is executed at startup in filename
