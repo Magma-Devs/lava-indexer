@@ -86,6 +86,30 @@ type ProviderRewardsSnapshotter struct {
 	// call to RESTURL. Typical use: `lava-extension: archive` to hint
 	// archive-mode on Lava's public gateway.
 	RESTHeaders map[string]string `yaml:"rest_headers,omitempty"`
+
+	// SnapshotAnchor overrides the chain's reported genesis timestamp
+	// as the monthly-cadence anchor. Useful when the chain forked or
+	// was renamed — e.g. lava-testnet-2 reports 2022-12-26 via /genesis
+	// (the upstream testnet-1 origin), but its operational start and
+	// intended snapshot cadence is 2023-08-17 10:02 UTC. Format: RFC3339.
+	// When empty, the snapshotter uses client.GenesisTime() (the
+	// chain's own /genesis response).
+	SnapshotAnchor string `yaml:"snapshot_anchor,omitempty"`
+}
+
+// ParsedSnapshotAnchor returns the snapshot-anchor time override as a
+// time.Time, or the zero value when unset / unparsable. Callers fall
+// back to the chain's /genesis response in that case.
+func (p ProviderRewardsSnapshotter) ParsedSnapshotAnchor() time.Time {
+	s := strings.TrimSpace(p.SnapshotAnchor)
+	if s == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t.UTC()
 }
 
 // Web configures the built-in progress UI + status JSON API.

@@ -229,6 +229,15 @@ func main() {
 			slog.Info("snapshotter skipped by config", "name", s.Name())
 		}
 	}
+	// Prefer the operator-configured snapshot_anchor over the chain's
+	// /genesis timestamp — needed for forked / renamed chains where
+	// /genesis still reports the upstream origin (e.g. testnet-2 still
+	// reporting testnet-1's 2022-12-26 genesis when the operational
+	// start was 2023-08-17).
+	snapAnchor := cfg.Snapshotters.ProviderRewards.ParsedSnapshotAnchor()
+	if snapAnchor.IsZero() {
+		snapAnchor = client.GenesisTime()
+	}
 	registerSnapshotter(provider_rewards.New(provider_rewards.Config{
 		Schema:        cfg.Database.Schema,
 		EarliestDate:  cfg.Snapshotters.ProviderRewards.ParsedEarliestDate(),
@@ -236,7 +245,7 @@ func main() {
 		RESTURL:       resolveSnapshotterRESTURL(cfg),
 		RESTHeaders:   resolveSnapshotterRESTHeaders(cfg),
 		GenesisHeight: client.Genesis(),
-		GenesisTime:   client.GenesisTime(),
+		GenesisTime:   snapAnchor,
 	}))
 	// Apply snapshotter DDL, same one-tx-per-snapshotter pattern as
 	// event handlers. Each snapshotter owns its tables so a partial DDL
