@@ -84,13 +84,19 @@ type Snapshotter interface {
 
 // Status is the generic coverage view returned by Snapshotter.Status.
 // Rendered as /api/snapshotters entries and the dashboard timeline.
-// Dates are ISO-formatted (YYYY-MM-DD); Failed carries per-date error
-// strings for the UI's expandable errors block.
+// Dates are ISO-formatted (YYYY-MM-DD); Blocks maps date → block
+// height so the UI can show the pinned block in each timeline-dot
+// tooltip alongside the logical date.
 type Status struct {
 	Expected []string
 	Covered  []string
 	Missing  []string
 	Failed   []FailedDate
+	// Blocks is the resolved block height for each date the
+	// snapshotter has a record of (covered + failed). Unordered;
+	// operators look up by date. Empty when a snapshotter doesn't
+	// have a concept of block heights.
+	Blocks map[string]int64
 }
 
 // FailedDate pairs a snapshot date with the error message recorded for

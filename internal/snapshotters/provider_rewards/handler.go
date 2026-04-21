@@ -292,11 +292,12 @@ func (h *Handler) blockForDate(ctx context.Context, date time.Time) (snapshotter
 func (h *Handler) Status(ctx context.Context, pool *pgxpool.Pool) (snapshotters.Status, error) {
 	type row struct {
 		date   time.Time
+		block  int64
 		status string
 		errMsg string
 	}
 	rows, err := pool.Query(ctx, fmt.Sprintf(`
-		SELECT snapshot_date, status, COALESCE(error, '')
+		SELECT snapshot_date, block_height, status, COALESCE(error, '')
 		FROM %s.provider_rewards_snapshots
 		ORDER BY snapshot_date`, h.cfg.Schema))
 	if err != nil {
@@ -308,7 +309,7 @@ func (h *Handler) Status(ctx context.Context, pool *pgxpool.Pool) (snapshotters.
 	seen := make(map[string]row)
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.date, &r.status, &r.errMsg); err != nil {
+		if err := rows.Scan(&r.date, &r.block, &r.status, &r.errMsg); err != nil {
 			return snapshotters.Status{}, err
 		}
 		seen[r.date.UTC().Format("2006-01-02")] = r
@@ -322,11 +323,15 @@ func (h *Handler) Status(ctx context.Context, pool *pgxpool.Pool) (snapshotters.
 		Expected: make([]string, 0, len(expected)),
 		Covered:  make([]string, 0, len(expected)),
 		Missing:  make([]string, 0, len(expected)),
+		Blocks:   make(map[string]int64, len(seen)),
 	}
 	for _, d := range expected {
 		key := d.Format("2006-01-02")
 		out.Expected = append(out.Expected, key)
 		r, ok := seen[key]
+		if ok {
+			out.Blocks[key] = r.block
+		}
 		switch {
 		case !ok:
 			out.Missing = append(out.Missing, key)
@@ -418,39 +423,52 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 		return fmt.Errorf("fetch rewards: %w", err)
 	}
 
-	// 2a. Partition by success/failure and decide whether to persist.
-	successCount := 0
-	var failedProviders []string
-	var firstErr error
+	// 2a. Partition by outcome. Only real fetch failures count toward
+	// the threshold; "no rewards" responses are chain-authoritative
+	// answers (provider not staked at this height, delegation absent,
+	// etc.) and don't indicate a problem.
+	var fetched, noRewards, failed int
+	var firstFailReason error
 	for _, r := range results {
-		if r.err != nil {
-			failedProviders = append(failedProviders, r.provider)
-			if firstErr == nil {
-				firstErr = r.err
+		switch r.outcome {
+		case outcomeFetched:
+			fetched++
+		case outcomeNoRewards:
+			noRewards++
+		case outcomeFailed:
+			failed++
+			if firstFailReason == nil {
+				firstFailReason = r.reason
 			}
-			continue
 		}
-		successCount++
 	}
-	fraction := float64(successCount) / float64(len(providers))
-	if len(failedProviders) > 0 {
-		slog.Warn("snapshot had per-provider failures",
+	answered := fetched + noRewards // providers the chain gave a clean answer for
+	slog.Info("snapshot fetch complete",
+		"snapshotter", Name,
+		"date", target.SnapshotDate.UTC().Format("2006-01-02"),
+		"block", target.BlockHeight,
+		"total", len(providers),
+		"fetched", fetched,
+		"no_rewards", noRewards,
+		"failed", failed)
+	if failed > 0 {
+		slog.Warn("snapshot had real fetch failures",
 			"snapshotter", Name,
 			"date", target.SnapshotDate.UTC().Format("2006-01-02"),
-			"block", target.BlockHeight,
-			"failed", len(failedProviders),
-			"ok", successCount,
-			"fraction", fmt.Sprintf("%.3f", fraction),
-			"first_err", firstErr)
+			"failed", failed,
+			"first_err", firstFailReason)
 	}
-	if fraction < minSuccessFraction {
-		// Too many providers failed. Persist a failed-status row so
-		// BlocksDue won't keep retrying this date forever, and so the
-		// UI surfaces the situation to operators. Short tx.
-		errMsg := fmt.Sprintf("%.1f%% providers failed (%d/%d): %v",
-			(1-fraction)*100, len(failedProviders), len(providers), firstErr)
+	// Threshold: if most providers failed to answer at all, persist
+	// a failed row so BlocksDue doesn't retry this date forever. The
+	// denominator is total (not answered) — a date where the handler
+	// genuinely wasn't deployed yet has ALL providers failing, which
+	// is what we want to catch here. Chain-authoritative "no rewards"
+	// responses don't penalise the snapshot.
+	if answered == 0 || float64(answered)/float64(len(providers)) < minSuccessFraction {
+		errMsg := fmt.Sprintf("%d/%d providers failed to fetch: %v",
+			failed, len(providers), firstFailReason)
 		return pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
-			return h.insertSnapshotRow(ctx, tx, target, successCount, "failed", errMsg)
+			return h.insertSnapshotRow(ctx, tx, target, fetched, "failed", errMsg)
 		})
 	}
 
@@ -459,11 +477,12 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 	// final write tx — a rollback in step 4 leaves the dict rows in
 	// place, which is harmless (the composite PK on provider_rewards
 	// prevents dup-inserting fact rows, and dict rows are idempotent by
-	// design). Skip providers that failed — nothing to map for them.
+	// design). Only outcomeFetched rows contribute entries to map;
+	// noRewards and failed providers don't surface fact rows.
 	provSet := make(map[string]struct{})
 	specSet := make(map[string]struct{})
 	for _, r := range results {
-		if r.err != nil {
+		if r.outcome != outcomeFetched {
 			continue
 		}
 		provSet[r.provider] = struct{}{}
@@ -516,7 +535,7 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 	rows := make([][]any, 0, 256)
 	provWithRewards := 0
 	for _, r := range results {
-		if r.err != nil {
+		if r.outcome != outcomeFetched {
 			continue
 		}
 		if len(r.entries) > 0 {
@@ -621,13 +640,28 @@ func (h *Handler) insertSnapshotRow(ctx context.Context, tx pgx.Tx, target snaps
 	return err
 }
 
-// fetchResult bundles one provider's parsed chain response, or the
-// error that prevented fetching. Exactly one of entries/err is
-// meaningful (err == nil → entries valid; err != nil → entries empty).
+// providerOutcome distinguishes chain-authoritative "no rewards"
+// responses from actual fetch failures. The snapshot threshold only
+// considers realFailure — a provider that wasn't staked at the
+// queried height returns noRewards, not realFailure, so operators
+// see a clean `status='ok'` with the fetched subset.
+type providerOutcome int
+
+const (
+	outcomeFetched   providerOutcome = iota // got a clean response (possibly empty info[])
+	outcomeNoRewards                        // chain said "no rewards for this provider at this block"
+	outcomeFailed                           // real fetch failure — HTTP 5xx / decode / retry exhausted
+)
+
+// fetchResult bundles one provider's parsed chain response. When
+// outcome == outcomeFetched, entries is the (possibly empty) reward
+// list. When outcome == outcomeNoRewards or outcomeFailed, reason
+// carries the underlying message for logs; entries is empty.
 type fetchResult struct {
 	provider string
+	outcome  providerOutcome
 	entries  []RewardEntry
-	err      error
+	reason   error // wrapped chain message or HTTP error, for logs
 }
 
 // fetchAll returns one entry per provider in the same order. Successful
@@ -651,14 +685,18 @@ func (h *Handler) fetchAll(ctx context.Context, providers []string, blockHeight 
 	out := make([]fetchResult, len(providers))
 	for i, addr := range providers {
 		g.Go(func() error {
-			// ctx from errgroup is cancelled only on g.Wait's real
-			// ctx cancellation — we never return a non-nil error
-			// from these closures, so siblings run to completion.
 			if gctx.Err() != nil {
 				return nil
 			}
 			entries, err := h.caller.EstimatedRewards(gctx, addr, blockHeight)
-			out[i] = fetchResult{provider: addr, entries: entries, err: err}
+			switch {
+			case err == nil:
+				out[i] = fetchResult{provider: addr, outcome: outcomeFetched, entries: entries}
+			case errors.Is(err, errNoRewards):
+				out[i] = fetchResult{provider: addr, outcome: outcomeNoRewards, reason: err}
+			default:
+				out[i] = fetchResult{provider: addr, outcome: outcomeFailed, reason: err}
+			}
 			return nil
 		})
 	}
@@ -828,41 +866,43 @@ func cleanIntegerString(s string) (string, bool) {
 // ---------------------------------------------------------------------------
 
 // errRetryPruned indicates the endpoint looks like a pruning replica
-// for this block height. Retry on a fresh connection — some gateways
-// rotate between nodes, so a second try often succeeds.
+// (or the handler isn't registered at the queried height). Retry on a
+// fresh connection — Lava's LB rotates between replicas, so a second
+// try often lands on one that can answer.
 var errRetryPruned = errors.New("replica pruned; retry")
 
-// errRetryTransient indicates an opaque success:false response. Retry
-// conservatively (fewer attempts than pruned-replica).
-var errRetryTransient = errors.New("chain returned success=false; retry")
-
-// errNoClaimableRewards indicates the application-level "nothing to
-// distribute" state. Treated as an empty info[] — NOT an error at the
-// snapshotter level.
-var errNoClaimableRewards = errors.New("no claimable rewards after distribution")
+// errNoRewards indicates the chain authoritatively returned "no
+// rewards to compute for this provider at this block" — the provider
+// wasn't staked, the delegation state isn't present, rewards already
+// distributed, etc. NOT an error at the snapshotter level; treated as
+// an empty info[]. The underlying chain message is carried in the
+// wrapped error so logs show the specific reason per provider.
+//
+// We classify ALL unrecognised success:false responses as no-rewards
+// rather than "transient retry", because success:false from a working
+// replica is a deterministic answer — retrying 3× won't change it and
+// only makes "not staked at this height" look like a real fetch
+// failure to the operator.
+var errNoRewards = errors.New("chain reports no rewards for provider")
 
 func classifyChainMessage(msg string) error {
 	low := strings.ToLower(msg)
+	// Patterns that indicate the REPLICA (not the chain state) is the
+	// problem — the handler isn't registered, or the replica is at a
+	// different chain version. Retry on a fresh connection.
 	switch {
 	case strings.Contains(low, "version does not exist"),
 		strings.Contains(low, "version mismatch"),
 		strings.Contains(low, "no commit info found"),
-		// "Not Implemented" (grpc code 12) surfaces when Lava's public
-		// gateway load-balances to a replica that doesn't have the
-		// EstimatedProviderRewards handler registered at this height —
-		// another replica will. Retry on a fresh connection.
 		strings.Contains(low, "not implemented"):
 		return fmt.Errorf("%w: %s", errRetryPruned, msg)
-	case strings.Contains(low, "cannot get claimable rewards after distribution"),
-		// Observed on otherwise-valid providers whose delegation state
-		// isn't present at the queried height — the chain can't compute
-		// rewards for a delegator/provider pair it can't find. Treat as
-		// empty (no accrued rewards), not as an error worth retrying.
-		strings.Contains(low, "cannot estimate rewards for delegator/delegation"):
-		return errNoClaimableRewards
-	default:
-		return fmt.Errorf("%w: %s", errRetryTransient, msg)
 	}
+	// Every other success:false is a chain-authoritative "nothing to
+	// compute for this (provider, block) pair" — provider not staked,
+	// delegation absent, rewards already distributed, etc. Treat as
+	// empty rewards; the caller can log the specific message so
+	// operators can audit why a provider showed empty.
+	return fmt.Errorf("%w: %s", errNoRewards, msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -874,11 +914,6 @@ func classifyChainMessage(msg string) error {
 // seconds on Lava's public gateway — but the worst-case payoff is a few
 // seconds per stuck provider, bounded.
 const maxPrunedRetries = 10
-
-// maxTransientRetries caps retries for opaque success:false. Lower than
-// pruned since the error is non-specific: if the chain is consistently
-// returning "success: false" for this provider, hammering won't help.
-const maxTransientRetries = 3
 
 // HTTPCaller is the production RESTCaller. Calls the chain via a plain
 // http.Client sharing keep-alive + TLS session cache with the rest of
@@ -958,19 +993,21 @@ func (c *HTTPCaller) EstimatedRewards(ctx context.Context, addr string, blockHei
 		if perr == nil {
 			return entries, nil
 		}
-		if errors.Is(perr, errNoClaimableRewards) {
-			return nil, nil
-		}
-		var limit int
-		switch {
-		case errors.Is(perr, errRetryPruned):
-			limit = maxPrunedRetries
-		case errors.Is(perr, errRetryTransient):
-			limit = maxTransientRetries
-		default:
+		// Chain authoritatively said "no rewards for this provider at
+		// this block". Not an error — return empty entries so the
+		// caller counts this as a successful-but-empty fetch, not a
+		// failure to fetch. The wrapped message is logged at the
+		// caller if the operator wants to see it.
+		if errors.Is(perr, errNoRewards) {
 			return nil, perr
 		}
-		if attempt+1 >= limit {
+		// errRetryPruned retries up to maxPrunedRetries; anything else
+		// from ParseEstimatedRewards (shouldn't happen with the current
+		// classifier) is terminal.
+		if !errors.Is(perr, errRetryPruned) {
+			return nil, perr
+		}
+		if attempt+1 >= maxPrunedRetries {
 			return nil, fmt.Errorf("provider %s: %w (attempts=%d)", addr, perr, attempt+1)
 		}
 		if !backoffSleep(ctx, attempt) {

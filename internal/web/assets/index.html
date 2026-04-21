@@ -1360,18 +1360,27 @@
     const failedDates = new Set(failed.map(f => f.date));
 
     // Timeline dots: one per expected date, classified by status.
+    // Tooltip includes the pinned block height when known (covered /
+    // failed dates), so operators can cross-reference the snapshot
+    // row directly against the chain.
     card.timeline.innerHTML = '';
+    const blocks = s.blocks || {};
     for (const d of expected) {
       let cls = 'snap-dot';
       if (covered.has(d)) cls += ' covered';
       else if (failedDates.has(d)) cls += ' failed';
       else cls += ' missing';
-      const dot = el('span', { class: cls, title: d });
+      const titleParts = [d];
+      if (blocks[d]) titleParts.push(`block ${fmt(blocks[d])}`);
+      const dot = el('span', { class: cls, title: titleParts.join(' · ') });
       dot.addEventListener('mousemove', (e) => {
         const status = covered.has(d) ? 'covered'
                      : failedDates.has(d) ? 'failed'
                      : 'missing';
-        showTooltip(e, `<b>${d}</b><br><span style="color:#6b7a99">${status}</span>`);
+        const blockLine = blocks[d]
+          ? `<br><span style="color:#6b7a99">block ${fmt(blocks[d])}</span>`
+          : '';
+        showTooltip(e, `<b>${d}</b>${blockLine}<br><span style="color:#6b7a99">${status}</span>`);
       });
       dot.addEventListener('mouseleave', hideTooltip);
       card.timeline.appendChild(dot);

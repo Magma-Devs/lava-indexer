@@ -146,19 +146,21 @@ func TestParseEstimatedRewards_NoClaimableRewards(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !errors.Is(err, errNoClaimableRewards) {
-		t.Fatalf("got %v, want errNoClaimableRewards", err)
+	if !errors.Is(err, errNoRewards) {
+		t.Fatalf("got %v, want errNoRewards", err)
 	}
 }
 
 func TestParseEstimatedRewards_OpaqueSuccessFalse(t *testing.T) {
+	// Any success:false that isn't an explicit replica/version issue is
+	// chain-authoritative "no rewards for this (provider, block) pair".
 	body := []byte(`{"success": false, "message": "something else broke"}`)
 	_, err := ParseEstimatedRewards(body)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !errors.Is(err, errRetryTransient) {
-		t.Fatalf("got %v, want errRetryTransient", err)
+	if !errors.Is(err, errNoRewards) {
+		t.Fatalf("got %v, want errNoRewards", err)
 	}
 }
 
@@ -209,8 +211,8 @@ func TestClassifyChainMessage(t *testing.T) {
 		{"upstream_error: version does not exist", errRetryPruned, "version does not exist"},
 		{"version mismatch: 1 vs 2", errRetryPruned, "version mismatch"},
 		{"no commit info found for height 5", errRetryPruned, "no commit info"},
-		{"cannot get claimable rewards after distribution", errNoClaimableRewards, ""},
-		{"some_other_failure", errRetryTransient, "some_other_failure"},
+		{"cannot get claimable rewards after distribution", errNoRewards, ""},
+		{"some_other_failure", errNoRewards, "some_other_failure"},
 	}
 	for _, tc := range tests {
 		err := classifyChainMessage(tc.msg)

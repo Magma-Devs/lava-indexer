@@ -688,6 +688,7 @@ type SnapshotterStatus struct {
 	Covered   []string                `json:"covered"`
 	Missing   []string                `json:"missing"`
 	Failed    []SnapshotterFailedDate `json:"failed"`
+	Blocks    map[string]int64        `json:"blocks,omitempty"`
 	LastRunAt *time.Time              `json:"last_run_at,omitempty"`
 	NextRunAt *time.Time              `json:"next_run_at,omitempty"`
 }
@@ -777,6 +778,7 @@ func (s *Server) snapshotterStatus(ctx context.Context, sn snapshotters.Snapshot
 	st.Expected = cov.Expected
 	st.Covered = cov.Covered
 	st.Missing = cov.Missing
+	st.Blocks = cov.Blocks
 	for _, fd := range cov.Failed {
 		st.Failed = append(st.Failed, SnapshotterFailedDate{Date: fd.Date, Error: fd.Error})
 	}

@@ -2,6 +2,7 @@ package provider_rewards
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -35,8 +36,9 @@ func TestHTTPCaller_EstimatedRewards_Success(t *testing.T) {
 }
 
 // TestHTTPCaller_EstimatedRewards_NoClaimable: the application-level
-// "no claimable rewards" response is converted into empty entries, NOT
-// an error.
+// "no claimable rewards" response surfaces as a typed errNoRewards
+// error so the caller (fetchAll) can classify the outcome as
+// no-rewards-for-this-provider, separate from a real fetch failure.
 func TestHTTPCaller_EstimatedRewards_NoClaimable(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/10000000000ulava",
@@ -48,8 +50,8 @@ func TestHTTPCaller_EstimatedRewards_NoClaimable(t *testing.T) {
 
 	c := NewHTTPCaller(srv.URL, nil)
 	entries, err := c.EstimatedRewards(context.Background(), "lava@addr", 1)
-	if err != nil {
-		t.Fatalf("expected nil error for no-claimable, got %v", err)
+	if !errors.Is(err, errNoRewards) {
+		t.Fatalf("expected errNoRewards, got %v", err)
 	}
 	if len(entries) != 0 {
 		t.Fatalf("entries len = %d, want 0", len(entries))
