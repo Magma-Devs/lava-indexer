@@ -458,7 +458,7 @@ Env overrides: `SNAPSHOTTERS_HANDLERS` (comma-separated — `all` /
    implements `snapshotters.Snapshotter`.
 2. Add a `cfg.Snapshotters.YourSnap` section to `internal/config/config.go`
    with whatever schedule/target knobs you need — **no** `enabled` flag;
-   selection is done via `snapshotters.list` to match the handler pattern.
+   selection is done via `snapshotters.handlers` to match the handler pattern.
 3. Register it unconditionally in `cmd/indexer/main.go` via the
    `registerSnapshotter` helper — it consults `cfg.Snapshotters.WantsSnapshotter`
    and skips anything not in the list.

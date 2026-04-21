@@ -61,7 +61,7 @@ func (s Snapshotters) WantsSnapshotter(name string) bool {
 
 // ProviderRewardsSnapshotter configures the provider_rewards
 // snapshotter (see internal/snapshotters/provider_rewards). Gated by
-// Snapshotters.List — absent from the list means the section is
+// Snapshotters.Handlers — absent from the list means the section is
 // ignored entirely.
 type ProviderRewardsSnapshotter struct {
 	// EarliestDate is the first monthly-17th we attempt to snapshot.
@@ -532,7 +532,7 @@ func (c *Config) validate() error {
 		c.Database.Schema = "app"
 	}
 	// Snapshotters: validate provider_rewards earliest_date when it's
-	// selected via snapshotters.list. Fail fast here so a typo surfaces
+	// selected via snapshotters.handlers. Fail fast here so a typo surfaces
 	// at startup rather than on the first scheduled tick ~10 minutes
 	// in. Snapshotters not in the list are skipped — we don't force
 	// operators to keep fields valid for something they haven't turned

@@ -59,6 +59,16 @@ func (r *Registry) NextRunAt() time.Time {
 	return r.nextRunAt
 }
 
+// LastTickErr returns the last error seen during snapshot execution on
+// the most recent tick, or nil if the last tick was clean. Useful for
+// surfacing a top-level banner on the dashboard without walking the
+// per-snapshotter status.
+func (r *Registry) LastTickErr() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lastTickErr
+}
+
 // RunLoop runs each registered snapshotter's BlocksDue + Snapshot on
 // interval (default 10m). It runs once immediately on startup — that's
 // the backfill path, so a fresh deploy catches up without waiting a
@@ -150,12 +160,17 @@ func (r *Registry) runOne(ctx context.Context, pool *pgxpool.Pool, s Snapshotter
 		// Small jittered sleep between targets so fresh-deploy catch-ups
 		// don't burst the chain RPC. Skip on the first target so a
 		// steady-state single-snapshot-per-tick call doesn't pay latency.
+		// time.NewTimer + Stop (not time.After) so a ctx-done cancel
+		// doesn't leak a running timer — `time.After` runs its channel
+		// to expiry even after the select picked ctx.Done.
 		if i > 0 {
 			jitter := time.Duration(rand.Int63n(int64(2 * time.Second)))
+			tmr := time.NewTimer(500*time.Millisecond + jitter)
 			select {
 			case <-ctx.Done():
+				tmr.Stop()
 				return
-			case <-time.After(500*time.Millisecond + jitter):
+			case <-tmr.C:
 			}
 		}
 

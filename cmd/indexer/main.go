@@ -217,7 +217,7 @@ func main() {
 	// Register snapshotters. Snapshotters are the periodic, calendar-
 	// driven ingestion seam (parallel to events.Handler for event-
 	// driven). Selection mirrors the handler pattern:
-	// cfg.Snapshotters.List selects a subset; "all" (or empty) means
+	// cfg.Snapshotters.Handlers selects a subset; "all" (or empty) means
 	// every one. Snapshotters not selected are never constructed —
 	// no DDL, no goroutine, nothing in /api/snapshotters.
 	snapReg := snapshotters.NewRegistry()

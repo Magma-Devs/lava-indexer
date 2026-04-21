@@ -29,11 +29,11 @@ import (
 //
 // Lifecycle per registry tick:
 //
-//   1. BlocksDue returns the still-needed snapshot targets (usually bounded
-//      to what the calendar has already produced and the DB hasn't covered).
-//   2. For each target the registry calls Snapshot, which does its own
-//      HTTP fan-out (outside any tx) and opens short transactions for
-//      the DB writes. Failures are logged and the next target still runs.
+//  1. BlocksDue returns the still-needed snapshot targets (usually bounded
+//     to what the calendar has already produced and the DB hasn't covered).
+//  2. For each target the registry calls Snapshot, which does its own
+//     HTTP fan-out (outside any tx) and opens short transactions for
+//     the DB writes. Failures are logged and the next target still runs.
 //
 // Why the snapshotter owns the tx boundary instead of the registry:
 // a snapshot's chain fan-out can take several minutes (200+ providers,
@@ -99,6 +99,14 @@ type Status struct {
 type FailedDate struct {
 	Date  string
 	Error string
+}
+
+// URLSurface is an optional capability a snapshotter can implement to
+// publish its upstream REST URL on the dashboard. Kept off the main
+// Snapshotter interface because not every snapshotter will have a URL
+// worth surfacing — a local-state snapshotter, for instance.
+type URLSurface interface {
+	RESTURL() string
 }
 
 // SnapshotTarget is one (logical date, chain block, chain time) tuple

@@ -719,6 +719,28 @@ func (s *Server) handleSnapshotters(w http.ResponseWriter, r *http.Request) {
 	_ = enc.Encode(out)
 }
 
+// redactURLUserinfo masks any basic-auth credentials embedded in a
+// URL before it's surfaced on /api/snapshotters or /api/status.
+// /api/snapshotters has no authentication in front of it; operators
+// who accidentally embed `user:secret@host` in a private-gateway URL
+// should see `user:***@host` on the dashboard, not the raw secret.
+func redactURLUserinfo(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.User == nil {
+		return raw
+	}
+	if _, hasPw := u.User.Password(); hasPw {
+		u.User = url.UserPassword(u.User.Username(), "***")
+	}
+	return u.String()
+}
+
 // snapshotterStatus builds one entry of the /api/snapshotters response.
 // Iterates snapshotters generically — expected/covered/missing/failed
 // come from Snapshotter.Status, the optional RESTURL() interface
@@ -734,12 +756,14 @@ func (s *Server) snapshotterStatus(ctx context.Context, sn snapshotters.Snapshot
 		t := nr
 		st.NextRunAt = &t
 	}
-	// URL-publishing seam: a snapshotter that wants its REST endpoint
-	// surfaced on the dashboard exposes it via RESTURL(). Kept as a
-	// local interface (not part of snapshotters.Snapshotter) so the
-	// core interface stays focused on DDL + schedule + snapshot.
-	if u, ok := sn.(interface{ RESTURL() string }); ok {
-		st.RESTURL = u.RESTURL()
+	// URL-publishing seam: snapshotters.URLSurface is an optional
+	// capability exported by the snapshotters package. Kept off the
+	// base Snapshotter interface so the core stays focused on
+	// DDL + schedule + snapshot, but declared as a named type so the
+	// seam has a compile-time anchor (renames break the build, not
+	// silently the UI).
+	if u, ok := sn.(snapshotters.URLSurface); ok {
+		st.RESTURL = redactURLUserinfo(u.RESTURL())
 	}
 	// Coverage view: every Snapshotter implements Status so the web
 	// layer stays generic (no concrete imports, no type-switches on

@@ -27,8 +27,8 @@ type fakeSnap struct {
 	onRun func()
 }
 
-func (f *fakeSnap) Name() string     { return f.name }
-func (f *fakeSnap) DDL() []string    { return nil }
+func (f *fakeSnap) Name() string  { return f.name }
+func (f *fakeSnap) DDL() []string { return nil }
 
 func (f *fakeSnap) BlocksDue(_ context.Context, _ *pgxpool.Pool) ([]SnapshotTarget, error) {
 	f.dueCalls.Add(1)

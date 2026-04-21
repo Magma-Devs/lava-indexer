@@ -11,6 +11,7 @@
 package provider_rewards
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,8 @@ import (
 	"math/big"
 	"math/rand"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -124,12 +127,12 @@ func (h *Handler) RESTURL() string { return h.cfg.RESTURL }
 // `lava_relay_payment` fails at startup because the FK targets don't
 // exist. Idempotent by design.
 //
-// - providers / chains — dict tables; shared with lava_relay_payment.
-// - provider_rewards_snapshots is one row per (date, block) — the
-//   snapshotter's "coverage table". Unique on snapshot_date so a retry
-//   of the same date safely upserts.
-// - provider_rewards is the fact table; the composite PK ensures a
-//   single (provider, spec, source, denom) tuple per block.
+//   - providers / chains — dict tables; shared with lava_relay_payment.
+//   - provider_rewards_snapshots is one row per (date, block) — the
+//     snapshotter's "coverage table". Unique on snapshot_date so a retry
+//     of the same date safely upserts.
+//   - provider_rewards is the fact table; the composite PK ensures a
+//     single (provider, spec, source, denom) tuple per block.
 func (h *Handler) DDL() []string {
 	return []string{
 		h.providers.DDL(),
@@ -221,10 +224,14 @@ func (h *Handler) BlocksDue(ctx context.Context, pool *pgxpool.Pool) ([]snapshot
 	return targets, nil
 }
 
+// coveredDates returns the set of snapshot dates already recorded as
+// ok OR failed. Failed dates are treated as covered so BlocksDue
+// doesn't re-retry them forever — operators who want to retry a
+// failed date delete the row manually and the next tick picks it up.
 func (h *Handler) coveredDates(ctx context.Context, pool *pgxpool.Pool) (map[string]struct{}, error) {
 	rows, err := pool.Query(ctx, fmt.Sprintf(`
 		SELECT snapshot_date FROM %s.provider_rewards_snapshots
-		WHERE status = 'ok'`, h.cfg.Schema))
+		WHERE status IN ('ok', 'failed')`, h.cfg.Schema))
 	if err != nil {
 		return nil, err
 	}
@@ -359,16 +366,32 @@ func ExpectedDates(earliest, now time.Time) []time.Time {
 	}
 }
 
+// minSuccessFraction is the lower bound on per-provider success rate
+// for a snapshot to be persisted as status='ok'. Below this, the
+// snapshot is considered degraded and persisted as status='failed'
+// with the error message — the date won't re-snapshot (Status()
+// renders it as failed; BlocksDue excludes status='ok' dates only).
+//
+// Chosen at 0.8 because Lava's public LB consistently 501s on ~1–5%
+// of queries even after retries, so a threshold of 1.0 means no date
+// ever completes on early-2025 blocks where the chain's
+// EstimatedProviderRewards handler was only partially deployed across
+// archive replicas.
+const minSuccessFraction = 0.8
+
 // Snapshot runs one full snapshot for `target`. The HTTP fan-out
 // happens OUTSIDE any transaction — critical because a snapshot can
 // take several minutes at 25-way concurrency × 10 retries. We then
 // open two short transactions: one to resolve dict IDs (providers +
 // chains), one to write the snapshot row + fact rows.
 //
-// If any provider's chain call exhausts retries, Snapshot returns an
-// error without writing anything — next tick re-tries the date from
-// scratch, giving a consistent view at the cost of repeating some
-// chain reads. "Partial" mode is deliberately not implemented.
+// Per-provider failures are tolerated up to (1 - minSuccessFraction)
+// of the provider set. Above that threshold the snapshot row is
+// persisted with status='failed' so BlocksDue doesn't re-retry
+// indefinitely, and the UI surfaces the partial-coverage state.
+// Below the threshold (i.e. most providers succeeded), the snapshot
+// is persisted as 'ok' with only the successful providers' rows and
+// a log line listing the failed providers for operator investigation.
 func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snapshotters.SnapshotTarget) error {
 	// 1. Enumerate known providers (pool query, no tx — a one-shot read
 	// doesn't need tx isolation). We use the committed app.providers set
@@ -388,11 +411,47 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 	}
 
 	// 2. Fetch estimated rewards for every provider in a concurrency-
-	// bounded errgroup — OUTSIDE any tx. First error cancels siblings
-	// so a doomed snapshot doesn't keep 24 more HTTP loops running.
+	// bounded errgroup — OUTSIDE any tx. Per-provider errors are
+	// tolerated; only ctx cancellation aborts the fan-out.
 	results, err := h.fetchAll(ctx, providers, target.BlockHeight)
 	if err != nil {
 		return fmt.Errorf("fetch rewards: %w", err)
+	}
+
+	// 2a. Partition by success/failure and decide whether to persist.
+	successCount := 0
+	var failedProviders []string
+	var firstErr error
+	for _, r := range results {
+		if r.err != nil {
+			failedProviders = append(failedProviders, r.provider)
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			continue
+		}
+		successCount++
+	}
+	fraction := float64(successCount) / float64(len(providers))
+	if len(failedProviders) > 0 {
+		slog.Warn("snapshot had per-provider failures",
+			"snapshotter", Name,
+			"date", target.SnapshotDate.UTC().Format("2006-01-02"),
+			"block", target.BlockHeight,
+			"failed", len(failedProviders),
+			"ok", successCount,
+			"fraction", fmt.Sprintf("%.3f", fraction),
+			"first_err", firstErr)
+	}
+	if fraction < minSuccessFraction {
+		// Too many providers failed. Persist a failed-status row so
+		// BlocksDue won't keep retrying this date forever, and so the
+		// UI surfaces the situation to operators. Short tx.
+		errMsg := fmt.Sprintf("%.1f%% providers failed (%d/%d): %v",
+			(1-fraction)*100, len(failedProviders), len(providers), firstErr)
+		return pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+			return h.insertSnapshotRow(ctx, tx, target, successCount, "failed", errMsg)
+		})
 	}
 
 	// 3. Resolve provider + spec IDs in their own short tx. Dict caches
@@ -400,10 +459,13 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 	// final write tx — a rollback in step 4 leaves the dict rows in
 	// place, which is harmless (the composite PK on provider_rewards
 	// prevents dup-inserting fact rows, and dict rows are idempotent by
-	// design).
+	// design). Skip providers that failed — nothing to map for them.
 	provSet := make(map[string]struct{})
 	specSet := make(map[string]struct{})
 	for _, r := range results {
+		if r.err != nil {
+			continue
+		}
 		provSet[r.provider] = struct{}{}
 		for _, entry := range r.entries {
 			specSet[entry.Spec] = struct{}{}
@@ -454,6 +516,9 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 	rows := make([][]any, 0, 256)
 	provWithRewards := 0
 	for _, r := range results {
+		if r.err != nil {
+			continue
+		}
 		if len(r.entries) > 0 {
 			provWithRewards++
 		}
@@ -556,19 +621,26 @@ func (h *Handler) insertSnapshotRow(ctx context.Context, tx pgx.Tx, target snaps
 	return err
 }
 
-// fetchResult bundles one provider's parsed chain response.
+// fetchResult bundles one provider's parsed chain response, or the
+// error that prevented fetching. Exactly one of entries/err is
+// meaningful (err == nil → entries valid; err != nil → entries empty).
 type fetchResult struct {
 	provider string
 	entries  []RewardEntry
+	err      error
 }
 
+// fetchAll returns one entry per provider in the same order. Successful
+// calls set entries (possibly empty — "no accrued rewards" is a valid
+// response). Failed calls set err. A single ctx cancellation (e.g.
+// shutdown) terminates the whole fan-out and returns ctx.Err().
+//
+// Per-provider errors DO NOT cancel siblings — unlike first-error-wins,
+// the real Lava LB returns 501 / empty-body for a consistent ~1–5% of
+// queries regardless of retries, and aborting the whole snapshot on
+// one bad provider means no date ever completes. The caller decides
+// whether enough providers succeeded to persist the snapshot.
 func (h *Handler) fetchAll(ctx context.Context, providers []string, blockHeight int64) ([]fetchResult, error) {
-	// errgroup.WithContext gives us first-error-cancels-siblings semantics:
-	// when any worker's EstimatedRewards call fails, the derived ctx is
-	// cancelled and the other 24 in-flight HTTP loops bail out of their
-	// retry sleeps + active requests promptly, instead of running the
-	// remaining ~2000 retries for a snapshot that's already going to
-	// roll back.
 	g, gctx := errgroup.WithContext(ctx)
 	workers := h.cfg.Concurrency
 	if workers <= 0 {
@@ -579,16 +651,22 @@ func (h *Handler) fetchAll(ctx context.Context, providers []string, blockHeight 
 	out := make([]fetchResult, len(providers))
 	for i, addr := range providers {
 		g.Go(func() error {
-			entries, err := h.caller.EstimatedRewards(gctx, addr, blockHeight)
-			if err != nil {
-				return fmt.Errorf("provider %s: %w", addr, err)
+			// ctx from errgroup is cancelled only on g.Wait's real
+			// ctx cancellation — we never return a non-nil error
+			// from these closures, so siblings run to completion.
+			if gctx.Err() != nil {
+				return nil
 			}
-			out[i] = fetchResult{provider: addr, entries: entries}
+			entries, err := h.caller.EstimatedRewards(gctx, addr, blockHeight)
+			out[i] = fetchResult{provider: addr, entries: entries, err: err}
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return nil, err
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 	return out, nil
 }
@@ -674,9 +752,17 @@ func parseSource(s string) (SourceKind, string) {
 // application-level failure mode (pruning replica, no accrued rewards,
 // opaque upstream failure). Exported for tests.
 func ParseEstimatedRewards(body []byte) ([]RewardEntry, error) {
+	// Empty body with 200 OK — gateway hiccup. Observed in the wild
+	// on Lava's public REST LB; treat as pruned-retry so the fresh
+	// connection / replica rotation has a shot.
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, fmt.Errorf("%w: empty body", errRetryPruned)
+	}
 	var r estimatedRewardsResp
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
+		// Truncated / malformed JSON is almost always a gateway issue.
+		// Classify as pruned-retry so a fresh connection has a chance.
+		return nil, fmt.Errorf("%w: decode: %v", errRetryPruned, err)
 	}
 	if r.Success != nil && !*r.Success {
 		return nil, classifyChainMessage(r.Message)
@@ -833,7 +919,11 @@ func NewHTTPCaller(baseURL string, headers map[string]string) *HTTPCaller {
 // EstimatedProviderRewards handler isn't always registered on every
 // replica — a fresh connection usually hits a working one.
 func (c *HTTPCaller) EstimatedRewards(ctx context.Context, addr string, blockHeight int64) ([]RewardEntry, error) {
-	path := fmt.Sprintf("/lavanet/lava/pairing/estimated_provider_rewards/%s/1ulava", addr)
+	// url.PathEscape defends against any bech32 weirdness sneaking into
+	// the addr segment. Cosmos addresses don't contain path-special
+	// characters in practice, but escaping eliminates the injection
+	// class outright.
+	path := "/lavanet/lava/pairing/estimated_provider_rewards/" + url.PathEscape(addr) + "/1ulava"
 	for attempt := 0; ; attempt++ {
 		body, err := c.doGET(ctx, path, blockHeight)
 		if err != nil {
@@ -915,12 +1005,9 @@ func (c *HTTPCaller) Tip(ctx context.Context) (int64, error) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return 0, fmt.Errorf("decode latest: %w", err)
 	}
-	var h int64
-	for _, r := range resp.Block.Header.Height {
-		if r < '0' || r > '9' {
-			return 0, fmt.Errorf("non-numeric tip height %q", resp.Block.Header.Height)
-		}
-		h = h*10 + int64(r-'0')
+	h, err := strconv.ParseInt(resp.Block.Header.Height, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse tip height %q: %w", resp.Block.Header.Height, err)
 	}
 	return h, nil
 }
@@ -947,7 +1034,7 @@ func (c *HTTPCaller) doGET(ctx context.Context, path string, blockHeight int64) 
 		req.Header.Set(k, v)
 	}
 	if blockHeight > 0 {
-		req.Header.Set("x-cosmos-block-height", fmt.Sprintf("%d", blockHeight))
+		req.Header.Set("x-cosmos-block-height", strconv.FormatInt(blockHeight, 10))
 	}
 	req.Header.Set("accept", "application/json")
 	resp, err := c.http.Do(req)
@@ -976,7 +1063,11 @@ func (e *httpStatusErr) Error() string {
 	return fmt.Sprintf("GET %s: http %d", e.path, e.code)
 }
 
-// backoffSleep sleeps 250ms × 2^attempt with ±50% jitter, capped at 10s.
+// backoffSleep sleeps a random duration in [0, 250ms × 2^attempt]
+// (capped at 10s) — AWS-style full jitter. Full jitter (not ±50%) is
+// critical when 25 concurrent workers all hit the same pruned replica:
+// narrow jitter bands clump their retries back onto the upstream in
+// the same ~125ms window, defeating the load-balancing purpose.
 // Returns false if ctx was cancelled during the sleep.
 func backoffSleep(ctx context.Context, attempt int) bool {
 	base := 250 * time.Millisecond
@@ -984,8 +1075,7 @@ func backoffSleep(ctx context.Context, attempt int) bool {
 	if d > 10*time.Second {
 		d = 10 * time.Second
 	}
-	jitter := time.Duration(rand.Int63n(int64(d)/2 + 1))
-	d = d/2 + jitter
+	d = time.Duration(rand.Int63n(int64(d) + 1))
 	select {
 	case <-ctx.Done():
 		return false
