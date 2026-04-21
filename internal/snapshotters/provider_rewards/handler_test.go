@@ -170,14 +170,57 @@ func TestParseEstimatedRewards_OpaqueSuccessFalse(t *testing.T) {
 }
 
 func TestParseEstimatedRewards_EmptyInfoArray(t *testing.T) {
-	// 200 OK with empty info — legitimate "no rewards accrued" response.
-	body := []byte(`{"info": []}`)
+	// 200 OK with empty info AND empty total — legitimate "no rewards"
+	// response.
+	body := []byte(`{"info": [], "total": []}`)
 	entries, err := ParseEstimatedRewards(body)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(entries) != 0 {
 		t.Fatalf("entries = %d, want 0", len(entries))
+	}
+}
+
+func TestParseEstimatedRewards_TotalFallback(t *testing.T) {
+	// Chain's observed shape in production: info is empty but total
+	// carries the aggregate reward. We synthesise one entry with
+	// SourceTotal + spec="" so the amount isn't silently dropped.
+	body := []byte(`{"info":[], "total":[{"denom":"ulava","amount":"18124981.000000000000000000"}], "recommended_block":"4895282"}`)
+	entries, err := ParseEstimatedRewards(body)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].SourceKind != SourceTotal {
+		t.Fatalf("source = %d, want SourceTotal (%d)", entries[0].SourceKind, SourceTotal)
+	}
+	if entries[0].Spec != "" {
+		t.Fatalf("spec = %q, want empty", entries[0].Spec)
+	}
+	if len(entries[0].Amounts) != 1 {
+		t.Fatalf("amounts = %d, want 1", len(entries[0].Amounts))
+	}
+	if entries[0].Amounts[0].Denom != "ulava" || entries[0].Amounts[0].Amount != "18124981" {
+		t.Fatalf("amount = %+v, want ulava/18124981", entries[0].Amounts[0])
+	}
+}
+
+func TestParseEstimatedRewards_InfoPreferredOverTotal(t *testing.T) {
+	// When both info and total are populated, info wins — it's the
+	// authoritative breakdown; total is redundant.
+	body := []byte(`{"info":[{"source":"Boost: ETH1","amount":[{"denom":"ulava","amount":"100"}]}], "total":[{"denom":"ulava","amount":"999"}]}`)
+	entries, err := ParseEstimatedRewards(body)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].SourceKind != SourceBoost {
+		t.Fatalf("wanted info-sourced entry (Boost), got SourceKind=%d", entries[0].SourceKind)
 	}
 }
 

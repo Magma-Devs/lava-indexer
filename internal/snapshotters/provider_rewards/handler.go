@@ -48,6 +48,14 @@ const (
 	SourceBoost        SourceKind = 0
 	SourcePools        SourceKind = 1
 	SourceSubscription SourceKind = 2
+	// SourceTotal is the aggregate row synthesised from the chain's
+	// `total[]` field when `info[]` comes back empty. Observed shape:
+	// {"info":[], "total":[{"denom":"ulava","amount":"…"}]} — the
+	// chain returns no source-breakdown for the simulated-delegation
+	// query we send but still reports an aggregate reward figure.
+	// Stored with spec="" (no breakdown available) so downstream
+	// consumers can differentiate from source-attributed rows.
+	SourceTotal SourceKind = 3
 )
 
 // Config is the subset of cfg.Snapshotters.ProviderRewards this package
@@ -767,13 +775,18 @@ type RewardAmount struct {
 }
 
 // estimatedRewardsResp mirrors the chain's JSON shape so decoding stays
-// declarative. On success the `info` array is populated; on the
-// application-level error path the `success` flag is false and the
-// `message` field carries the reason.
+// declarative. Most observed responses populate `total[]` (aggregate
+// reward for the simulated delegation) with `info[]` empty; the spec
+// originally assumed `info[]` would carry the source breakdown but in
+// practice the chain only populates it for specific query shapes. We
+// parse both and prefer `info[]` when present, falling back to a
+// single synthesised entry from `total[]` so the snapshot captures
+// the reward amount rather than silently dropping it.
 type estimatedRewardsResp struct {
-	Info    []rawInfo `json:"info"`
-	Success *bool     `json:"success,omitempty"`
-	Message string    `json:"message,omitempty"`
+	Info    []rawInfo       `json:"info"`
+	Total   []rawCoinAmount `json:"total"`
+	Success *bool           `json:"success,omitempty"`
+	Message string          `json:"message,omitempty"`
 }
 
 type rawInfo struct {
@@ -828,25 +841,45 @@ func ParseEstimatedRewards(body []byte) ([]RewardEntry, error) {
 	if r.Success != nil && !*r.Success {
 		return nil, classifyChainMessage(r.Message)
 	}
-	entries := make([]RewardEntry, 0, len(r.Info))
-	for _, raw := range r.Info {
-		kind, spec := parseSource(raw.Source)
-		amounts := make([]RewardAmount, 0, len(raw.Amount))
-		for _, a := range raw.Amount {
-			// The chain returns amount as a decimal string like
-			// "30737293.000000000000000000". Strip the fractional zeros
-			// so we can fit it into a NUMERIC(40, 0) — every entry we've
-			// observed has all-zero fractional part (it's a base-unit
-			// integer dressed in fixed-decimal notation).
-			cleaned, ok := cleanIntegerString(a.Amount)
-			if !ok {
-				return nil, fmt.Errorf("non-integer amount %q (spec=%s denom=%s)", a.Amount, spec, a.Denom)
+	if len(r.Info) > 0 {
+		entries := make([]RewardEntry, 0, len(r.Info))
+		for _, raw := range r.Info {
+			kind, spec := parseSource(raw.Source)
+			amounts, err := parseAmounts(raw.Amount, spec)
+			if err != nil {
+				return nil, err
 			}
-			amounts = append(amounts, RewardAmount{Denom: a.Denom, Amount: cleaned})
+			entries = append(entries, RewardEntry{SourceKind: kind, Spec: spec, Amounts: amounts})
 		}
-		entries = append(entries, RewardEntry{SourceKind: kind, Spec: spec, Amounts: amounts})
+		return entries, nil
 	}
-	return entries, nil
+	// info[] empty — fall back to total[] if present. A single entry
+	// with SourceTotal captures the aggregate so downstream consumers
+	// at least know the per-provider reward figure, even without the
+	// source breakdown the chain withheld for this query shape.
+	if len(r.Total) > 0 {
+		amounts, err := parseAmounts(r.Total, "")
+		if err != nil {
+			return nil, err
+		}
+		return []RewardEntry{{SourceKind: SourceTotal, Spec: "", Amounts: amounts}}, nil
+	}
+	return nil, nil
+}
+
+// parseAmounts cleans the chain's decimal-string amounts down to
+// base-unit integers. Extracted so both info[]- and total[]-shaped
+// responses reuse the same logic.
+func parseAmounts(raw []rawCoinAmount, spec string) ([]RewardAmount, error) {
+	out := make([]RewardAmount, 0, len(raw))
+	for _, a := range raw {
+		cleaned, ok := cleanIntegerString(a.Amount)
+		if !ok {
+			return nil, fmt.Errorf("non-integer amount %q (spec=%s denom=%s)", a.Amount, spec, a.Denom)
+		}
+		out = append(out, RewardAmount{Denom: a.Denom, Amount: cleaned})
+	}
+	return out, nil
 }
 
 // cleanIntegerString accepts either a plain integer string or a decimal
