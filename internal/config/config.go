@@ -542,13 +542,12 @@ func (c *Config) validate() error {
 		if ed == "" {
 			return fmt.Errorf("snapshotters.provider_rewards.earliest_date is required when enabled")
 		}
-		t, err := time.Parse("2006-01-02", ed)
-		if err != nil {
+		if _, err := time.Parse("2006-01-02", ed); err != nil {
 			return fmt.Errorf("snapshotters.provider_rewards.earliest_date: %w", err)
 		}
-		if t.Day() != 17 {
-			return fmt.Errorf("snapshotters.provider_rewards.earliest_date must be a 17th (got %s)", ed)
-		}
+		// Day-of-month is no longer constrained — the slot day derives
+		// from the chain's genesis timestamp (see provider_rewards
+		// ExpectedDates). earliest_date is just a floor.
 	}
 	return nil
 }

@@ -7,16 +7,20 @@ import (
 	"time"
 )
 
-func TestExpectedDates_StepsByMonthOn17th(t *testing.T) {
+func TestExpectedDates_GenesisAnchored(t *testing.T) {
+	// Lava mainnet's real genesis anchor.
+	genesis := time.Date(2024, 1, 17, 15, 0, 0, 0, time.UTC)
 	earliest := time.Date(2025, 1, 17, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2025, 4, 20, 16, 0, 0, 0, time.UTC)
-	got := ExpectedDates(earliest, now)
+	got := ExpectedDates(genesis, earliest, now)
 
+	// Slots = genesis + N months, preserving 15:00 UTC wall-clock.
+	// Filtered by earliest=2025-01-17 and now=2025-04-20 16:00.
 	want := []time.Time{
-		time.Date(2025, 1, 17, 0, 0, 0, 0, time.UTC),
-		time.Date(2025, 2, 17, 0, 0, 0, 0, time.UTC),
-		time.Date(2025, 3, 17, 0, 0, 0, 0, time.UTC),
-		time.Date(2025, 4, 17, 0, 0, 0, 0, time.UTC),
+		time.Date(2025, 1, 17, 15, 0, 0, 0, time.UTC),
+		time.Date(2025, 2, 17, 15, 0, 0, 0, time.UTC),
+		time.Date(2025, 3, 17, 15, 0, 0, 0, time.UTC),
+		time.Date(2025, 4, 17, 15, 0, 0, 0, time.UTC),
 	}
 	if len(got) != len(want) {
 		t.Fatalf("len(got)=%d, want %d (got=%v)", len(got), len(want), got)
@@ -29,13 +33,13 @@ func TestExpectedDates_StepsByMonthOn17th(t *testing.T) {
 }
 
 func TestExpectedDates_ExcludesFutureSlot(t *testing.T) {
+	genesis := time.Date(2024, 1, 17, 15, 0, 0, 0, time.UTC)
 	earliest := time.Date(2025, 1, 17, 0, 0, 0, 0, time.UTC)
-	// Right at the 17th but before 15:00 UTC — slot is in the future,
-	// must be excluded.
+	// Right at the 17th but before 15:00 UTC — March slot (15:00) is
+	// still in the future, must be excluded.
 	now := time.Date(2025, 3, 17, 14, 59, 59, 0, time.UTC)
-	got := ExpectedDates(earliest, now)
+	got := ExpectedDates(genesis, earliest, now)
 
-	// Expect only Jan and Feb; March hasn't hit 15:00 UTC yet.
 	if len(got) != 2 {
 		t.Fatalf("len=%d (%v), want 2", len(got), got)
 	}
@@ -44,18 +48,19 @@ func TestExpectedDates_ExcludesFutureSlot(t *testing.T) {
 	}
 }
 
-func TestExpectedDates_EarliestIsAlreadyNormalizedTo17th(t *testing.T) {
-	// Caller supplies an off-by-one date (e.g. 10th). ExpectedDates
-	// normalises to the 17th of that same month so operators can't
-	// accidentally shift the cadence.
-	earliest := time.Date(2025, 1, 10, 0, 0, 0, 0, time.UTC)
+func TestExpectedDates_EarliestAppliesAsFloor(t *testing.T) {
+	// Genesis gives us slots back to 2024-02-17, but earliest_date
+	// pushes the floor forward to 2025-01-17 — slots before it must
+	// be skipped.
+	genesis := time.Date(2024, 1, 17, 15, 0, 0, 0, time.UTC)
+	earliest := time.Date(2025, 1, 17, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2025, 2, 18, 0, 0, 0, 0, time.UTC)
-	got := ExpectedDates(earliest, now)
+	got := ExpectedDates(genesis, earliest, now)
 	if len(got) != 2 {
-		t.Fatalf("len=%d, want 2", len(got))
+		t.Fatalf("len=%d, want 2 (expected Jan + Feb 2025)", len(got))
 	}
-	if got[0].Day() != 17 || got[1].Day() != 17 {
-		t.Fatalf("dates not normalised to 17th: %v", got)
+	if got[0].Year() != 2025 || got[0].Month() != time.January {
+		t.Fatalf("first slot = %s, want 2025-01-17", got[0])
 	}
 }
 

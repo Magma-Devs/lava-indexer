@@ -236,6 +236,7 @@ func main() {
 		RESTURL:       resolveSnapshotterRESTURL(cfg),
 		RESTHeaders:   resolveSnapshotterRESTHeaders(cfg),
 		GenesisHeight: client.Genesis(),
+		GenesisTime:   client.GenesisTime(),
 	}))
 	// Apply snapshotter DDL, same one-tx-per-snapshotter pattern as
 	// event handlers. Each snapshotter owns its tables so a partial DDL

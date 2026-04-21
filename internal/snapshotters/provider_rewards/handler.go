@@ -54,12 +54,19 @@ const (
 // needs. Passed explicitly (rather than reaching into the global Config)
 // so the snapshotter is straightforward to test — see handler_test.go.
 type Config struct {
-	Schema        string
-	EarliestDate  time.Time
-	Concurrency   int
-	RESTURL       string            // base URL of the REST endpoint
-	RESTHeaders   map[string]string // extra headers (e.g. lava-extension: archive)
-	GenesisHeight int64             // hint for the binary-search lower bound
+	Schema       string
+	EarliestDate time.Time
+	Concurrency  int
+	RESTURL      string            // base URL of the REST endpoint
+	RESTHeaders  map[string]string // extra headers (e.g. lava-extension: archive)
+	// GenesisHeight is the hint for the BlocksDue binary-search lower bound.
+	GenesisHeight int64
+	// GenesisTime is the chain's genesis timestamp. Used as the anchor
+	// for monthly snapshot dates: slots are genesis+1mo, genesis+2mo,
+	// etc., preserving the genesis hour/minute/second. Lava mainnet's
+	// genesis at 2024-01-17T15:00:00Z produces the monthly-17th@15:00
+	// UTC cadence the operator expects.
+	GenesisTime time.Time
 }
 
 // New returns a Handler wired with a concrete RESTCaller. The RESTCaller
@@ -176,19 +183,20 @@ func (h *Handler) Warmup(ctx context.Context, pool *pgxpool.Pool) error {
 	return h.chains.Warmup(ctx, pool)
 }
 
-// BlocksDue computes the set of (date, block) targets that still need a
-// snapshot. The date set is every 17th of the month from EarliestDate
-// up to today, filtered to dates whose 15:00 UTC slot is strictly in the
-// past (we can't snapshot a future block). Dates already present in
-// provider_rewards_snapshots with status='ok' are subtracted.
+// BlocksDue computes the set of (slot, block) targets that still need
+// a snapshot. Slots are genesis-anchored monthly steps (see
+// ExpectedDates). Slots whose timestamp is strictly in the past are
+// eligible; future slots are skipped until the cadence catches up.
+// Dates already present in provider_rewards_snapshots with status='ok'
+// or 'failed' are subtracted.
 //
-// For each still-needed date we binary-search the chain for the block
-// whose timestamp is closest to {date}T15:00:00Z and cache the
-// (date → block) mapping so a rerun of BlocksDue doesn't pay the search
-// cost a second time.
+// For each still-needed slot we binary-search the chain for the block
+// whose timestamp is closest to the slot's wall-clock and cache the
+// (date → block) mapping so a rerun of BlocksDue doesn't pay the
+// search cost a second time.
 func (h *Handler) BlocksDue(ctx context.Context, pool *pgxpool.Pool) ([]snapshotters.SnapshotTarget, error) {
-	dates := ExpectedDates(h.cfg.EarliestDate, time.Now().UTC())
-	if len(dates) == 0 {
+	slots := ExpectedDates(h.cfg.GenesisTime, h.cfg.EarliestDate, time.Now().UTC())
+	if len(slots) == 0 {
 		return nil, nil
 	}
 
@@ -198,24 +206,24 @@ func (h *Handler) BlocksDue(ctx context.Context, pool *pgxpool.Pool) ([]snapshot
 		return nil, fmt.Errorf("query covered dates: %w", err)
 	}
 
-	targets := make([]snapshotters.SnapshotTarget, 0, len(dates))
-	for _, d := range dates {
-		if _, ok := covered[d.Format("2006-01-02")]; ok {
+	targets := make([]snapshotters.SnapshotTarget, 0, len(slots))
+	for _, slot := range slots {
+		if _, ok := covered[slot.Format("2006-01-02")]; ok {
 			continue
 		}
-		target, cached, err := h.blockForDate(ctx, d)
+		target, cached, err := h.blockForSlot(ctx, slot)
 		if err != nil {
-			// Non-fatal for a single date — the chain may be temporarily
+			// Non-fatal for a single slot — the chain may be temporarily
 			// unreachable. Log and keep going so one bad date doesn't
 			// starve the others.
-			slog.Warn("resolve block for snapshot date failed",
-				"snapshotter", Name, "date", d.Format("2006-01-02"), "err", err)
+			slog.Warn("resolve block for snapshot slot failed",
+				"snapshotter", Name, "date", slot.Format("2006-01-02"), "err", err)
 			continue
 		}
 		if !cached {
-			slog.Info("resolved block for snapshot date",
+			slog.Info("resolved block for snapshot slot",
 				"snapshotter", Name,
-				"date", d.Format("2006-01-02"),
+				"date", slot.Format("2006-01-02"),
 				"block", target.BlockHeight,
 				"block_time", target.BlockTime)
 		}
@@ -247,8 +255,11 @@ func (h *Handler) coveredDates(ctx context.Context, pool *pgxpool.Pool) (map[str
 	return out, rows.Err()
 }
 
-func (h *Handler) blockForDate(ctx context.Context, date time.Time) (snapshotters.SnapshotTarget, bool, error) {
-	key := date.Format("2006-01-02")
+func (h *Handler) blockForSlot(ctx context.Context, slot time.Time) (snapshotters.SnapshotTarget, bool, error) {
+	// Cache key = calendar date; the slot itself is deterministic from
+	// the genesis anchor (one slot per month) so a per-date key is
+	// sufficient and matches how the DB stores snapshot_date.
+	key := slot.Format("2006-01-02")
 	h.blockCache.Lock()
 	if h.blockCache.m == nil {
 		h.blockCache.m = make(map[string]cacheEntry)
@@ -257,13 +268,13 @@ func (h *Handler) blockForDate(ctx context.Context, date time.Time) (snapshotter
 		h.blockCache.Unlock()
 		return snapshotters.SnapshotTarget{
 			BlockHeight:  e.blockHeight,
-			SnapshotDate: date,
+			SnapshotDate: slot,
 			BlockTime:    e.blockTime,
 		}, true, nil
 	}
 	h.blockCache.Unlock()
 
-	target := time.Date(date.Year(), date.Month(), date.Day(), 15, 0, 0, 0, time.UTC)
+	target := slot.UTC()
 	low := h.cfg.GenesisHeight
 	if low < 1 {
 		low = 1
@@ -277,7 +288,7 @@ func (h *Handler) blockForDate(ctx context.Context, date time.Time) (snapshotter
 	h.blockCache.Unlock()
 	return snapshotters.SnapshotTarget{
 		BlockHeight:  blk,
-		SnapshotDate: date,
+		SnapshotDate: slot,
 		BlockTime:    blkTime,
 	}, false, nil
 }
@@ -318,7 +329,7 @@ func (h *Handler) Status(ctx context.Context, pool *pgxpool.Pool) (snapshotters.
 		return snapshotters.Status{}, err
 	}
 
-	expected := ExpectedDates(h.cfg.EarliestDate, time.Now().UTC())
+	expected := ExpectedDates(h.cfg.GenesisTime, h.cfg.EarliestDate, time.Now().UTC())
 	out := snapshotters.Status{
 		Expected: make([]string, 0, len(expected)),
 		Covered:  make([]string, 0, len(expected)),
@@ -351,37 +362,47 @@ func (h *Handler) Status(ctx context.Context, pool *pgxpool.Pool) (snapshotters.
 	return out, nil
 }
 
-// ExpectedDates returns every monthly-17th between earliest and now
-// (inclusive on earliest, exclusive on dates whose 15:00 UTC slot is in
-// the future). Exported for tests.
-func ExpectedDates(earliest, now time.Time) []time.Time {
-	earliest = time.Date(earliest.Year(), earliest.Month(), 17, 0, 0, 0, 0, time.UTC)
+// ExpectedDates returns the monthly snapshot slots anchored on the
+// chain's genesis timestamp. Slot N = genesis + N months, preserving
+// the genesis day-of-month and wall-clock time. Slots earlier than
+// earliestDate are filtered out (operator floor); slots in the future
+// (genesis+N > now) are not yet eligible.
+//
+// For Lava mainnet (genesis 2024-01-17T15:00:00Z) this produces
+// 2024-02-17T15:00:00Z, 2024-03-17T15:00:00Z, … — the same cadence
+// a hardcoded monthly-17th@15:00 would, but correct for any chain
+// without hardcoded magic numbers.
+//
+// Exported for tests and for the Status() path.
+func ExpectedDates(genesis, earliest, now time.Time) []time.Time {
+	if genesis.IsZero() {
+		return nil
+	}
+	g := genesis.UTC()
+	e := earliest.UTC()
 	var out []time.Time
-	cur := earliest
-	for {
-		slot := time.Date(cur.Year(), cur.Month(), 17, 15, 0, 0, 0, time.UTC)
+	for n := 1; ; n++ {
+		slot := g.AddDate(0, n, 0)
 		if slot.After(now) {
 			return out
 		}
-		out = append(out, time.Date(cur.Year(), cur.Month(), 17, 0, 0, 0, 0, time.UTC))
-		// Advance to the 17th of the next month. Using AddDate(0, 1, 0)
-		// on a day-17 date stays on day 17 across every month length
-		// (no Feb-29 / Feb-30 weirdness since 17 ≤ 28).
-		cur = cur.AddDate(0, 1, 0)
+		if slot.Before(e) {
+			continue
+		}
+		out = append(out, slot)
 	}
 }
 
-// minSuccessFraction is the lower bound on per-provider success rate
-// for a snapshot to be persisted as status='ok'. Below this, the
-// snapshot is considered degraded and persisted as status='failed'
-// with the error message — the date won't re-snapshot (Status()
-// renders it as failed; BlocksDue excludes status='ok' dates only).
+// minSuccessFraction is the upper bound on the fraction of providers
+// that returned a REAL fetch failure (not no-rewards, not state-
+// pruned) before we mark a snapshot as status='failed'. Defined
+// indirectly: if failed/total > (1 - minSuccessFraction), fail.
 //
-// Chosen at 0.8 because Lava's public LB consistently 501s on ~1–5%
-// of queries even after retries, so a threshold of 1.0 means no date
-// ever completes on early-2025 blocks where the chain's
-// EstimatedProviderRewards handler was only partially deployed across
-// archive replicas.
+// Chosen at 0.8 (so up to 20% real failures tolerated) because most
+// per-provider errors on historical dates are archive-state
+// unavailability (outcomeStatePruned) or chain-authoritative "not
+// staked" (outcomeNoRewards) — genuine 5xx / decode failures are
+// rare once those are removed from the failure count.
 const minSuccessFraction = 0.8
 
 // Snapshot runs one full snapshot for `target`. The HTTP fan-out
@@ -424,10 +445,9 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 	}
 
 	// 2a. Partition by outcome. Only real fetch failures count toward
-	// the threshold; "no rewards" responses are chain-authoritative
-	// answers (provider not staked at this height, delegation absent,
-	// etc.) and don't indicate a problem.
-	var fetched, noRewards, failed int
+	// the threshold; chain-authoritative "no rewards" and archive-
+	// state-pruned responses are accepted at face value.
+	var fetched, noRewards, statePruned, failed int
 	var firstFailReason error
 	for _, r := range results {
 		switch r.outcome {
@@ -435,6 +455,8 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 			fetched++
 		case outcomeNoRewards:
 			noRewards++
+		case outcomeStatePruned:
+			statePruned++
 		case outcomeFailed:
 			failed++
 			if firstFailReason == nil {
@@ -442,7 +464,6 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 			}
 		}
 	}
-	answered := fetched + noRewards // providers the chain gave a clean answer for
 	slog.Info("snapshot fetch complete",
 		"snapshotter", Name,
 		"date", target.SnapshotDate.UTC().Format("2006-01-02"),
@@ -450,6 +471,7 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 		"total", len(providers),
 		"fetched", fetched,
 		"no_rewards", noRewards,
+		"state_pruned", statePruned,
 		"failed", failed)
 	if failed > 0 {
 		slog.Warn("snapshot had real fetch failures",
@@ -458,13 +480,12 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 			"failed", failed,
 			"first_err", firstFailReason)
 	}
-	// Threshold: if most providers failed to answer at all, persist
-	// a failed row so BlocksDue doesn't retry this date forever. The
-	// denominator is total (not answered) — a date where the handler
-	// genuinely wasn't deployed yet has ALL providers failing, which
-	// is what we want to catch here. Chain-authoritative "no rewards"
-	// responses don't penalise the snapshot.
-	if answered == 0 || float64(answered)/float64(len(providers)) < minSuccessFraction {
+	// Threshold applies ONLY to real fetch failures against total.
+	// A date where the archive pruned state for most providers is
+	// still a legitimate snapshot of the subset we DID get — we
+	// wouldn't want to re-try it indefinitely because retries won't
+	// materialise new state.
+	if len(providers) > 0 && float64(failed)/float64(len(providers)) > (1-minSuccessFraction) {
 		errMsg := fmt.Sprintf("%d/%d providers failed to fetch: %v",
 			failed, len(providers), firstFailReason)
 		return pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
@@ -640,17 +661,17 @@ func (h *Handler) insertSnapshotRow(ctx context.Context, tx pgx.Tx, target snaps
 	return err
 }
 
-// providerOutcome distinguishes chain-authoritative "no rewards"
-// responses from actual fetch failures. The snapshot threshold only
-// considers realFailure — a provider that wasn't staked at the
-// queried height returns noRewards, not realFailure, so operators
-// see a clean `status='ok'` with the fetched subset.
+// providerOutcome distinguishes four shapes the per-provider fetch
+// can take. Only outcomeFailed counts toward the snapshot-level
+// threshold — the others are chain- or archive-state answers we
+// accept at face value.
 type providerOutcome int
 
 const (
-	outcomeFetched   providerOutcome = iota // got a clean response (possibly empty info[])
-	outcomeNoRewards                        // chain said "no rewards for this provider at this block"
-	outcomeFailed                           // real fetch failure — HTTP 5xx / decode / retry exhausted
+	outcomeFetched     providerOutcome = iota // got a clean response (possibly empty info[])
+	outcomeNoRewards                          // chain said "no rewards for this provider at this block"
+	outcomeStatePruned                        // archive state for this height pruned on every retried replica
+	outcomeFailed                             // real fetch failure — HTTP 5xx / decode / retry exhausted
 )
 
 // fetchResult bundles one provider's parsed chain response. When
@@ -694,6 +715,8 @@ func (h *Handler) fetchAll(ctx context.Context, providers []string, blockHeight 
 				out[i] = fetchResult{provider: addr, outcome: outcomeFetched, entries: entries}
 			case errors.Is(err, errNoRewards):
 				out[i] = fetchResult{provider: addr, outcome: outcomeNoRewards, reason: err}
+			case errors.Is(err, errStatePruned):
+				out[i] = fetchResult{provider: addr, outcome: outcomeStatePruned, reason: err}
 			default:
 				out[i] = fetchResult{provider: addr, outcome: outcomeFailed, reason: err}
 			}
@@ -885,6 +908,15 @@ var errRetryPruned = errors.New("replica pruned; retry")
 // failure to the operator.
 var errNoRewards = errors.New("chain reports no rewards for provider")
 
+// errStatePruned indicates we exhausted pruned-retry attempts and
+// every replica we hit had state pruned at the queried height. Not a
+// fetch failure on our side — it's archive unavailability. The REST
+// gateway's LB rotates through replicas with different pruning depths,
+// and for old dates no subset of replicas reliably holds state. These
+// providers are neither "fetched" nor a real failure to investigate;
+// they're just "state unavailable" for this (provider, height) pair.
+var errStatePruned = errors.New("state pruned at queried height")
+
 func classifyChainMessage(msg string) error {
 	low := strings.ToLower(msg)
 	// Patterns that indicate the REPLICA (not the chain state) is the
@@ -976,11 +1008,14 @@ func (c *HTTPCaller) EstimatedRewards(ctx context.Context, addr string, blockHei
 		if err != nil {
 			// Treat 404/501 as pruned-replica: the handler isn't
 			// registered on the replica we just hit; a fresh
-			// connection usually rotates to one that has it.
+			// connection usually rotates to one that has it. If
+			// retries exhaust, treat as state-pruned (archive
+			// unavailable for this height) rather than a real
+			// fetch failure.
 			var hs *httpStatusErr
 			if errors.As(err, &hs) && (hs.code == 501 || hs.code == 404) {
 				if attempt+1 >= maxPrunedRetries {
-					return nil, fmt.Errorf("provider %s: %w (attempts=%d)", addr, err, attempt+1)
+					return nil, fmt.Errorf("%w: %v (attempts=%d)", errStatePruned, err, attempt+1)
 				}
 				if !backoffSleep(ctx, attempt) {
 					return nil, ctx.Err()
@@ -1008,7 +1043,12 @@ func (c *HTTPCaller) EstimatedRewards(ctx context.Context, addr string, blockHei
 			return nil, perr
 		}
 		if attempt+1 >= maxPrunedRetries {
-			return nil, fmt.Errorf("provider %s: %w (attempts=%d)", addr, perr, attempt+1)
+			// Every replica we tried had state pruned at this height.
+			// Not a fetch failure we can act on — the archive just
+			// doesn't hold state that old across the LB. Surface a
+			// typed errStatePruned so fetchAll routes to
+			// outcomeStatePruned instead of outcomeFailed.
+			return nil, fmt.Errorf("%w: %v (attempts=%d)", errStatePruned, perr, attempt+1)
 		}
 		if !backoffSleep(ctx, attempt) {
 			return nil, ctx.Err()
