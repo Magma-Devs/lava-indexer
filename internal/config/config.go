@@ -562,16 +562,15 @@ func (c *Config) validate() error {
 	// operators to keep fields valid for something they haven't turned
 	// on.
 	if c.Snapshotters.WantsSnapshotter("provider_rewards") {
-		ed := strings.TrimSpace(c.Snapshotters.ProviderRewards.EarliestDate)
-		if ed == "" {
-			return fmt.Errorf("snapshotters.provider_rewards.earliest_date is required when enabled")
+		// earliest_date is an optional floor — when empty, the
+		// snapshotter emits every genesis-anchored slot from
+		// genesis+1mo through now. Operators set it only to skip
+		// early history they don't care about.
+		if ed := strings.TrimSpace(c.Snapshotters.ProviderRewards.EarliestDate); ed != "" {
+			if _, err := time.Parse("2006-01-02", ed); err != nil {
+				return fmt.Errorf("snapshotters.provider_rewards.earliest_date: %w", err)
+			}
 		}
-		if _, err := time.Parse("2006-01-02", ed); err != nil {
-			return fmt.Errorf("snapshotters.provider_rewards.earliest_date: %w", err)
-		}
-		// Day-of-month is no longer constrained — the slot day derives
-		// from the chain's genesis timestamp (see provider_rewards
-		// ExpectedDates). earliest_date is just a floor.
 	}
 	return nil
 }
