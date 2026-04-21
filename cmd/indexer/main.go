@@ -216,26 +216,27 @@ func main() {
 
 	// Register snapshotters. Snapshotters are the periodic, calendar-
 	// driven ingestion seam (parallel to events.Handler for event-
-	// driven). Disabled snapshotters are never constructed — the
-	// `enabled=false` path spawns no goroutine, applies no DDL, and
-	// renders nothing in the UI.
+	// driven). Selection mirrors the handler pattern:
+	// cfg.Snapshotters.List selects a subset; "all" (or empty) means
+	// every one. Snapshotters not selected are never constructed —
+	// no DDL, no goroutine, nothing in /api/snapshotters.
 	snapReg := snapshotters.NewRegistry()
-	if cfg.Snapshotters.ProviderRewards.Enabled {
-		prCfg := provider_rewards.Config{
-			Schema:        cfg.Database.Schema,
-			EarliestDate:  cfg.Snapshotters.ProviderRewards.ParsedEarliestDate(),
-			Concurrency:   cfg.Snapshotters.ProviderRewards.Concurrency,
-			RESTURL:       resolveSnapshotterRESTURL(cfg),
-			RESTHeaders:   resolveSnapshotterRESTHeaders(cfg),
-			GenesisHeight: client.Genesis(),
+	registerSnapshotter := func(s snapshotters.Snapshotter) {
+		if cfg.Snapshotters.WantsSnapshotter(s.Name()) {
+			snapReg.Register(s)
+			slog.Info("snapshotter registered", "name", s.Name())
+		} else {
+			slog.Info("snapshotter skipped by config", "name", s.Name())
 		}
-		snapReg.Register(provider_rewards.New(prCfg))
-		slog.Info("snapshotter registered",
-			"name", provider_rewards.Name,
-			"rest_url", prCfg.RESTURL,
-			"earliest_date", cfg.Snapshotters.ProviderRewards.EarliestDate,
-			"concurrency", prCfg.Concurrency)
 	}
+	registerSnapshotter(provider_rewards.New(provider_rewards.Config{
+		Schema:        cfg.Database.Schema,
+		EarliestDate:  cfg.Snapshotters.ProviderRewards.ParsedEarliestDate(),
+		Concurrency:   cfg.Snapshotters.ProviderRewards.Concurrency,
+		RESTURL:       resolveSnapshotterRESTURL(cfg),
+		RESTHeaders:   resolveSnapshotterRESTHeaders(cfg),
+		GenesisHeight: client.Genesis(),
+	}))
 	// Apply snapshotter DDL, same one-tx-per-snapshotter pattern as
 	// event handlers. Each snapshotter owns its tables so a partial DDL
 	// failure rolls back cleanly.

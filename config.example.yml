@@ -166,19 +166,25 @@ graphql:
 # own tables. Unlike event handlers (which consume the block stream),
 # snapshotters own their cadence and RPC work.
 #
-# Disabled snapshotters incur zero cost — no DDL is applied, no
+# Unlisted snapshotters incur zero cost — no DDL is applied, no
 # goroutine is spawned, and the /api/snapshotters endpoint doesn't
 # surface them. Turn on only the ones your operator use case needs.
 snapshotters:
+  # Which snapshotters to register. Mirrors indexer.handlers: ["all"]
+  # (or empty) enables every compiled-in snapshotter; otherwise name
+  # them explicitly. Examples:
+  #   list: ["all"]                  # every snapshotter
+  #   list: ["provider_rewards"]     # just this one
+  #   list: []                       # also means "all" (matches handlers)
+  # Omit the snapshotters: section entirely to keep the defaults.
+  list: []
+
   # How often the snapshotter loop checks whether there's work to do.
   # Each tick is one DB query per snapshotter (cheap); short intervals
   # are fine. Default 10m.
   check_interval: 10m
 
   provider_rewards:
-    # Master switch. When false, no DDL / no goroutine / no UI card.
-    enabled: false
-
     # First monthly-17th we attempt to snapshot. Must be a 17th of
     # some month (validated at startup). Every subsequent 17th whose
     # 15:00 UTC slot is in the past is eligible; covered dates are

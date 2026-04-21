@@ -678,7 +678,12 @@ func classifyChainMessage(msg string) error {
 	switch {
 	case strings.Contains(low, "version does not exist"),
 		strings.Contains(low, "version mismatch"),
-		strings.Contains(low, "no commit info found"):
+		strings.Contains(low, "no commit info found"),
+		// "Not Implemented" (grpc code 12) surfaces when Lava's public
+		// gateway load-balances to a replica that doesn't have the
+		// EstimatedProviderRewards handler registered at this height —
+		// another replica will. Retry on a fresh connection.
+		strings.Contains(low, "not implemented"):
 		return fmt.Errorf("%w: %s", errRetryPruned, msg)
 	case strings.Contains(low, "cannot get claimable rewards after distribution"):
 		return errNoClaimableRewards
@@ -724,14 +729,36 @@ func NewHTTPCaller(baseURL string, headers map[string]string) *HTTPCaller {
 	}
 }
 
-// EstimatedRewards hits the Lava subscription module's estimated-rewards
-// endpoint pinned at blockHeight. Retries pruned-replica responses up
-// to maxPrunedRetries with jittered exponential backoff.
+// EstimatedRewards hits the Lava pairing module's estimated-rewards
+// endpoint pinned at blockHeight. The gRPC method takes two args
+// (provider, amount_delegator); the REST gateway exposes it as a
+// two-segment path. We always pass "1ulava" as the delegator amount —
+// the minimum valid coin — so the chain returns the estimated
+// per-provider breakdown regardless of any real delegation.
+//
+// Retries pruned-replica responses up to maxPrunedRetries with
+// jittered exponential backoff. Also treats HTTP 501/404 the same way:
+// Lava's public gateway load-balances across replicas, and the
+// EstimatedProviderRewards handler isn't always registered on every
+// replica — a fresh connection usually hits a working one.
 func (c *HTTPCaller) EstimatedRewards(ctx context.Context, addr string, blockHeight int64) ([]RewardEntry, error) {
-	path := fmt.Sprintf("/lavanet/lava/subscription/estimated_provider_rewards/%s", addr)
+	path := fmt.Sprintf("/lavanet/lava/pairing/estimated_provider_rewards/%s/1ulava", addr)
 	for attempt := 0; ; attempt++ {
 		body, err := c.doGET(ctx, path, blockHeight)
 		if err != nil {
+			// Treat 404/501 as pruned-replica: the handler isn't
+			// registered on the replica we just hit; a fresh
+			// connection usually rotates to one that has it.
+			var hs *httpStatusErr
+			if errors.As(err, &hs) && (hs.code == 501 || hs.code == 404) {
+				if attempt+1 >= maxPrunedRetries {
+					return nil, fmt.Errorf("provider %s: %w (attempts=%d)", addr, err, attempt+1)
+				}
+				if !backoffSleep(ctx, attempt) {
+					return nil, ctx.Err()
+				}
+				continue
+			}
 			return nil, err
 		}
 		entries, perr := ParseEstimatedRewards(body)
@@ -828,7 +855,7 @@ func (c *HTTPCaller) doGET(ctx context.Context, path string, blockHeight int64) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("GET %s: http %d", path, resp.StatusCode)
+		return nil, &httpStatusErr{path: path, code: resp.StatusCode}
 	}
 	body := make([]byte, 0, 8192)
 	buf := make([]byte, 8192)
@@ -842,6 +869,17 @@ func (c *HTTPCaller) doGET(ctx context.Context, path string, blockHeight int64) 
 		}
 	}
 	return body, nil
+}
+
+// httpStatusErr carries the upstream HTTP status so EstimatedRewards
+// can route 501/404 into the pruned-retry loop instead of giving up.
+type httpStatusErr struct {
+	path string
+	code int
+}
+
+func (e *httpStatusErr) Error() string {
+	return fmt.Sprintf("GET %s: http %d", e.path, e.code)
 }
 
 // backoffSleep sleeps 250ms × 2^attempt with ±50% jitter, capped at 10s.

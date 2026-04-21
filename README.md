@@ -430,9 +430,9 @@ Operator setup:
 
 ```yaml
 snapshotters:
+  list: ["all"]           # same pattern as indexer.handlers; omit or []=all
   check_interval: 10m
   provider_rewards:
-    enabled: true
     earliest_date: "2025-01-17"
     concurrency: 25
     rest_url: ""          # optional; falls back to the first REST endpoint
@@ -447,22 +447,20 @@ Progress is visible in the web UI's "Snapshotters" card (one dot per
 expected date — green covered / red failed / grey missing) and via
 `GET /api/snapshotters`.
 
-Env overrides: `PROVIDER_REWARDS_ENABLED`, `PROVIDER_REWARDS_EARLIEST_DATE`,
-`PROVIDER_REWARDS_CONCURRENCY`, `PROVIDER_REWARDS_REST_URL`,
-`SNAPSHOTTERS_CHECK_INTERVAL`.
+Env overrides: `SNAPSHOTTERS` (comma-separated list — `all` / `provider_rewards`),
+`SNAPSHOTTERS_CHECK_INTERVAL`, `PROVIDER_REWARDS_EARLIEST_DATE`,
+`PROVIDER_REWARDS_CONCURRENCY`, `PROVIDER_REWARDS_REST_URL`.
 
 ### Adding a new snapshotter
 
 1. Create a package under `internal/snapshotters/<your_snap>/` that
    implements `snapshotters.Snapshotter`.
 2. Add a `cfg.Snapshotters.YourSnap` section to `internal/config/config.go`
-   with `enabled bool` and whatever schedule/target knobs you need.
-3. Register it in `cmd/indexer/main.go`:
-   ```go
-   if cfg.Snapshotters.YourSnap.Enabled {
-       snapReg.Register(your_snap.New(...))
-   }
-   ```
+   with whatever schedule/target knobs you need — **no** `enabled` flag;
+   selection is done via `snapshotters.list` to match the handler pattern.
+3. Register it unconditionally in `cmd/indexer/main.go` via the
+   `registerSnapshotter` helper — it consults `cfg.Snapshotters.WantsSnapshotter`
+   and skips anything not in the list.
 4. DDL applies at startup; RunLoop runs `BlocksDue` + `Snapshot` on
    every tick.
 

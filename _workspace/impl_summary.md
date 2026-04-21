@@ -1,116 +1,94 @@
-# chain_id mismatch → runtime disable (was: fail-fast abort)
+# Implementation summary: provider_rewards snapshotter
 
-## What changed from the previous version
+Added a new `Snapshotter` seam (`internal/snapshotters`) parallel to the
+existing event-driven `Handler` and wired up a concrete
+`provider_rewards` snapshotter that captures
+`estimated_provider_rewards` for every registered provider at
+monthly-17th 15:00-UTC block heights.
 
-The previous implementer built chain_id validation as a fail-fast: any
-mismatch or "didn't report" caused Probe to return an aggregated error
-and the process to exit. The user revised the requirement: treat
-mismatch the same way as a transient probe failure — flag the endpoint
-as `Disabled` with a reason string, log WARN, continue. Startup only
-aborts when ZERO endpoints are left healthy, preserving the existing
-fail-fast for "nothing to index from".
+## Files added
 
-## Files touched
+- `internal/snapshotters/snapshotter.go` — `Snapshotter` interface +
+  `SnapshotTarget`.
+- `internal/snapshotters/registry.go` — `Registry` with `RunLoop`
+  (tick-on-interval, runs once immediately on startup, per-target
+  pgx.Tx, one-failure-doesn't-starve-others).
+- `internal/snapshotters/block_time.go` — generic binary search for
+  "block closest to timestamp T".
+- `internal/snapshotters/provider_rewards/handler.go` — the concrete
+  snapshotter: DDL, BlocksDue, Snapshot, HTTP caller with
+  retry-on-pruned-replica, source-label parser, amount cleaner.
+- `internal/snapshotters/registry_test.go`,
+  `internal/snapshotters/block_time_test.go`,
+  `internal/snapshotters/provider_rewards/handler_test.go`,
+  `internal/snapshotters/provider_rewards/http_caller_test.go` — unit
+  tests for all the response-classification branches, date math, binary
+  search convergence, one-failure-doesn't-starve-others behaviour.
 
-- `internal/rpc/multi.go`
-  - Added `Reason string` to `Endpoint`. Set whenever `Disabled = true`;
-    zero-value on healthy endpoints.
-  - `Probe(ctx, expectedChainID)` rewritten: no more `mismatches` slice,
-    no more aggregate error. All four disable paths (probe error,
-    empty Network under validation, mismatch, and the pre-existing
-    probe failure) now set both `Disabled` and `Reason`. Only returns
-    an error when zero endpoints remain healthy.
-  - Dropped the `strings` import (no longer building a joined error).
-  - Probe-failure path now carries `"probe failed: <err>"` as Reason —
-    previously the `✗` on the dashboard was unexplained.
-  - Log lines changed for chain_id issues: WARN instead of silently
-    feeding an aggregate error, with the same slog key=value style as
-    the rest of the file.
+## Files modified
 
-- `internal/web/server.go`
-  - Added `Reason string \`json:"reason,omitempty"\`` to
-    `EndpointStatus`. Populated from `ep.Reason` in `handleStatus`.
+- `internal/config/config.go` — added `Snapshotters` section,
+  env-overrides, earliest-date validation, `ParsedEarliestDate()`
+  helper.
+- `cmd/indexer/main.go` — registration (gated on
+  `cfg.Snapshotters.ProviderRewards.Enabled`), DDL apply, dict warmup,
+  RunLoop goroutine under errgroup, `resolveSnapshotterRESTURL` +
+  `resolveSnapshotterRESTHeaders` helpers (fall back to first
+  `kind: rest` endpoint).
+- `internal/web/server.go` — `Snapshotters` field on `Server`,
+  `/api/snapshotters` endpoint, `SnapshotterStatus` + failed-date
+  shapes.
+- `internal/web/assets/index.html` — new "Snapshotters" UI card with a
+  dot-per-date timeline (green covered / red failed / grey missing),
+  expandable errors list, last-run / next-run meta, isolated keyed DOM
+  cache for in-place updates. Section is hidden when
+  `/api/snapshotters` returns `[]`.
+- `config.example.yml` — documented new `snapshotters:` block.
+- `README.md` — new "Snapshotters" section describing the seam, the
+  concrete provider_rewards snapshotter, and how to add another.
 
-- `internal/web/assets/index.html`
-  - Two small CSS classes: `.ep-reason` (muted inline line under the
-    URL on the compact overview row) and `.ep-reason-banner` (red
-    banner on the detail card). These are the minimum needed — reusing
-    the existing `.bad` colour would have been too noisy on the compact
-    list and too quiet on the detail card.
-  - Overview row: extra `<span class="ep-reason">` appended inside
-    each `.ep` grid; shown when `e.disabled && e.reason`, hidden
-    otherwise.
-  - Detail card: banner placed directly under the head so it's the
-    first thing an operator sees on a broken endpoint. Hidden on
-    healthy endpoints.
+## Key design decisions
 
-- `internal/rpc/multi_test.go` (rewrite)
-  - Renamed the mismatch test from `ChainIDMismatch` → `ChainIDMismatchDisables`
-    to reflect the new semantic.
-  - Existing assertions flipped from "error mentions bad endpoint" to
-    "Probe returns nil; bad endpoint Disabled=true with Reason
-    containing expected + advertised chain_ids; good endpoints
-    untouched".
-  - New `AllMismatchFailsFast` test: three endpoints all mismatched
-    must still return "no healthy endpoints" — preserves the
-    fail-fast when there's literally nothing to index from.
-  - New `FailureSetsReason` test: confirms probe failures (dial
-    error) now populate Reason, not just Disabled.
-  - `EndpointDidNotReport` and `EmptyExpectedSkips` tests updated to
-    match the new "disable, don't error" semantics.
-  - Added a `newFailingStubEndpoint` helper and a `findEndpoint`
-    helper so tests re-look up by URL instead of assuming slice
-    order.
+- **Dedicated seam, not reuse of `events.Handler`.** Snapshotters have
+  a fundamentally different shape: calendar-driven, their own RPC
+  calls, their own coverage table (not `indexer_ranges`). Shoehorning
+  would have muddied both interfaces.
+- **Dict reuse.** `provider_rewards` upserts into `app.providers` and
+  `app.chains` via the existing `events.Dict` helper so IDs align with
+  whatever `lava_relay_payment` has already written — no duplicated
+  dictionary tables.
+- **All-or-nothing snapshot transactions.** The spec had a "partial"
+  status in the DDL, but the implementation only writes `ok` or
+  `failed`. A partial snapshot creates data-quality ambiguity for
+  downstream consumers, and the registry re-runs failed dates from
+  scratch on the next tick. The `partial` value is reserved in the
+  column (TEXT DEFAULT 'ok') for future use; the UI's
+  `SnapshotterFailedDate` path treats any non-`ok`/non-`failed` status
+  as a flagged failed entry so anything we add later surfaces.
+- **HTTP caller is small and self-contained.** Rather than adapting
+  the main `rpc.RESTClient` (which is specifically for block /
+  tx-events fetching), I wrote a minimal caller that satisfies both
+  `RESTCaller` and `BlockTimeLookup`. This avoids dragging the full
+  MultiClient+routing code into the snapshotter path — the snapshotter
+  only needs one archive-backed endpoint, not routing + failover.
+- **Web Server.SnapshotterSchema field.** The server's status handler
+  knows `app` by default (via `state.State.Schema()`) but the
+  snapshotter status is keyed on the same schema; I added a separate
+  field rather than plumbing `state.State` into a second role, to keep
+  the dependency direction clean.
 
-## Files deliberately untouched
+## Divergences from spec
 
-- `internal/rpc/rpc.go`, `internal/rpc/rest.go`,
-  `internal/rpc/rpc_test.go`, `internal/rpc/rest_test.go` — the
-  `node_info.network` parsing the previous implementer added is
-  unchanged. The tests there exercise the Probe parsing, which the
-  new semantics don't affect.
-- `cmd/indexer/main.go` — the caller already passes
-  `cfg.Network.ChainID` and handles the "no healthy endpoints" error;
-  no code change needed since that's now the only error Probe returns.
-- AIMD / adaptive path — untouched per the spec.
-
-## Test coverage
-
-Runs green under `go build ./...`, `go vet ./...`, and
-`go test ./internal/rpc/... ./internal/web/...`:
-
-- `TestMultiClient_Probe_ChainIDMatch` — happy path, no Disabled, no
-  Reason.
-- `TestMultiClient_Probe_ChainIDMismatchDisables` — one mismatched
-  endpoint is Disabled with a Reason naming both chain_ids; good
-  endpoints stay healthy; Probe returns nil.
-- `TestMultiClient_Probe_AllMismatchFailsFast` — every endpoint
-  mismatches → Probe returns "no healthy endpoints".
-- `TestMultiClient_Probe_EndpointDidNotReport` — empty Network under
-  validation: Disabled=true, Reason mentions "did not report".
-- `TestMultiClient_Probe_EmptyExpectedSkips` — empty expectedChainID
-  skips validation; no endpoint Disabled.
-- `TestMultiClient_Probe_FailureSetsReason` — network-error probe
-  disables endpoint AND populates Reason with `"probe failed: ..."`.
-- Pre-existing RPC / REST Probe parsing tests still pass unchanged.
-
-## Design notes
-
-- **Reason format is a stable short string, not structured.** The
-  dashboard consumes it verbatim. If a future caller wants to
-  distinguish "mismatch" from "did not report" programmatically it
-  can look at `Disabled` + substring — same ergonomics we already use
-  elsewhere — but the primary consumer is an operator reading a
-  banner, so a human-readable string wins over a typed enum here.
-- **No re-enable / recheck.** An endpoint disabled at startup stays
-  disabled for the process lifetime. Matches the pre-existing
-  probe-failure semantics — operators fix config and restart, rather
-  than hot-recovery.
-- **Logging key names match the existing style** (`url`, `kind`,
-  `expected`, `advertised`). No changes to log format.
-- **`any` sentinel moved after chain_id validation.** Previously
-  `any = true` ran before the mismatch check, which was harmless
-  under fail-fast (the whole thing aborted anyway). In the new
-  semantics, a mismatched endpoint must NOT count toward "we have a
-  healthy endpoint", so the flag is set only after the endpoint
-  survives all checks.
+- **Partial status not emitted.** The spec lists `'ok' | 'partial' |
+  'failed'` but the current code only writes `ok` / `failed`. See the
+  design-decisions note above — schema still supports the value, just
+  no code path produces it today.
+- **API `expected` set starts at the earliest observed DB row**, not
+  `cfg.EarliestDate`, because the web server doesn't hold a reference
+  to the snapshotter's parsed config. This is correct in
+  steady state (once the first snapshot lands, `expected` matches)
+  and gracefully shows "no snapshots yet" on a fresh deploy. If
+  operators want to see the configured cadence before the first tick,
+  we could plumb the config through — left open as a follow-up.
+- **No "retry failed" button** — explicitly optional per spec; not
+  implemented.

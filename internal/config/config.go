@@ -33,17 +33,36 @@ type Snapshotters struct {
 	// snapshotter to compute due targets) so "check often" is fine.
 	CheckInterval time.Duration `yaml:"check_interval"`
 
+	// List selects which snapshotters to register. Use ["all"] (or leave
+	// empty) to enable every compiled-in snapshotter. Otherwise name
+	// them explicitly (e.g. ["provider_rewards"]). Mirrors the handler
+	// selection pattern in Indexer.Handlers — snapshotters not listed
+	// are never constructed: no DDL, no goroutine, no UI entry.
+	List []string `yaml:"list"`
+
 	ProviderRewards ProviderRewardsSnapshotter `yaml:"provider_rewards"`
 }
 
-// ProviderRewardsSnapshotter configures the provider_rewards
-// snapshotter (see internal/snapshotters/provider_rewards).
-type ProviderRewardsSnapshotter struct {
-	// Enabled is the master switch. When false, no DDL is applied, no
-	// goroutine is spawned, and the snapshotter is invisible to
-	// /api/snapshotters.
-	Enabled bool `yaml:"enabled"`
+// WantsSnapshotter reports whether `name` should be registered given
+// the snapshotters.list config. Empty list or ["all"] means "every
+// snapshotter" — same semantics as Indexer.WantsHandler.
+func (s Snapshotters) WantsSnapshotter(name string) bool {
+	if len(s.List) == 0 {
+		return true
+	}
+	for _, n := range s.List {
+		if strings.EqualFold(n, "all") || strings.EqualFold(n, name) {
+			return true
+		}
+	}
+	return false
+}
 
+// ProviderRewardsSnapshotter configures the provider_rewards
+// snapshotter (see internal/snapshotters/provider_rewards). Gated by
+// Snapshotters.List — absent from the list means the section is
+// ignored entirely.
+type ProviderRewardsSnapshotter struct {
 	// EarliestDate is the first monthly-17th we attempt to snapshot.
 	// Format: "2006-01-02". Must be a 17th (the RunLoop will error at
 	// config validation if not — forces the operator to notice a
@@ -285,8 +304,11 @@ func defaults() *Config {
 		},
 		Snapshotters: Snapshotters{
 			CheckInterval: 10 * time.Minute,
+			// Default: no snapshotters — operator opts in by listing
+			// names (or ["all"]). Matches the handler default of
+			// ["all"] being explicit, not implicit.
+			List: nil,
 			ProviderRewards: ProviderRewardsSnapshotter{
-				Enabled:      false,
 				EarliestDate: "2025-01-17",
 				Concurrency:  25,
 			},
@@ -432,8 +454,17 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Snapshotters.CheckInterval = d
 		}
 	}
-	if v := os.Getenv("PROVIDER_REWARDS_ENABLED"); v != "" {
-		cfg.Snapshotters.ProviderRewards.Enabled = strings.EqualFold(v, "true") || v == "1"
+	if v := os.Getenv("SNAPSHOTTERS"); v != "" {
+		// Comma-separated names, e.g. "all" or "provider_rewards".
+		// Mirrors INDEXER_HANDLERS exactly.
+		out := make([]string, 0, 4)
+		for _, p := range strings.Split(v, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		cfg.Snapshotters.List = out
 	}
 	if v := os.Getenv("PROVIDER_REWARDS_EARLIEST_DATE"); v != "" {
 		cfg.Snapshotters.ProviderRewards.EarliestDate = v
@@ -499,12 +530,13 @@ func (c *Config) validate() error {
 	if c.Database.Schema == "" {
 		c.Database.Schema = "app"
 	}
-	// Snapshotters: validate provider_rewards earliest_date when enabled.
-	// Fail fast here so a typo surfaces at startup rather than on the
-	// first scheduled tick ~10 minutes in. Disabled snapshotters are
-	// skipped — we don't force operators to keep fields valid for
-	// something they've turned off.
-	if c.Snapshotters.ProviderRewards.Enabled {
+	// Snapshotters: validate provider_rewards earliest_date when it's
+	// selected via snapshotters.list. Fail fast here so a typo surfaces
+	// at startup rather than on the first scheduled tick ~10 minutes
+	// in. Snapshotters not in the list are skipped — we don't force
+	// operators to keep fields valid for something they haven't turned
+	// on.
+	if c.Snapshotters.WantsSnapshotter("provider_rewards") {
 		ed := strings.TrimSpace(c.Snapshotters.ProviderRewards.EarliestDate)
 		if ed == "" {
 			return fmt.Errorf("snapshotters.provider_rewards.earliest_date is required when enabled")
