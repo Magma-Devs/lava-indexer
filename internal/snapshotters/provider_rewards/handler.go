@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
 	"math/rand"
@@ -26,7 +27,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/magma-devs/lava-indexer/internal/events"
+	"github.com/magma-devs/lava-indexer/internal/rpc"
 	"github.com/magma-devs/lava-indexer/internal/snapshotters"
+	"golang.org/x/sync/errgroup"
 )
 
 // Name returned by the Snapshotter interface. Stable identifier — used
@@ -113,8 +116,15 @@ func (h *Handler) Name() string { return Name }
 func (h *Handler) RESTURL() string { return h.cfg.RESTURL }
 
 // DDL returns the SQL statements that create the two tables owned by
-// this snapshotter. Idempotent.
+// this snapshotter, PLUS idempotent CREATE-IF-NOT-EXISTS for the
+// `providers` and `chains` dict tables we FK into. The dict tables
+// are conceptually shared with `lava_relay_payment`, but including
+// them here (CREATE IF NOT EXISTS) lets the snapshotter start
+// standalone — without this, selecting `provider_rewards` but not
+// `lava_relay_payment` fails at startup because the FK targets don't
+// exist. Idempotent by design.
 //
+// - providers / chains — dict tables; shared with lava_relay_payment.
 // - provider_rewards_snapshots is one row per (date, block) — the
 //   snapshotter's "coverage table". Unique on snapshot_date so a retry
 //   of the same date safely upserts.
@@ -122,6 +132,8 @@ func (h *Handler) RESTURL() string { return h.cfg.RESTURL }
 //   single (provider, spec, source, denom) tuple per block.
 func (h *Handler) DDL() []string {
 	return []string{
+		h.providers.DDL(),
+		h.chains.DDL(),
 		fmt.Sprintf(`
 			CREATE TABLE IF NOT EXISTS %[1]s.provider_rewards_snapshots (
 			  block_height   BIGINT       PRIMARY KEY,
@@ -263,6 +275,70 @@ func (h *Handler) blockForDate(ctx context.Context, date time.Time) (snapshotter
 	}, false, nil
 }
 
+// Status returns the current coverage view for /api/snapshotters and
+// the dashboard card. Uses h.cfg.EarliestDate as the authoritative
+// "expected from" date (the config is the operator's declaration of
+// what should be snapshotted). Partitions into Covered/Missing/Failed
+// by reading each row's status column. Returns an empty Status when
+// the snapshots table hasn't been created yet (pre-DDL or
+// configuration skip).
+func (h *Handler) Status(ctx context.Context, pool *pgxpool.Pool) (snapshotters.Status, error) {
+	type row struct {
+		date   time.Time
+		status string
+		errMsg string
+	}
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
+		SELECT snapshot_date, status, COALESCE(error, '')
+		FROM %s.provider_rewards_snapshots
+		ORDER BY snapshot_date`, h.cfg.Schema))
+	if err != nil {
+		// Most likely cause: DDL hasn't been applied yet. Return empty
+		// so the UI can still render "no snapshots yet".
+		return snapshotters.Status{}, nil
+	}
+	defer rows.Close()
+	seen := make(map[string]row)
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.date, &r.status, &r.errMsg); err != nil {
+			return snapshotters.Status{}, err
+		}
+		seen[r.date.UTC().Format("2006-01-02")] = r
+	}
+	if err := rows.Err(); err != nil {
+		return snapshotters.Status{}, err
+	}
+
+	expected := ExpectedDates(h.cfg.EarliestDate, time.Now().UTC())
+	out := snapshotters.Status{
+		Expected: make([]string, 0, len(expected)),
+		Covered:  make([]string, 0, len(expected)),
+		Missing:  make([]string, 0, len(expected)),
+	}
+	for _, d := range expected {
+		key := d.Format("2006-01-02")
+		out.Expected = append(out.Expected, key)
+		r, ok := seen[key]
+		switch {
+		case !ok:
+			out.Missing = append(out.Missing, key)
+		case r.status == "ok":
+			out.Covered = append(out.Covered, key)
+		case r.status == "failed":
+			out.Failed = append(out.Failed, snapshotters.FailedDate{Date: key, Error: r.errMsg})
+		default:
+			// 'partial' or any future state we haven't enumerated —
+			// surface it as failed-with-status so operators notice.
+			out.Failed = append(out.Failed, snapshotters.FailedDate{
+				Date:  key,
+				Error: fmt.Sprintf("status=%s %s", r.status, r.errMsg),
+			})
+		}
+	}
+	return out, nil
+}
+
 // ExpectedDates returns every monthly-17th between earliest and now
 // (inclusive on earliest, exclusive on dates whose 15:00 UTC slot is in
 // the future). Exported for tests.
@@ -283,39 +359,48 @@ func ExpectedDates(earliest, now time.Time) []time.Time {
 	}
 }
 
-// Snapshot runs one full snapshot for `target`. Calls the chain for
-// every known provider, parses the result, upserts dict rows, and
-// inserts the fact rows — all inside the passed pgx.Tx.
+// Snapshot runs one full snapshot for `target`. The HTTP fan-out
+// happens OUTSIDE any transaction — critical because a snapshot can
+// take several minutes at 25-way concurrency × 10 retries. We then
+// open two short transactions: one to resolve dict IDs (providers +
+// chains), one to write the snapshot row + fact rows.
 //
-// If any provider's chain call exhausts retries, the whole tx rolls
-// back. A "partial" mode is deliberately NOT implemented — on next tick
-// we re-try the date from scratch, which gives a consistent view at
-// the cost of repeating some chain reads.
-func (h *Handler) Snapshot(ctx context.Context, tx pgx.Tx, target snapshotters.SnapshotTarget) error {
-	// 1. Enumerate known providers. We use the committed app.providers
-	// set so coverage tracks whatever handlers the operator has run so
-	// far — in practice that's lava_relay_payment.
-	providers, err := h.selectProviders(ctx, tx)
+// If any provider's chain call exhausts retries, Snapshot returns an
+// error without writing anything — next tick re-tries the date from
+// scratch, giving a consistent view at the cost of repeating some
+// chain reads. "Partial" mode is deliberately not implemented.
+func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snapshotters.SnapshotTarget) error {
+	// 1. Enumerate known providers (pool query, no tx — a one-shot read
+	// doesn't need tx isolation). We use the committed app.providers set
+	// so coverage tracks whatever handlers the operator has run so far —
+	// in practice that's lava_relay_payment.
+	providers, err := h.selectProviders(ctx, pool)
 	if err != nil {
 		return fmt.Errorf("select providers: %w", err)
 	}
 	if len(providers) == 0 {
 		// Empty snapshot is legitimate — no providers means no rows to
-		// write, and the snapshots row records provider_count=0.
-		return h.insertSnapshotRow(ctx, tx, target, 0, "ok", "")
+		// write, and the snapshots row records provider_count=0. Open a
+		// short tx just for the upsert.
+		return pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+			return h.insertSnapshotRow(ctx, tx, target, 0, "ok", "")
+		})
 	}
 
 	// 2. Fetch estimated rewards for every provider in a concurrency-
-	// bounded pool. A single failure from any provider aborts the whole
-	// snapshot — see function doc.
+	// bounded errgroup — OUTSIDE any tx. First error cancels siblings
+	// so a doomed snapshot doesn't keep 24 more HTTP loops running.
 	results, err := h.fetchAll(ctx, providers, target.BlockHeight)
 	if err != nil {
 		return fmt.Errorf("fetch rewards: %w", err)
 	}
 
-	// 3. Resolve provider + spec IDs via the dict tables. First pass
-	// collects the unique specs we saw; we also need provider IDs for
-	// the providers we queried.
+	// 3. Resolve provider + spec IDs in their own short tx. Dict caches
+	// are commit-only, so these writes commit safely independent of the
+	// final write tx — a rollback in step 4 leaves the dict rows in
+	// place, which is harmless (the composite PK on provider_rewards
+	// prevents dup-inserting fact rows, and dict rows are idempotent by
+	// design).
 	provSet := make(map[string]struct{})
 	specSet := make(map[string]struct{})
 	for _, r := range results {
@@ -332,32 +417,25 @@ func (h *Handler) Snapshot(ctx context.Context, tx pgx.Tx, target snapshotters.S
 	for s := range specSet {
 		specList = append(specList, s)
 	}
-	provIDs, err := h.providers.IDs(ctx, tx, provList)
-	if err != nil {
-		return fmt.Errorf("provider ids: %w", err)
-	}
-	specIDs, err := h.chains.IDs(ctx, tx, specList)
-	if err != nil {
-		return fmt.Errorf("spec ids: %w", err)
-	}
-
-	// 4. Insert the snapshots row first so the FK on provider_rewards
-	// is satisfied. provider_count is the count of providers that had
-	// at least one reward entry.
-	provWithRewards := 0
-	for _, r := range results {
-		if len(r.entries) > 0 {
-			provWithRewards++
+	var provIDs, specIDs map[string]int32
+	err = pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		var e error
+		provIDs, e = h.providers.IDs(ctx, tx, provList)
+		if e != nil {
+			return fmt.Errorf("provider ids: %w", e)
 		}
-	}
-	if err := h.insertSnapshotRow(ctx, tx, target, provWithRewards, "ok", ""); err != nil {
-		return fmt.Errorf("insert snapshot row: %w", err)
+		specIDs, e = h.chains.IDs(ctx, tx, specList)
+		if e != nil {
+			return fmt.Errorf("spec ids: %w", e)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
-	// 5. Bulk-insert the fact rows via CopyFrom. Every row is unique by
-	// construction (composite PK); we dedupe in memory as a safety net
-	// since a provider could theoretically return two entries for the
-	// same (spec, source, denom).
+	// 4. Build the fact rows in memory (no DB, no tx). Every row is
+	// unique by construction (composite PK); dedup as a safety net.
 	const (
 		iBlockHeight = iota
 		iProviderID
@@ -366,7 +444,6 @@ func (h *Handler) Snapshot(ctx context.Context, tx pgx.Tx, target snapshotters.S
 		iDenom
 		iAmount
 	)
-	copyCols := []string{"block_height", "provider_id", "spec_id", "source_kind", "denom", "amount"}
 	type rowKey struct {
 		providerID int32
 		specID     int32
@@ -375,7 +452,11 @@ func (h *Handler) Snapshot(ctx context.Context, tx pgx.Tx, target snapshotters.S
 	}
 	seen := make(map[rowKey]struct{})
 	rows := make([][]any, 0, 256)
+	provWithRewards := 0
 	for _, r := range results {
+		if len(r.entries) > 0 {
+			provWithRewards++
+		}
 		provID, ok := provIDs[r.provider]
 		if !ok {
 			return fmt.Errorf("provider id missing for %s", r.provider)
@@ -411,23 +492,34 @@ func (h *Handler) Snapshot(ctx context.Context, tx pgx.Tx, target snapshotters.S
 			}
 		}
 	}
-	if len(rows) == 0 {
+	copyCols := []string{"block_height", "provider_id", "spec_id", "source_kind", "denom", "amount"}
+
+	// 5. Open the write tx: insert the snapshots row (parent FK) then
+	// CopyFrom the fact rows. Short tx — a few milliseconds of DB work,
+	// no HTTP inside. On failure the whole write tx rolls back and the
+	// next tick re-tries the date.
+	return pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		if err := h.insertSnapshotRow(ctx, tx, target, provWithRewards, "ok", ""); err != nil {
+			return fmt.Errorf("insert snapshot row: %w", err)
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		_, err := tx.CopyFrom(
+			ctx,
+			pgx.Identifier{h.cfg.Schema, "provider_rewards"},
+			copyCols,
+			pgx.CopyFromRows(rows),
+		)
+		if err != nil {
+			return fmt.Errorf("COPY provider_rewards: %w", err)
+		}
 		return nil
-	}
-	_, err = tx.CopyFrom(
-		ctx,
-		pgx.Identifier{h.cfg.Schema, "provider_rewards"},
-		copyCols,
-		pgx.CopyFromRows(rows),
-	)
-	if err != nil {
-		return fmt.Errorf("COPY provider_rewards: %w", err)
-	}
-	return nil
+	})
 }
 
-func (h *Handler) selectProviders(ctx context.Context, tx pgx.Tx) ([]string, error) {
-	rows, err := tx.Query(ctx, fmt.Sprintf(`SELECT addr FROM %s.providers ORDER BY id`, h.cfg.Schema))
+func (h *Handler) selectProviders(ctx context.Context, pool *pgxpool.Pool) ([]string, error) {
+	rows, err := pool.Query(ctx, fmt.Sprintf(`SELECT addr FROM %s.providers ORDER BY id`, h.cfg.Schema))
 	if err != nil {
 		return nil, err
 	}
@@ -471,48 +563,32 @@ type fetchResult struct {
 }
 
 func (h *Handler) fetchAll(ctx context.Context, providers []string, blockHeight int64) ([]fetchResult, error) {
-	type job struct {
-		addr string
-	}
-	type reply struct {
-		addr    string
-		entries []RewardEntry
-		err     error
-	}
-	jobs := make(chan job, len(providers))
-	replies := make(chan reply, len(providers))
-
+	// errgroup.WithContext gives us first-error-cancels-siblings semantics:
+	// when any worker's EstimatedRewards call fails, the derived ctx is
+	// cancelled and the other 24 in-flight HTTP loops bail out of their
+	// retry sleeps + active requests promptly, instead of running the
+	// remaining ~2000 retries for a snapshot that's already going to
+	// roll back.
+	g, gctx := errgroup.WithContext(ctx)
 	workers := h.cfg.Concurrency
-	if workers > len(providers) {
-		workers = len(providers)
+	if workers <= 0 {
+		workers = 25
 	}
-	for i := 0; i < workers; i++ {
-		go func() {
-			for j := range jobs {
-				entries, err := h.caller.EstimatedRewards(ctx, j.addr, blockHeight)
-				replies <- reply{addr: j.addr, entries: entries, err: err}
-			}
-		}()
-	}
-	for _, p := range providers {
-		jobs <- job{addr: p}
-	}
-	close(jobs)
+	g.SetLimit(workers)
 
-	out := make([]fetchResult, 0, len(providers))
-	var firstErr error
-	for range providers {
-		r := <-replies
-		if r.err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("provider %s: %w", r.addr, r.err)
+	out := make([]fetchResult, len(providers))
+	for i, addr := range providers {
+		g.Go(func() error {
+			entries, err := h.caller.EstimatedRewards(gctx, addr, blockHeight)
+			if err != nil {
+				return fmt.Errorf("provider %s: %w", addr, err)
 			}
-			continue
-		}
-		out = append(out, fetchResult{provider: r.addr, entries: r.entries})
+			out[i] = fetchResult{provider: addr, entries: entries}
+			return nil
+		})
 	}
-	if firstErr != nil {
-		return nil, firstErr
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -725,12 +801,21 @@ type HTTPCaller struct {
 // NewHTTPCaller builds an HTTPCaller. Pass the archive-backed REST URL;
 // the caller assumes the endpoint can answer historical heights via the
 // `x-cosmos-block-height` header.
+//
+// Uses rpc.SharedTransport so the snapshotter participates in the same
+// HTTP/2 + TLS-session-cache + high-idle-conns connection pool as the
+// rest of the indexer. Without this, http.DefaultTransport's
+// MaxIdleConnsPerHost=2 would force 23 of 25 concurrent workers to pay
+// a fresh TCP+TLS handshake per request (~50-150 ms each), compounded
+// on every pruned-replica retry (501 is the expected signal, not the
+// exception).
 func NewHTTPCaller(baseURL string, headers map[string]string) *HTTPCaller {
 	return &HTTPCaller{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		headers: headers,
 		http: &http.Client{
-			Timeout: 60 * time.Second,
+			Transport: rpc.SharedTransport,
+			Timeout:   60 * time.Second,
 		},
 	}
 }
@@ -840,9 +925,19 @@ func (c *HTTPCaller) Tip(ctx context.Context) (int64, error) {
 	return h, nil
 }
 
+// maxBodyBytes caps the response body we read per call. Estimated-
+// rewards responses are a few KB per provider; 16 MiB is generous
+// headroom that still bounds a compromised/broken upstream trying to
+// OOM the process via an unbounded body.
+const maxBodyBytes = 16 << 20
+
 // doGET runs one GET with the configured headers and (optionally) a
-// pinned block-height header. On 200 returns the raw body; on anything
-// else wraps a structured error.
+// pinned block-height header. Reads the body via io.LimitReader + ReadAll
+// before inspecting status — draining to EOF even on non-2xx is
+// required for Go's net/http to return the connection to the
+// keep-alive pool; skipping the drain forces a TCP+TLS handshake on
+// every retry, compounded over the pruned-replica 501s the retry loop
+// actually expects.
 func (c *HTTPCaller) doGET(ctx context.Context, path string, blockHeight int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
@@ -860,19 +955,12 @@ func (c *HTTPCaller) doGET(ctx context.Context, path string, blockHeight int64) 
 		return nil, err
 	}
 	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, &httpStatusErr{path: path, code: resp.StatusCode}
-	}
-	body := make([]byte, 0, 8192)
-	buf := make([]byte, 8192)
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			body = append(body, buf[:n]...)
-		}
-		if rerr != nil {
-			break
-		}
 	}
 	return body, nil
 }

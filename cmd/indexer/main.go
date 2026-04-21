@@ -337,16 +337,15 @@ func main() {
 		srv := &web.Server{
 			ChainID:           cfg.Network.ChainID,
 			State:             st,
-			Client:            client,
-			Registry:          reg,
-			Snapshotters:      snapReg,
-			Pool:              pool,
-			Stats:             pipelineStatsAdapter{pipe},
-			Start:             cfg.Indexer.StartHeight,
-			End:               cfg.Indexer.EndHeight,
-			SnapshotterSchema: cfg.Database.Schema,
-			GraphQLEnabled:    cfg.GraphQL.Enabled,
-			GraphQLUpstream:   cfg.GraphQL.Upstream,
+			Client:          client,
+			Registry:        reg,
+			Snapshotters:    snapReg,
+			Pool:            pool,
+			Stats:           pipelineStatsAdapter{pipe},
+			Start:           cfg.Indexer.StartHeight,
+			End:             cfg.Indexer.EndHeight,
+			GraphQLEnabled:  cfg.GraphQL.Enabled,
+			GraphQLUpstream: cfg.GraphQL.Upstream,
 		}
 		g.Go(func() error { return srv.ListenAndServe(gctx, cfg.Web.Addr) })
 	}

@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -167,9 +166,9 @@ func (r *Registry) runOne(ctx context.Context, pool *pgxpool.Pool, s Snapshotter
 			"block", tgt.BlockHeight)
 
 		start := time.Now()
-		err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
-			return s.Snapshot(ctx, tx, tgt)
-		})
+		// Snapshot owns its own tx boundary — see the Snapshotter
+		// interface comment for why the registry no longer wraps.
+		err := s.Snapshot(ctx, pool, tgt)
 		dur := time.Since(start)
 		if err != nil {
 			// Context cancellation isn't an error worth reporting from

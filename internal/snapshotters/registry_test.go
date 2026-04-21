@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -39,12 +38,11 @@ func (f *fakeSnap) BlocksDue(_ context.Context, _ *pgxpool.Pool) ([]SnapshotTarg
 	return f.targets, f.dueErr
 }
 
-func (f *fakeSnap) Snapshot(_ context.Context, _ pgx.Tx, target SnapshotTarget) error {
-	// In unit tests we never call this through the registry's real
-	// pgx.Tx path — we only reach here if someone exercised Snapshot
-	// directly. The registry path calls pgx.BeginTxFunc, which needs a
-	// real pool. Registry-level tests use runOne via RunLoop and rely
-	// on BlocksDue returning an empty list instead.
+func (f *fakeSnap) Snapshot(_ context.Context, _ *pgxpool.Pool, target SnapshotTarget) error {
+	// Snapshotters now own their own tx boundary, so the registry
+	// passes the pool through without wrapping. Registry-level tests
+	// use runOne via RunLoop and rely on BlocksDue returning an empty
+	// list instead of actually hitting this path.
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.seen = append(f.seen, target.BlockHeight)
@@ -53,6 +51,10 @@ func (f *fakeSnap) Snapshot(_ context.Context, _ pgx.Tx, target SnapshotTarget) 
 		return err
 	}
 	return nil
+}
+
+func (f *fakeSnap) Status(_ context.Context, _ *pgxpool.Pool) (Status, error) {
+	return Status{}, nil
 }
 
 // TestRegistry_TickRunsAllSnapshotters verifies that RunLoop calls

@@ -20,21 +20,29 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Snapshotter is the interface a concrete snapshotter implements. Mirrors
 // events.Handler in spirit — a stable name, DDL it owns, and a per-target
-// write path that runs inside a pgx.Tx supplied by the registry.
+// write path that owns its own tx boundary.
 //
 // Lifecycle per registry tick:
 //
 //   1. BlocksDue returns the still-needed snapshot targets (usually bounded
 //      to what the calendar has already produced and the DB hasn't covered).
-//   2. For each target the registry opens a fresh pgx.Tx, calls Snapshot,
-//      commits on success / rolls back on error. Failures are logged and
-//      the next target still runs.
+//   2. For each target the registry calls Snapshot, which does its own
+//      HTTP fan-out (outside any tx) and opens short transactions for
+//      the DB writes. Failures are logged and the next target still runs.
+//
+// Why the snapshotter owns the tx boundary instead of the registry:
+// a snapshot's chain fan-out can take several minutes (200+ providers,
+// up to 10 retries each, 60s HTTP timeout). Wrapping that in a single
+// pgx.Tx pinned a pool connection in `idle in transaction` for that
+// whole window, starving the status handler, dead-letter sweep, and
+// autovacuum. Pushing tx ownership into the concrete snapshotter lets
+// it keep the fan-out outside any tx and open short tx(s) only for
+// the actual DB writes.
 //
 // Snapshotter implementations MUST be concurrency-safe for sequential
 // invocations on one instance — the registry does not fan out snapshots
@@ -56,10 +64,41 @@ type Snapshotter interface {
 	// each returned target in turn.
 	BlocksDue(ctx context.Context, pool *pgxpool.Pool) ([]SnapshotTarget, error)
 
-	// Snapshot persists one snapshot. Runs inside the passed pgx.Tx so
-	// either every write lands atomically or none does — killing the
-	// process mid-snapshot leaves no partial rows.
-	Snapshot(ctx context.Context, tx pgx.Tx, target SnapshotTarget) error
+	// Snapshot persists one snapshot. The snapshotter owns its own tx
+	// boundary: chain fan-out happens outside any tx; short transactions
+	// are opened only for the DB writes. Atomicity is preserved inside
+	// those short tx(s); the function as a whole is not tx-atomic from
+	// fetch to insert (a crash mid-fetch leaves no partial rows because
+	// no rows have been written yet; a crash mid-write rolls back the
+	// write tx).
+	Snapshot(ctx context.Context, pool *pgxpool.Pool, target SnapshotTarget) error
+
+	// Status returns the current coverage view for this snapshotter as
+	// surfaced on /api/snapshotters and the dashboard card. Each
+	// snapshotter owns its own query against its own schema — the web
+	// layer only iterates and serialises. Kept in the base interface so
+	// web can stay generic; implementations may return an empty Status
+	// if they have no concept of expected/covered dates.
+	Status(ctx context.Context, pool *pgxpool.Pool) (Status, error)
+}
+
+// Status is the generic coverage view returned by Snapshotter.Status.
+// Rendered as /api/snapshotters entries and the dashboard timeline.
+// Dates are ISO-formatted (YYYY-MM-DD); Failed carries per-date error
+// strings for the UI's expandable errors block.
+type Status struct {
+	Expected []string
+	Covered  []string
+	Missing  []string
+	Failed   []FailedDate
+}
+
+// FailedDate pairs a snapshot date with the error message recorded for
+// it. Snapshotters that don't persist failed-status rows return an
+// empty slice.
+type FailedDate struct {
+	Date  string
+	Error string
 }
 
 // SnapshotTarget is one (logical date, chain block, chain time) tuple
