@@ -684,13 +684,14 @@ func coverageRatio(ranges []RangeJSON, from, to int64) float64 {
 // Matches the shape rendered by the UI card: expected/covered dates,
 // failures, and the last/next tick timestamps.
 type SnapshotterStatus struct {
-	Name       string                  `json:"name"`
-	Expected   []string                `json:"expected"`
-	Covered    []string                `json:"covered"`
-	Missing    []string                `json:"missing"`
-	Failed     []SnapshotterFailedDate `json:"failed"`
-	LastRunAt  *time.Time              `json:"last_run_at,omitempty"`
-	NextRunAt  *time.Time              `json:"next_run_at,omitempty"`
+	Name      string                  `json:"name"`
+	RESTURL   string                  `json:"rest_url,omitempty"`
+	Expected  []string                `json:"expected"`
+	Covered   []string                `json:"covered"`
+	Missing   []string                `json:"missing"`
+	Failed    []SnapshotterFailedDate `json:"failed"`
+	LastRunAt *time.Time              `json:"last_run_at,omitempty"`
+	NextRunAt *time.Time              `json:"next_run_at,omitempty"`
 }
 
 // SnapshotterFailedDate pairs a failed snapshot date with the recorded
@@ -733,6 +734,13 @@ func (s *Server) snapshotterStatus(ctx context.Context, sn snapshotters.Snapshot
 	if nr := s.Snapshotters.NextRunAt(); !nr.IsZero() {
 		t := nr
 		st.NextRunAt = &t
+	}
+	// URL-publishing seam: a snapshotter that wants its REST endpoint
+	// surfaced on the dashboard exposes it via RESTURL(). Kept as a
+	// local interface (not part of snapshotters.Snapshotter) so the
+	// core interface stays focused on DDL + schedule + snapshot.
+	if u, ok := sn.(interface{ RESTURL() string }); ok {
+		st.RESTURL = u.RESTURL()
 	}
 	if sn.Name() == provider_rewards.Name {
 		s.fillProviderRewardsStatus(ctx, &st)

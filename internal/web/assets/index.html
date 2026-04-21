@@ -1385,11 +1385,34 @@
       ? `${fmt(coveredN)} / ${fmt(total)} snapshots`
       : 'no snapshots yet';
 
-    const parts = [];
-    if (s.last_run_at) parts.push(`last run <b>${fmtDateTime(s.last_run_at)}</b>`);
-    if (s.next_run_at) parts.push(`next run <b>${fmtDateTime(s.next_run_at)}</b>`);
-    card.meta.innerHTML = parts.join(' · ');
-    card.meta.style.display = parts.length ? '' : 'none';
+    // Build meta via DOM nodes so URLs (which may contain `<`, `&`, etc.)
+    // land as text, not HTML. Other parts are known-safe (formatted
+    // timestamps).
+    card.meta.innerHTML = '';
+    const metaParts = [];
+    if (s.rest_url) {
+      const span = document.createElement('span');
+      span.appendChild(document.createTextNode('REST '));
+      const b = document.createElement('b');
+      b.textContent = s.rest_url;
+      span.appendChild(b);
+      metaParts.push(span);
+    }
+    if (s.last_run_at) {
+      const span = document.createElement('span');
+      span.innerHTML = `last run <b>${fmtDateTime(s.last_run_at)}</b>`;
+      metaParts.push(span);
+    }
+    if (s.next_run_at) {
+      const span = document.createElement('span');
+      span.innerHTML = `next run <b>${fmtDateTime(s.next_run_at)}</b>`;
+      metaParts.push(span);
+    }
+    for (let i = 0; i < metaParts.length; i++) {
+      if (i > 0) card.meta.appendChild(document.createTextNode(' · '));
+      card.meta.appendChild(metaParts[i]);
+    }
+    card.meta.style.display = metaParts.length ? '' : 'none';
 
     if (failed.length > 0) {
       card.errorsDetail.style.display = '';

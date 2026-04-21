@@ -106,6 +106,12 @@ type cacheEntry struct {
 // Name returns the stable identifier.
 func (h *Handler) Name() string { return Name }
 
+// RESTURL exposes the base REST endpoint this snapshotter is pointed
+// at, so the web UI can render it alongside the rest of the
+// configuration-dependent state. Empty when the operator left RESTURL
+// blank and the resolver's fallback didn't find a rest-kind endpoint.
+func (h *Handler) RESTURL() string { return h.cfg.RESTURL }
+
 // DDL returns the SQL statements that create the two tables owned by
 // this snapshotter. Idempotent.
 //
