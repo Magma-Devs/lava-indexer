@@ -465,38 +465,56 @@ Env overrides: `SNAPSHOTTERS_HANDLERS` (comma-separated — `all` /
 4. DDL applies at startup; RunLoop runs `BlocksDue` + `Snapshot` on
    every tick.
 
-## Priced denoms deriver
+## Denom pricing (schema + snapshotter)
 
-`internal/denoms` keeps `app.priced_denoms` populated from whatever
-raw denoms land in `app.provider_rewards`. One goroutine, 5 min
-ticker, idempotent on every pass.
+Denom data lives in three tables that split dictionary, operator
+overlay, and historical pricing cleanly:
 
-- **What it does.** `SELECT DISTINCT denom FROM app.provider_rewards`,
-  resolve each raw denom to a base form (`ulava` → `lava`,
-  `ibc/<hash>` → IBC trace lookup → base, otherwise lowercase-trimmed),
-  upsert into `app.priced_denoms`. New denoms land with
-  `coingecko_id = NULL`; existing ones just bump `last_seen_at`.
-- **Seeded mappings.** 23 known Cosmos tokens ship with
-  `base_denom → coingecko_id` applied on startup (`ON CONFLICT DO
-  UPDATE`). Adding a new mapping later is one SQL statement — no
-  redeploy.
-- **Adding a coingecko_id for a new denom.**
+- **`app.denoms`** — pure string dict (`id INT PK`, `denom UNIQUE`).
+  Same shape as `app.providers` / `app.chains`. Populated by the
+  `provider_rewards` snapshotter as it observes RESOLVED denoms
+  (IBC hashes are resolved to their base before they land here).
+- **`app.denom_metadata`** — operator-editable overlay keyed on
+  `denom_id`. Carries `base_denom`, `factor` (microdenom divisor),
+  `coingecko_id`, and a `suppress` boolean. Seeded at startup with
+  24 known Cosmos tokens (`ulava`, `uatom`, `uosmo`, …) plus a
+  blacklist for a rogue test IBC hash. Operators edit in-place via
+  SQL — no redeploy needed.
+- **`app.denom_prices`** — CoinGecko historical USD prices at each
+  monthly snapshot date. Written by the `denom_prices` snapshotter.
 
-  ```sql
-  UPDATE app.priced_denoms
-     SET coingecko_id = 'some-new-token'
-   WHERE base_denom = 'snt';
-  ```
+The `denom_prices` snapshotter shares the genesis-anchored monthly
+cadence with `provider_rewards`; every 17th-of-month@15:00 UTC slot
+gets one pricing row per denom that has a `coingecko_id` and isn't
+suppressed. LAVA goes first and is load-bearing — if LAVA's fetch
+fails after retries, the whole date is marked `status='failed'`.
 
-- **`coingecko_id IS NULL` is a monitoring hook.** The deriver logs a
-  WARN every time it lands a new base denom without a mapping, and
-  the dashboard's **Priced denoms** card renders an "N unmapped"
-  expandable list for a direct ops view. Alert on
-  `SELECT COUNT(*) FROM app.priced_denoms WHERE coingecko_id IS NULL`
-  if you care about price coverage.
-- **Disable.** `denoms.deriver.enabled: false` (or
-  `DENOMS_DERIVER_ENABLED=false`) skips DDL entirely and runs no
-  goroutine.
+`app.priced_rewards` is a materialised view that joins
+`provider_rewards` × `denom_metadata` × `denom_prices`, giving
+dashboards `display_amount` (raw / factor) and `value_usd`
+(display_amount × price_usd). `REFRESH MATERIALIZED VIEW
+CONCURRENTLY` runs after every successful price snapshot.
+
+**Adding a coingecko_id for a new denom.**
+
+```sql
+UPDATE app.denom_metadata dm
+   SET coingecko_id = 'some-new-token'
+  FROM app.denoms d
+ WHERE d.id = dm.denom_id AND d.denom = 'usnt';
+```
+
+**Suppressing a denom (keeps it out of `priced_rewards`).**
+
+```sql
+UPDATE app.denom_metadata dm
+   SET suppress = TRUE
+  FROM app.denoms d
+ WHERE d.id = dm.denom_id AND d.denom = 'ibc/BAD_HASH';
+```
+
+The suppress cache inside `provider_rewards` refreshes every tick, so
+the change takes effect on the next snapshot run.
 
 ## Aggregates: MVs and rollups
 

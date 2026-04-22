@@ -456,10 +456,6 @@
       <h2>Snapshotters</h2>
       <div id="snapshotters"></div>
     </section>
-    <section class="handlers" id="denoms-section" style="display:none">
-      <h2>Priced denoms</h2>
-      <div id="denoms-card" class="snapshotter"></div>
-    </section>
   </div>
 
   <div id="view-endpoints" class="view">
@@ -1444,78 +1440,6 @@
     }
   }
 
-  // Priced denoms card: one-shot render, in-place text updates.
-  async function refreshDenoms() {
-    const section = document.getElementById('denoms-section');
-    let data;
-    try {
-      const r = await fetch('/api/denoms');
-      if (!r.ok) throw new Error(r.status);
-      data = await r.json();
-    } catch (_) {
-      section.style.display = 'none';
-      return;
-    }
-    if (!data) {
-      section.style.display = 'none';
-      return;
-    }
-    section.style.display = '';
-    const root = document.getElementById('denoms-card');
-    const mapped = data.mapped || 0;
-    const unmapped = data.unmapped || 0;
-    const total = mapped + unmapped;
-    const unresolved = data.unresolved || [];
-    const lastRun = data.last_run_at ? new Date(data.last_run_at) : null;
-    root.innerHTML = '';
-
-    const head = el('div', { class: 'snap-head' },
-      el('div', { class: 'snap-name' }, 'priced_denoms'),
-      el('div', { class: 'snap-pct' },
-        el('div', { class: 'win' }, `${fmt(mapped)} mapped`),
-        el('div', { class: 'counts' }, `${fmt(unmapped)} unmapped · ${fmt(total)} total`),
-      ),
-    );
-    root.appendChild(head);
-
-    if (unresolved.length > 0) {
-      const details = el('details', { class: 'snap-errors' });
-      const summary = el('summary', {}, `${fmt(unresolved.length)} denom${unresolved.length === 1 ? '' : 's'} need${unresolved.length === 1 ? 's' : ''} a coingecko_id`);
-      const list = el('div', { class: 'err-list' });
-      for (const d of unresolved) {
-        const row = el('div', { class: 'err' });
-        const b = document.createElement('b');
-        b.textContent = d;
-        row.appendChild(b);
-        list.appendChild(row);
-      }
-      details.appendChild(summary);
-      details.appendChild(list);
-      root.appendChild(details);
-    }
-
-    const metaParts = [];
-    if (lastRun) {
-      const span = document.createElement('span');
-      span.innerHTML = `last scan <b>${fmtDateTime(lastRun)}</b>`;
-      metaParts.push(span);
-    }
-    if (data.last_err) {
-      const span = document.createElement('span');
-      span.style.color = 'var(--danger)';
-      span.textContent = 'last scan error: ' + data.last_err;
-      metaParts.push(span);
-    }
-    if (metaParts.length > 0) {
-      const meta = el('div', { class: 'snap-meta' });
-      for (let i = 0; i < metaParts.length; i++) {
-        if (i > 0) meta.appendChild(document.createTextNode(' · '));
-        meta.appendChild(metaParts[i]);
-      }
-      root.appendChild(meta);
-    }
-  }
-
   let currentView = 'overview';
   document.querySelectorAll('#tabs button').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -1551,7 +1475,6 @@
     // doesn't regress the main /api/status latency when the snapshots
     // table is large. Fetched alongside but independently.
     refreshSnapshotters().catch(err => console.error('snapshotters', err));
-    refreshDenoms().catch(err => console.error('denoms', err));
   }
   refresh();
   setInterval(refresh, 3000);

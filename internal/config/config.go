@@ -19,39 +19,7 @@ type Config struct {
 	Log           Log          `yaml:"log"`
 	GraphQL       GraphQL      `yaml:"graphql"`
 	Snapshotters  Snapshotters `yaml:"snapshotters"`
-	Denoms        Denoms       `yaml:"denoms"`
 	AggregatesDir string       `yaml:"aggregates_dir"`
-}
-
-// Denoms configures derived dictionaries of on-chain denoms observed
-// in ingestion data. Today that's just the priced_denoms deriver
-// (internal/denoms) which feeds an eventual price-snapshotter; future
-// derivers (e.g. a chain-registry dictionary) would get their own
-// subsection here.
-type Denoms struct {
-	Deriver DenomsDeriver `yaml:"deriver"`
-}
-
-// DenomsDeriver configures the priced_denoms derivation loop. Enabled
-// by default — the loop is cheap (one SELECT DISTINCT + up-to-N
-// upserts per tick) and the output table is a prerequisite for the
-// price snapshotter.
-type DenomsDeriver struct {
-	// Enabled is the master switch. When false, no DDL is applied and
-	// no goroutine is spawned.
-	Enabled bool `yaml:"enabled"`
-	// Interval is the tick period. Default 5m.
-	Interval time.Duration `yaml:"interval"`
-	// ResolveTimeout is the per-raw-denom timeout when looking up an
-	// IBC trace against the chain REST. Default 10s.
-	ResolveTimeout time.Duration `yaml:"resolve_timeout"`
-	// RESTURL is the base URL for IBC trace lookups. When empty,
-	// inherits from snapshotters.provider_rewards.rest_url (or its
-	// fallback to the first kind:rest endpoint).
-	RESTURL string `yaml:"rest_url"`
-	// RESTHeaders attaches extra HTTP headers (e.g. lava-extension:
-	// archive) to every trace lookup.
-	RESTHeaders map[string]string `yaml:"rest_headers,omitempty"`
 }
 
 // Snapshotters configures the snapshotter seam — periodic, calendar-
@@ -74,6 +42,7 @@ type Snapshotters struct {
 	Handlers []string `yaml:"handlers"`
 
 	ProviderRewards ProviderRewardsSnapshotter `yaml:"provider_rewards"`
+	DenomPrices     DenomPricesSnapshotter     `yaml:"denom_prices"`
 }
 
 // WantsSnapshotter reports whether `name` should be registered given
@@ -127,6 +96,21 @@ type ProviderRewardsSnapshotter struct {
 	// When empty, the snapshotter uses client.GenesisTime() (the
 	// chain's own /genesis response).
 	SnapshotAnchor string `yaml:"snapshot_anchor,omitempty"`
+}
+
+// DenomPricesSnapshotter configures the denom_prices snapshotter (see
+// internal/snapshotters/denom_prices). Gated by Snapshotters.Handlers —
+// absent from the list means the section is ignored entirely.
+type DenomPricesSnapshotter struct {
+	// CoingeckoAPIURL is the base URL of the CoinGecko API (v3). When
+	// empty, defaults to the public API. Operators with a Pro plan can
+	// point this at `https://pro-api.coingecko.com/api/v3` (and pass
+	// the API key via rest_headers).
+	CoingeckoAPIURL string `yaml:"coingecko_api_url"`
+
+	// RESTHeaders attaches extra HTTP headers to every CoinGecko call.
+	// Typical use: `x-cg-pro-api-key` for the Pro API.
+	RESTHeaders map[string]string `yaml:"rest_headers,omitempty"`
 }
 
 // ParsedSnapshotAnchor returns the snapshot-anchor time override as a
@@ -195,19 +179,19 @@ type Indexer struct {
 	// empty) to enable every compiled-in handler. Otherwise list handler
 	// names (e.g. ["lava_relay_payment"]). Handlers not listed are not
 	// registered, so they also don't record coverage in indexer_ranges.
-	Handlers         []string      `yaml:"handlers"`
-	TipConfirmations int64         `yaml:"tip_confirmations"`
+	Handlers         []string `yaml:"handlers"`
+	TipConfirmations int64    `yaml:"tip_confirmations"`
 	// FetchWorkers: positive number = explicit worker count; 0 = adaptive.
 	// In adaptive mode the process spawns `Σ endpoint.max_concurrency`
 	// workers at startup, so every endpoint can hit its ceiling in
 	// parallel. The AIMD controller then gates actual concurrent calls
 	// per endpoint, so over-provisioning workers just backpressures
 	// gracefully instead of overloading a node.
-	FetchWorkers     int           `yaml:"fetch_workers"`
-	FetchBatchSize   int           `yaml:"fetch_batch_size"`
-	WriteBatchRows   int           `yaml:"write_batch_rows"`
-	QueueDepth       int           `yaml:"queue_depth"`
-	TipPollInterval  time.Duration `yaml:"tip_poll_interval"`
+	FetchWorkers    int           `yaml:"fetch_workers"`
+	FetchBatchSize  int           `yaml:"fetch_batch_size"`
+	WriteBatchRows  int           `yaml:"write_batch_rows"`
+	QueueDepth      int           `yaml:"queue_depth"`
+	TipPollInterval time.Duration `yaml:"tip_poll_interval"`
 
 	// PruneOutsideWindow, if true, deletes any indexer_ranges and
 	// indexer_failures entries for heights outside [StartHeight, EndHeight|tip]
@@ -310,10 +294,10 @@ func Load(path string) (*Config, error) {
 func defaults() *Config {
 	return &Config{
 		Indexer: Indexer{
-			StartHeight:          1,
-			EndHeight:            0,
-			TipConfirmations:     0, // Cosmos/CometBFT has deterministic finality
-			FetchWorkers:         16,
+			StartHeight:      1,
+			EndHeight:        0,
+			TipConfirmations: 0, // Cosmos/CometBFT has deterministic finality
+			FetchWorkers:     16,
 			// Bumped from 10 to 50. With the fetch/persist split and the
 			// uncapped per-endpoint routing, roundtrip overhead matters more
 			// than queue depth; 50 heights per JSON-RPC batch cuts per-
@@ -369,12 +353,12 @@ func defaults() *Config {
 				EarliestDate: "2025-01-17",
 				Concurrency:  25,
 			},
-		},
-		Denoms: Denoms{
-			Deriver: DenomsDeriver{
-				Enabled:        true,
-				Interval:       5 * time.Minute,
-				ResolveTimeout: 10 * time.Second,
+			DenomPrices: DenomPricesSnapshotter{
+				// Public CoinGecko API. Free tier; rate-limited to ~10-30
+				// req/min. The snapshotter honours Retry-After and does
+				// exponential backoff with a 60s cap — see pricing.ts for
+				// the pattern this is ported from.
+				CoingeckoAPIURL: "https://api.coingecko.com/api/v3",
 			},
 		},
 		AggregatesDir: "./aggregates",
@@ -540,22 +524,9 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Snapshotters.ProviderRewards.RESTURL = v
 	}
 
-	// Denoms
-	if v := os.Getenv("DENOMS_DERIVER_ENABLED"); v != "" {
-		cfg.Denoms.Deriver.Enabled = strings.EqualFold(v, "true") || v == "1"
-	}
-	if v := os.Getenv("DENOMS_DERIVER_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Denoms.Deriver.Interval = d
-		}
-	}
-	if v := os.Getenv("DENOMS_DERIVER_RESOLVE_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Denoms.Deriver.ResolveTimeout = d
-		}
-	}
-	if v := os.Getenv("DENOMS_DERIVER_REST_URL"); v != "" {
-		cfg.Denoms.Deriver.RESTURL = v
+	// Denom prices
+	if v := os.Getenv("COINGECKO_API_URL"); v != "" {
+		cfg.Snapshotters.DenomPrices.CoingeckoAPIURL = v
 	}
 }
 

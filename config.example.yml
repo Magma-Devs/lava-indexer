@@ -169,21 +169,6 @@ graphql:
 # Unlisted snapshotters incur zero cost — no DDL is applied, no
 # goroutine is spawned, and the /api/snapshotters endpoint doesn't
 # surface them. Turn on only the ones your operator use case needs.
-# ----------------------------------------------------------------------------
-# Denoms deriver: auto-discovers raw denoms from provider_rewards and upserts
-# into app.priced_denoms. Seeds known base_denom → coingecko_id mappings at
-# startup. New denoms land with coingecko_id=NULL — operators fill mappings
-# via SQL (`UPDATE app.priced_denoms SET coingecko_id = '…' WHERE
-# base_denom = '…'`), no redeploy.
-# ----------------------------------------------------------------------------
-denoms:
-  deriver:
-    enabled: true
-    interval: 5m
-    resolve_timeout: 10s
-    # rest_url / rest_headers are optional — falls back to the
-    # snapshotters.provider_rewards REST URL for IBC trace lookups.
-
 snapshotters:
   # Which snapshotters to register. Same shape as indexer.handlers:
   # ["all"] enables every compiled-in snapshotter; empty also means
@@ -220,4 +205,15 @@ snapshotters:
     # Optional: headers attached to every snapshotter request. When
     # empty, inherits the headers from the chosen REST endpoint.
     # Typical use: `lava-extension: archive` on Lava's public gateway.
+    rest_headers: {}
+
+  denom_prices:
+    # CoinGecko API base URL. The free public API is fine; bump to
+    # https://pro-api.coingecko.com/api/v3 and add x-cg-pro-api-key to
+    # rest_headers if you have a Pro plan. Also settable via env:
+    # COINGECKO_API_URL.
+    coingecko_api_url: "https://api.coingecko.com/api/v3"
+
+    # Optional headers attached to every CoinGecko call. Use for Pro
+    # API keys.
     rest_headers: {}

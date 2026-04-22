@@ -28,7 +28,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/magma-devs/lava-indexer/internal/events"
 	"github.com/magma-devs/lava-indexer/internal/rpc"
-	"github.com/magma-devs/lava-indexer/internal/denoms"
 	"github.com/magma-devs/lava-indexer/internal/snapshotters"
 	"github.com/magma-devs/lava-indexer/internal/state"
 )
@@ -59,7 +58,6 @@ type Server struct {
 	Client          *rpc.MultiClient
 	Registry        *events.Registry
 	Snapshotters    *snapshotters.Registry // optional — nil disables the /api/snapshotters endpoint
-	DenomDeriver    *denoms.Deriver        // optional — nil disables the /api/denoms endpoint
 	Pool            *pgxpool.Pool
 	Stats           StatsProvider // optional — enables blocks/sec in the response
 	Start           int64
@@ -89,7 +87,6 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/history", s.handleHistory)
 	mux.HandleFunc("/api/snapshotters", s.handleSnapshotters)
-	mux.HandleFunc("/api/denoms", s.handleDenoms)
 
 	// Optional reverse-proxy to PostGraphile (or whatever GraphQL server).
 	// When enabled, /graphql and /graphiql on this port proxy to the
@@ -196,13 +193,13 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 
 type StatusResponse struct {
 	ChainID          string           `json:"chain_id"`
-	ChainGenesis     int64            `json:"chain_genesis"`               // always 1 by Cosmos convention
-	ChainGenesisTime *time.Time       `json:"chain_genesis_time,omitempty"`// set iff an endpoint reports earliest=1 (archive)
-	TipTime          *time.Time       `json:"tip_time,omitempty"`          // wall-clock time at current tip
-	Start            int64            `json:"start_height"`                // user-configured indexing window
+	ChainGenesis     int64            `json:"chain_genesis"`                // always 1 by Cosmos convention
+	ChainGenesisTime *time.Time       `json:"chain_genesis_time,omitempty"` // set iff an endpoint reports earliest=1 (archive)
+	TipTime          *time.Time       `json:"tip_time,omitempty"`           // wall-clock time at current tip
+	Start            int64            `json:"start_height"`                 // user-configured indexing window
 	End              int64            `json:"end_height"`
 	Tip              int64            `json:"tip"`
-	BlocksPerSec     float64          `json:"blocks_per_sec"`              // short-window rate, 0 if not tracking yet
+	BlocksPerSec     float64          `json:"blocks_per_sec"` // short-window rate, 0 if not tracking yet
 	GeneratedAt      time.Time        `json:"generated_at"`
 	Endpoints        []EndpointStatus `json:"endpoints"`
 	Handlers         []HandlerStatus  `json:"handlers"`
@@ -230,11 +227,11 @@ type RunSummary struct {
 // LifetimeStats aggregates across every run that has ever existed for this
 // schema — survives process restarts.
 type LifetimeStats struct {
-	FirstStartedAt  *time.Time `json:"first_started_at,omitempty"`
-	TotalSeconds    float64    `json:"total_seconds"`
-	TotalBlocks     int64      `json:"total_blocks"`
-	TotalRows       int64      `json:"total_rows"`
-	TotalRuns       int        `json:"total_runs"`
+	FirstStartedAt *time.Time `json:"first_started_at,omitempty"`
+	TotalSeconds   float64    `json:"total_seconds"`
+	TotalBlocks    int64      `json:"total_blocks"`
+	TotalRows      int64      `json:"total_rows"`
+	TotalRuns      int        `json:"total_runs"`
 }
 
 type EndpointStatus struct {
@@ -265,9 +262,9 @@ type EndpointMetricsJSON struct {
 }
 
 type HandlerStatus struct {
-	Name         string           `json:"name"`
-	EventTypes   []string         `json:"event_types"`
-	Ranges       []RangeJSON      `json:"ranges"`
+	Name       string      `json:"name"`
+	EventTypes []string    `json:"event_types"`
+	Ranges     []RangeJSON `json:"ranges"`
 	// Gaps is "never-tried" heights only: uncovered AND not currently in
 	// the dead-letter pool. FailedRanges holds the dead-letter side so
 	// the UI can report them separately with different semantics.
@@ -285,11 +282,11 @@ type HandlerStatus struct {
 	// FailureCount sums both slices; the individual fields let the UI
 	// distinguish a churning retry pool from one the pipeline has
 	// permanently given up on.
-	FailureCount     int64       `json:"failure_count"`
-	RetryingCount    int64       `json:"retrying_count"`
-	PermanentCount   int64       `json:"permanent_count"`
-	MaxRetries       int         `json:"max_retries"`
-	FailedRanges     []RangeJSON `json:"failed_ranges,omitempty"`
+	FailureCount   int64       `json:"failure_count"`
+	RetryingCount  int64       `json:"retrying_count"`
+	PermanentCount int64       `json:"permanent_count"`
+	MaxRetries     int         `json:"max_retries"`
+	FailedRanges   []RangeJSON `json:"failed_ranges,omitempty"`
 }
 
 type RangeJSON struct {
@@ -786,25 +783,4 @@ func (s *Server) snapshotterStatus(ctx context.Context, sn snapshotters.Snapshot
 		st.Failed = append(st.Failed, SnapshotterFailedDate{Date: fd.Date, Error: fd.Error})
 	}
 	return st
-}
-
-
-// ---------------------------------------------------------------------------
-// /api/denoms
-// ---------------------------------------------------------------------------
-
-// handleDenoms returns the current priced_denoms deriver snapshot:
-// counts of mapped / unmapped base denoms plus the unmapped list (so
-// the dashboard can surface an actionable "these need a coingecko_id"
-// signal). When the deriver isn't running, returns null.
-func (s *Server) handleDenoms(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("content-type", "application/json")
-	if s.DenomDeriver == nil {
-		_, _ = w.Write([]byte("null"))
-		return
-	}
-	st := s.DenomDeriver.Status()
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(st)
 }

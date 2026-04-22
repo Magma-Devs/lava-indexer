@@ -99,6 +99,7 @@ func NewWithCaller(cfg Config, caller RESTCaller) *Handler {
 		caller:    caller,
 		providers: events.NewDict(cfg.Schema, "providers", "addr"),
 		chains:    events.NewDict(cfg.Schema, "chains", "name"),
+		denoms:    events.NewDict(cfg.Schema, "denoms", "denom"),
 	}
 }
 
@@ -108,6 +109,11 @@ type Handler struct {
 	caller    RESTCaller
 	providers *events.Dict
 	chains    *events.Dict
+	// denoms maps RESOLVED denom strings (e.g. "ulava", "uatom") onto
+	// int32 FKs. IBC hashes are resolved via the caller's ResolveIBC
+	// method BEFORE being looked up here — the dict only ever holds
+	// canonical microdenoms, never `ibc/<hash>` entries.
+	denoms *events.Dict
 
 	// blockCache memoises (date → block height) across runs so a
 	// re-invoked BlocksDue after a DB blip doesn't re-do the binary
@@ -116,6 +122,19 @@ type Handler struct {
 	blockCache struct {
 		sync.Mutex
 		m map[string]cacheEntry
+	}
+
+	// suppressCache caches the set of RAW denoms whose
+	// denom_metadata.suppress column is TRUE. Checked on every
+	// per-provider parse so noisy test denoms don't leak into
+	// provider_rewards. Refreshed once per snapshot tick — a new
+	// entry via operator UPDATE takes effect on the next tick.
+	suppressCache struct {
+		sync.Mutex
+		// loadedAt is zero until the cache has been populated at least
+		// once; callers rebuild it on every Snapshot() entry.
+		loadedAt time.Time
+		set      map[string]struct{}
 	}
 }
 
@@ -133,25 +152,131 @@ func (h *Handler) Name() string { return Name }
 // blank and the resolver's fallback didn't find a rest-kind endpoint.
 func (h *Handler) RESTURL() string { return h.cfg.RESTURL }
 
-// DDL returns the SQL statements that create the two tables owned by
-// this snapshotter, PLUS idempotent CREATE-IF-NOT-EXISTS for the
-// `providers` and `chains` dict tables we FK into. The dict tables
-// are conceptually shared with `lava_relay_payment`, but including
-// them here (CREATE IF NOT EXISTS) lets the snapshotter start
-// standalone — without this, selecting `provider_rewards` but not
-// `lava_relay_payment` fails at startup because the FK targets don't
-// exist. Idempotent by design.
+// seedDenomMetadata returns the idempotent INSERT statements that seed
+// app.denoms + app.denom_metadata with the known microdenom →
+// base_denom mapping. Kept alongside the DDL so provider_rewards can
+// bootstrap the denom dict standalone — the denom_prices snapshotter
+// depends on this data but shouldn't re-seed it (single source of
+// truth).
 //
-//   - providers / chains — dict tables; shared with lava_relay_payment.
+// The raw set mirrors pricing.ts DENOM_CONVERSIONS + DENOM_COINGECKO_ID
+// verbatim (see /home/bob/projects/info/apps/api/src/rpc/pricing.ts).
+// New denoms are added here once; operators can override
+// coingecko_id / suppress in the DB with a targeted UPDATE — no
+// redeploy needed.
+func seedDenomMetadata(schema string) []string {
+	type seedEntry struct {
+		raw, base, factor, cgid string
+	}
+	entries := []seedEntry{
+		{"ulava", "lava", "1000000", "lava-network"},
+		{"uatom", "atom", "1000000", "cosmos"},
+		{"uosmo", "osmo", "1000000", "osmosis"},
+		{"ujuno", "juno", "1000000", "juno-network"},
+		{"ustars", "stars", "1000000", "stargaze"},
+		{"uakt", "akt", "1000000", "akash-network"},
+		{"uhuahua", "huahua", "1000000", "chihuahua-token"},
+		{"uevmos", "evmos", "1000000000000000000", "evmos"},
+		{"inj", "inj", "1000000000000000000", "injective-protocol"},
+		{"aevmos", "evmos", "1000000000000000000", "evmos"},
+		{"basecro", "cro", "100000000", "crypto-com-chain"},
+		{"uscrt", "scrt", "1000000", "secret"},
+		{"uiris", "iris", "1000000", "iris-network"},
+		{"uregen", "regen", "1000000", "regen"},
+		{"uion", "ion", "1000000", "ion"},
+		{"nanolike", "like", "1000000000", "likecoin"},
+		{"uaxl", "axl", "1000000", "axelar"},
+		{"uband", "band", "1000000", "band-protocol"},
+		{"ubld", "bld", "1000000", "agoric"},
+		{"ucmdx", "cmdx", "1000000", "comdex"},
+		{"ucre", "cre", "1000000", "crescent-network"},
+		{"uxprt", "xprt", "1000000", "persistence"},
+		{"uusdc", "usdc", "1000000", "usd-coin"},
+		{"unit-move", "move", "10000000", "movement"},
+	}
+	out := make([]string, 0, 2*len(entries)+2)
+	for _, e := range entries {
+		out = append(out, fmt.Sprintf(
+			`INSERT INTO %[1]s.denoms (denom) VALUES ('%[2]s') ON CONFLICT DO NOTHING;`,
+			schema, e.raw))
+		out = append(out, fmt.Sprintf(
+			`INSERT INTO %[1]s.denom_metadata (denom_id, base_denom, factor, coingecko_id)
+			 SELECT id, '%[3]s', %[4]s, '%[5]s' FROM %[1]s.denoms WHERE denom = '%[2]s'
+			 ON CONFLICT (denom_id) DO UPDATE
+			   SET base_denom = EXCLUDED.base_denom,
+			       factor = EXCLUDED.factor,
+			       coingecko_id = EXCLUDED.coingecko_id;`,
+			schema, e.raw, e.base, e.factor, e.cgid))
+	}
+	// Test-denom blacklist — observed on Lava mainnet as a rogue
+	// ibc/... hash whose `total[]` entries appeared in the rewards
+	// simulation. Flagging suppress=TRUE keeps it out of
+	// priced_rewards while still letting operators audit what came
+	// through via a direct query on app.provider_rewards.
+	const testDenom = "ibc/E3FCBEDDBAC500B1BAB90395C7D1E4F33D9B9ECFE82A16ED7D7D141A0152323F"
+	out = append(out, fmt.Sprintf(
+		`INSERT INTO %[1]s.denoms (denom) VALUES ('%[2]s') ON CONFLICT DO NOTHING;`,
+		schema, testDenom))
+	out = append(out, fmt.Sprintf(
+		`INSERT INTO %[1]s.denom_metadata (denom_id, base_denom, factor, suppress)
+		 SELECT id, 'test', 1, TRUE FROM %[1]s.denoms WHERE denom = '%[2]s'
+		 ON CONFLICT (denom_id) DO NOTHING;`,
+		schema, testDenom))
+	return out
+}
+
+// DDL returns the SQL statements that create the tables owned by this
+// snapshotter, PLUS idempotent CREATE-IF-NOT-EXISTS for the `providers`,
+// `chains`, and `denoms` dict tables we FK into. The dict tables are
+// conceptually shared with other handlers, but including them here
+// (CREATE IF NOT EXISTS) lets the snapshotter start standalone.
+//
+//   - providers / chains / denoms — dict tables.
+//   - denom_metadata — operator-editable overlay (base_denom, factor,
+//     coingecko_id, suppress) keyed on denom_id.
 //   - provider_rewards_snapshots is one row per (date, block) — the
 //     snapshotter's "coverage table". Unique on snapshot_date so a retry
 //     of the same date safely upserts.
-//   - provider_rewards is the fact table; the composite PK ensures a
-//     single (provider, spec, source, denom) tuple per block.
+//   - provider_rewards is the fact table; the composite PK keys on
+//     (block_height, provider, spec, source, denom_id, source_denom) so
+//     a single tuple lands once per block while preserving the RAW
+//     (pre-resolution) denom observed on-chain for audit.
+//
+// The schema is wiped + recreated (DROP TABLE IF EXISTS) because no
+// prod data exists yet and the column layout is changing. Safe to run
+// against an empty DB; catastrophic against populated prod — operators
+// must re-run the snapshotter to refill.
 func (h *Handler) DDL() []string {
-	return []string{
+	stmts := []string{
 		h.providers.DDL(),
 		h.chains.DDL(),
+		h.denoms.DDL(),
+		// denom_metadata: operator-editable overlay keyed on denom_id.
+		// Separate from denoms (the pure Dict) so the Dict pattern stays
+		// consistent with providers / chains.
+		fmt.Sprintf(`
+			CREATE TABLE IF NOT EXISTS %[1]s.denom_metadata (
+			  denom_id      INT PRIMARY KEY REFERENCES %[1]s.denoms(id),
+			  base_denom    TEXT           NOT NULL,
+			  factor        NUMERIC(40, 0) NOT NULL DEFAULT 1000000,
+			  coingecko_id  TEXT,
+			  suppress      BOOL           NOT NULL DEFAULT FALSE,
+			  first_seen_at TIMESTAMPTZ    NOT NULL DEFAULT now(),
+			  last_seen_at  TIMESTAMPTZ    NOT NULL DEFAULT now()
+			);`, h.cfg.Schema),
+	}
+	// Seed the known microdenoms + blacklist. Appended after the
+	// create-table statements so the INSERTs have targets.
+	stmts = append(stmts, seedDenomMetadata(h.cfg.Schema)...)
+	// DROP + recreate the fact tables — no prod data to preserve.
+	// CASCADE handles the priced_rewards MV defined in the
+	// denom_prices snapshotter's DDL.
+	stmts = append(stmts,
+		fmt.Sprintf(`DROP TABLE IF EXISTS %[1]s.provider_rewards CASCADE;`, h.cfg.Schema),
+		fmt.Sprintf(`DROP TABLE IF EXISTS %[1]s.provider_rewards_snapshots CASCADE;`, h.cfg.Schema),
+		// Leftover from the previous priced_denoms design — harmless
+		// if the table never existed.
+		fmt.Sprintf(`DROP TABLE IF EXISTS %[1]s.priced_denoms CASCADE;`, h.cfg.Schema),
 		fmt.Sprintf(`
 			CREATE TABLE IF NOT EXISTS %[1]s.provider_rewards_snapshots (
 			  block_height   BIGINT       PRIMARY KEY,
@@ -172,23 +297,28 @@ func (h *Handler) DDL() []string {
 			  provider_id  INT            NOT NULL REFERENCES %[1]s.providers(id),
 			  spec_id      INT            NOT NULL REFERENCES %[1]s.chains(id),
 			  source_kind  SMALLINT       NOT NULL,
-			  denom        TEXT           NOT NULL,
+			  denom_id     INT            NOT NULL REFERENCES %[1]s.denoms(id),
+			  source_denom TEXT           NOT NULL,
 			  amount       NUMERIC(40, 0) NOT NULL,
-			  PRIMARY KEY (block_height, provider_id, spec_id, source_kind, denom)
+			  PRIMARY KEY (block_height, provider_id, spec_id, source_kind, denom_id, source_denom)
 			);`, h.cfg.Schema),
 		fmt.Sprintf(`
 			CREATE INDEX IF NOT EXISTS idx_provider_rewards_provider_block
 			  ON %[1]s.provider_rewards (provider_id, block_height);`, h.cfg.Schema),
-	}
+	)
+	return stmts
 }
 
-// Warmup pre-loads the providers and chains dictionary caches.
+// Warmup pre-loads the providers, chains, and denoms dictionary caches.
 // Non-fatal on error — the Snapshot path tolerates a cold cache.
 func (h *Handler) Warmup(ctx context.Context, pool *pgxpool.Pool) error {
 	if err := h.providers.Warmup(ctx, pool); err != nil {
 		return err
 	}
-	return h.chains.Warmup(ctx, pool)
+	if err := h.chains.Warmup(ctx, pool); err != nil {
+		return err
+	}
+	return h.denoms.Warmup(ctx, pool)
 }
 
 // BlocksDue computes the set of (slot, block) targets that still need
@@ -381,7 +511,8 @@ func (h *Handler) Status(ctx context.Context, pool *pgxpool.Pool) (snapshotters.
 // a hardcoded monthly-17th@15:00 would, but correct for any chain
 // without hardcoded magic numbers.
 //
-// Exported for tests and for the Status() path.
+// Exported for tests, for the Status() path, AND for the sibling
+// denom_prices snapshotter which shares this cadence.
 func ExpectedDates(genesis, earliest, now time.Time) []time.Time {
 	if genesis.IsZero() {
 		return nil
@@ -415,9 +546,18 @@ const minSuccessFraction = 0.8
 
 // Snapshot runs one full snapshot for `target`. The HTTP fan-out
 // happens OUTSIDE any transaction — critical because a snapshot can
-// take several minutes at 25-way concurrency × 10 retries. We then
-// open two short transactions: one to resolve dict IDs (providers +
-// chains), one to write the snapshot row + fact rows.
+// take several minutes at 25-way concurrency × 10 retries. Per-date
+// flow:
+//
+//  1. Select providers (no tx).
+//  2. Fan out per-provider EstimatedRewards calls (no tx). Carries
+//     RAW denoms back.
+//  3. Refresh suppressed-denom cache (one pool read).
+//  4. Collect distinct raw denoms; for each `ibc/<hash>` call
+//     ResolveIBC; build raw→resolved map. ibc/ entries are never
+//     written to app.denoms.
+//  5. Short tx: providers.IDs + chains.IDs + denoms.IDs(RESOLVED).
+//  6. Short write tx: insertSnapshotRow + CopyFrom.
 //
 // Per-provider failures are tolerated up to (1 - minSuccessFraction)
 // of the provider set. Above that threshold the snapshot row is
@@ -442,6 +582,14 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 		return pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
 			return h.insertSnapshotRow(ctx, tx, target, 0, "ok", "")
 		})
+	}
+
+	// Refresh the suppress cache once per tick. Operators UPDATE
+	// denom_metadata.suppress out-of-band to blacklist a denom; the
+	// next tick picks the change up.
+	if err := h.refreshSuppressCache(ctx, pool); err != nil {
+		slog.Warn("snapshot: load suppress cache failed (continuing with stale)",
+			"snapshotter", Name, "err", err)
 	}
 
 	// 2. Fetch estimated rewards for every provider in a concurrency-
@@ -501,15 +649,35 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 		})
 	}
 
-	// 3. Resolve provider + spec IDs in their own short tx. Dict caches
-	// are commit-only, so these writes commit safely independent of the
-	// final write tx — a rollback in step 4 leaves the dict rows in
-	// place, which is harmless (the composite PK on provider_rewards
-	// prevents dup-inserting fact rows, and dict rows are idempotent by
-	// design). Only outcomeFetched rows contribute entries to map;
-	// noRewards and failed providers don't surface fact rows.
+	// 3. Drop suppressed denoms before resolution — runs off the raw
+	// denom so an operator blacklist for `ibc/<hash>` works even if
+	// the trace lookup fails.
+	h.dropSuppressed(results)
+
+	// 4. Collect unique raw denoms, resolve IBC hashes. `rawToResolved`
+	// maps every raw denom we saw to its canonical form; the denom
+	// dict IDs are looked up on the RESOLVED values so `ibc/…` entries
+	// never land in app.denoms.
+	rawToResolved, err := h.resolveDenoms(ctx, results)
+	if err != nil {
+		// IBC resolution failure is tolerated with a warning — the
+		// caller's fetchAll already handled transient HTTP issues
+		// generally, so a hard error here means resolveDenoms hit a
+		// bug. Persist what we have as 'failed' rather than crash
+		// the snapshotter.
+		errMsg := fmt.Sprintf("resolve denoms: %v", err)
+		return pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+			return h.insertSnapshotRow(ctx, tx, target, fetched, "failed", errMsg)
+		})
+	}
+
+	// 5. Resolve provider + spec + denom IDs in their own short tx.
+	// Dict caches are commit-only, so these writes commit safely
+	// independent of the final write tx. Only outcomeFetched rows
+	// contribute entries; noRewards/failed/suppressed providers don't.
 	provSet := make(map[string]struct{})
 	specSet := make(map[string]struct{})
+	denomSet := make(map[string]struct{})
 	for _, r := range results {
 		if r.outcome != outcomeFetched {
 			continue
@@ -517,17 +685,23 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 		provSet[r.provider] = struct{}{}
 		for _, entry := range r.entries {
 			specSet[entry.Spec] = struct{}{}
+			for _, amt := range entry.Amounts {
+				resolved := rawToResolved[amt.Denom]
+				if resolved == "" {
+					// Resolution failed (e.g. ibc/ 5xx that exhausted
+					// retries). Skip the entry; it will be retried on
+					// the next snapshot.
+					continue
+				}
+				denomSet[resolved] = struct{}{}
+			}
 		}
 	}
-	provList := make([]string, 0, len(provSet))
-	for p := range provSet {
-		provList = append(provList, p)
-	}
-	specList := make([]string, 0, len(specSet))
-	for s := range specSet {
-		specList = append(specList, s)
-	}
-	var provIDs, specIDs map[string]int32
+	provList := collectKeys(provSet)
+	specList := collectKeys(specSet)
+	denomList := collectKeys(denomSet)
+
+	var provIDs, specIDs, denomIDs map[string]int32
 	err = pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		var e error
 		provIDs, e = h.providers.IDs(ctx, tx, provList)
@@ -538,27 +712,33 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 		if e != nil {
 			return fmt.Errorf("spec ids: %w", e)
 		}
+		denomIDs, e = h.denoms.IDs(ctx, tx, denomList)
+		if e != nil {
+			return fmt.Errorf("denom ids: %w", e)
+		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
 
-	// 4. Build the fact rows in memory (no DB, no tx). Every row is
+	// 6. Build the fact rows in memory (no DB, no tx). Every row is
 	// unique by construction (composite PK); dedup as a safety net.
 	const (
 		iBlockHeight = iota
 		iProviderID
 		iSpecID
 		iSourceKind
-		iDenom
+		iDenomID
+		iSourceDenom
 		iAmount
 	)
 	type rowKey struct {
-		providerID int32
-		specID     int32
-		sourceKind int16
-		denom      string
+		providerID  int32
+		specID      int32
+		sourceKind  int16
+		denomID     int32
+		sourceDenom string
 	}
 	seen := make(map[rowKey]struct{})
 	rows := make([][]any, 0, 256)
@@ -580,34 +760,44 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 				return fmt.Errorf("spec id missing for %s", entry.Spec)
 			}
 			for _, amt := range entry.Amounts {
+				resolved := rawToResolved[amt.Denom]
+				if resolved == "" {
+					continue
+				}
+				denomID, ok := denomIDs[resolved]
+				if !ok {
+					return fmt.Errorf("denom id missing for resolved=%s (raw=%s)", resolved, amt.Denom)
+				}
 				amount, ok := new(big.Int).SetString(amt.Amount, 10)
 				if !ok {
 					return fmt.Errorf("parse amount %q for %s/%s", amt.Amount, r.provider, entry.Spec)
 				}
 				k := rowKey{
-					providerID: provID,
-					specID:     specID,
-					sourceKind: int16(entry.SourceKind),
-					denom:      amt.Denom,
+					providerID:  provID,
+					specID:      specID,
+					sourceKind:  int16(entry.SourceKind),
+					denomID:     denomID,
+					sourceDenom: amt.Denom,
 				}
 				if _, dup := seen[k]; dup {
 					continue
 				}
 				seen[k] = struct{}{}
-				row := make([]any, 6)
+				row := make([]any, 7)
 				row[iBlockHeight] = target.BlockHeight
 				row[iProviderID] = provID
 				row[iSpecID] = specID
 				row[iSourceKind] = int16(entry.SourceKind)
-				row[iDenom] = amt.Denom
+				row[iDenomID] = denomID
+				row[iSourceDenom] = amt.Denom
 				row[iAmount] = amount
 				rows = append(rows, row)
 			}
 		}
 	}
-	copyCols := []string{"block_height", "provider_id", "spec_id", "source_kind", "denom", "amount"}
+	copyCols := []string{"block_height", "provider_id", "spec_id", "source_kind", "denom_id", "source_denom", "amount"}
 
-	// 5. Open the write tx: insert the snapshots row (parent FK) then
+	// 7. Open the write tx: insert the snapshots row (parent FK) then
 	// CopyFrom the fact rows. Short tx — a few milliseconds of DB work,
 	// no HTTP inside. On failure the whole write tx rolls back and the
 	// next tick re-tries the date.
@@ -629,6 +819,132 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 		}
 		return nil
 	})
+}
+
+// collectKeys is a tiny helper for deterministic list order out of a
+// set. Used for dict ID lookups — the underlying IDs() call dedups
+// internally, but providing a deduped slice keeps the wire message
+// smaller.
+func collectKeys(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	return out
+}
+
+// refreshSuppressCache loads the set of RAW denoms whose
+// denom_metadata.suppress column is TRUE. Joined across denom_metadata
+// + denoms so the result keys off the raw on-chain form (what
+// per-provider fetches surface, before IBC resolution). Runs once per
+// Snapshot() call.
+func (h *Handler) refreshSuppressCache(ctx context.Context, pool *pgxpool.Pool) error {
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
+		SELECT d.denom
+		FROM %[1]s.denom_metadata dm
+		JOIN %[1]s.denoms d ON d.id = dm.denom_id
+		WHERE dm.suppress = TRUE`, h.cfg.Schema))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	set := make(map[string]struct{})
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return err
+		}
+		set[s] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	h.suppressCache.Lock()
+	h.suppressCache.set = set
+	h.suppressCache.loadedAt = time.Now()
+	h.suppressCache.Unlock()
+	return nil
+}
+
+// dropSuppressed mutates `results` in-place, stripping any Amount
+// entries whose RAW denom is in the suppress cache. Operates before
+// IBC resolution so an operator can blacklist an `ibc/<hash>` without
+// needing the trace lookup to succeed first.
+func (h *Handler) dropSuppressed(results []fetchResult) {
+	h.suppressCache.Lock()
+	set := h.suppressCache.set
+	h.suppressCache.Unlock()
+	if len(set) == 0 {
+		return
+	}
+	for i := range results {
+		if results[i].outcome != outcomeFetched {
+			continue
+		}
+		for j := range results[i].entries {
+			filtered := results[i].entries[j].Amounts[:0]
+			for _, amt := range results[i].entries[j].Amounts {
+				if _, bad := set[amt.Denom]; bad {
+					continue
+				}
+				filtered = append(filtered, amt)
+			}
+			results[i].entries[j].Amounts = filtered
+		}
+	}
+}
+
+// resolveDenoms builds a raw→resolved map for every distinct denom in
+// `results`. Non-IBC denoms pass through unchanged (their on-chain form
+// IS the dict key). `ibc/<hash>` entries are resolved via the caller's
+// ResolveIBC — permanent failures (404) map to "" (caller skips the
+// row); transient failures return an error and abort the snapshot.
+func (h *Handler) resolveDenoms(ctx context.Context, results []fetchResult) (map[string]string, error) {
+	raws := make(map[string]struct{})
+	for _, r := range results {
+		if r.outcome != outcomeFetched {
+			continue
+		}
+		for _, entry := range r.entries {
+			for _, amt := range entry.Amounts {
+				raws[amt.Denom] = struct{}{}
+			}
+		}
+	}
+	out := make(map[string]string, len(raws))
+	for raw := range raws {
+		if !strings.HasPrefix(raw, "ibc/") {
+			out[raw] = raw
+			continue
+		}
+		hash := strings.TrimPrefix(raw, "ibc/")
+		if hash == "" {
+			// Malformed — skip (empty-string outcome means the caller
+			// drops this amt from the row set).
+			out[raw] = ""
+			continue
+		}
+		base, err := h.caller.ResolveIBC(ctx, hash)
+		if err != nil {
+			if errors.Is(err, errIBCNotFound) {
+				// Permanent — record empty so the caller skips. We
+				// don't want to abort the whole snapshot for a
+				// malformed hash.
+				slog.Warn("ibc trace not found, dropping amount",
+					"snapshotter", Name, "raw", raw)
+				out[raw] = ""
+				continue
+			}
+			// Transient — abort so the next tick retries.
+			return nil, fmt.Errorf("resolve ibc %s: %w", raw, err)
+		}
+		if base == "" {
+			out[raw] = ""
+			continue
+		}
+		out[raw] = base
+	}
+	return out, nil
 }
 
 func (h *Handler) selectProviders(ctx context.Context, pool *pgxpool.Pool) ([]string, error) {
@@ -757,6 +1073,12 @@ type RESTCaller interface {
 	// caller can drive the binary search used by BlocksDue.
 	BlockTime(ctx context.Context, height int64) (time.Time, error)
 	Tip(ctx context.Context) (int64, error)
+
+	// ResolveIBC returns the base_denom for an IBC hash (the trailing
+	// portion of an `ibc/<hash>` denom string). 404 responses surface
+	// as errIBCNotFound (permanent) so the caller can drop just that
+	// amount; 5xx / network errors surface as other errors (transient).
+	ResolveIBC(ctx context.Context, hash string) (string, error)
 }
 
 // RewardEntry is one parsed `info[]` element from the estimated-rewards
@@ -950,6 +1272,10 @@ var errNoRewards = errors.New("chain reports no rewards for provider")
 // they're just "state unavailable" for this (provider, height) pair.
 var errStatePruned = errors.New("state pruned at queried height")
 
+// errIBCNotFound is a permanent 404 from the IBC /denom_traces
+// endpoint. Caller drops the amount rather than aborting the snapshot.
+var errIBCNotFound = errors.New("ibc trace 404 (permanent)")
+
 func classifyChainMessage(msg string) error {
 	low := strings.ToLower(msg)
 	// Patterns that indicate the REPLICA (not the chain state) is the
@@ -987,6 +1313,15 @@ type HTTPCaller struct {
 	baseURL string
 	headers map[string]string
 	http    *http.Client
+
+	// ibcCache memoises denom_traces lookups. IBC traces are immutable
+	// once issued, so a resolved hash never changes; we keep the
+	// cache forever. Population is lazy — the first query for each
+	// hash pays one round-trip, every subsequent one is a map hit.
+	ibcCache struct {
+		sync.RWMutex
+		m map[string]string
+	}
 }
 
 // NewHTTPCaller builds an HTTPCaller. Pass the archive-backed REST URL;
@@ -1132,6 +1467,54 @@ func (c *HTTPCaller) Tip(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("parse tip height %q: %w", resp.Block.Header.Height, err)
 	}
 	return h, nil
+}
+
+// ResolveIBC looks up an IBC hash's `base_denom` via
+// /ibc/apps/transfer/v1/denom_traces/{hash}. Cached in-process
+// forever (IBC traces are immutable). A 404 surfaces as
+// errIBCNotFound (permanent — caller drops the row). Other 5xx /
+// network errors return a plain error (transient — caller retries).
+func (c *HTTPCaller) ResolveIBC(ctx context.Context, hash string) (string, error) {
+	if hash == "" {
+		return "", errors.New("ibc hash empty")
+	}
+	c.ibcCache.RLock()
+	if c.ibcCache.m != nil {
+		if b, ok := c.ibcCache.m[hash]; ok {
+			c.ibcCache.RUnlock()
+			return b, nil
+		}
+	}
+	c.ibcCache.RUnlock()
+
+	path := "/ibc/apps/transfer/v1/denom_traces/" + url.PathEscape(hash)
+	body, err := c.doGET(ctx, path, 0)
+	if err != nil {
+		var hs *httpStatusErr
+		if errors.As(err, &hs) && hs.code == 404 {
+			return "", fmt.Errorf("%w: hash=%s", errIBCNotFound, hash)
+		}
+		return "", fmt.Errorf("ibc trace %s: %w", hash, err)
+	}
+	var parsed struct {
+		DenomTrace struct {
+			BaseDenom string `json:"base_denom"`
+		} `json:"denom_trace"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", fmt.Errorf("ibc trace %s decode: %w", hash, err)
+	}
+	base := strings.TrimSpace(parsed.DenomTrace.BaseDenom)
+	if base == "" {
+		return "", fmt.Errorf("ibc trace %s: empty base_denom", hash)
+	}
+	c.ibcCache.Lock()
+	if c.ibcCache.m == nil {
+		c.ibcCache.m = make(map[string]string, 64)
+	}
+	c.ibcCache.m[hash] = base
+	c.ibcCache.Unlock()
+	return base, nil
 }
 
 // maxBodyBytes caps the response body we read per call. Estimated-
