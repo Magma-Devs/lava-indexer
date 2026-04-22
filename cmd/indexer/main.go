@@ -25,6 +25,7 @@ import (
 	"github.com/magma-devs/lava-indexer/internal/snapshotters"
 	"github.com/magma-devs/lava-indexer/internal/snapshotters/denom_prices"
 	"github.com/magma-devs/lava-indexer/internal/snapshotters/provider_rewards"
+	"github.com/magma-devs/lava-indexer/internal/snapshotters/supply"
 	"github.com/magma-devs/lava-indexer/internal/state"
 	"github.com/magma-devs/lava-indexer/internal/web"
 	_ "go.uber.org/automaxprocs" // auto-tunes GOMAXPROCS from cgroup CPU quota
@@ -263,6 +264,19 @@ func main() {
 		RESTCaller:       providerRewardsCaller,
 		GenesisHeight:    client.Genesis(),
 		GenesisTime:      snapAnchor,
+	}))
+	// Supply snapshotter: shares the genesis-anchored cadence and
+	// block-resolution caller with the other two; the only new chain
+	// call it makes is /cosmos/bank/v1beta1/supply, handled by supply's
+	// own HTTPCaller.
+	registerSnapshotter(supply.New(supply.Config{
+		Schema:        cfg.Database.Schema,
+		EarliestDate:  cfg.Snapshotters.Supply.ParsedEarliestDate(),
+		RESTURL:       resolveSupplyRESTURL(cfg),
+		RESTHeaders:   resolveSupplyRESTHeaders(cfg),
+		RESTCaller:    providerRewardsCaller,
+		GenesisHeight: client.Genesis(),
+		GenesisTime:   snapAnchor,
 	}))
 	// Apply snapshotter DDL, same one-tx-per-snapshotter pattern as
 	// event handlers. Each snapshotter owns its tables so a partial DDL
@@ -512,6 +526,44 @@ func resolveSnapshotterRESTHeaders(cfg *config.Config) map[string]string {
 	if len(cfg.Snapshotters.ProviderRewards.RESTHeaders) > 0 {
 		out := make(map[string]string, len(cfg.Snapshotters.ProviderRewards.RESTHeaders))
 		for k, v := range cfg.Snapshotters.ProviderRewards.RESTHeaders {
+			out[k] = v
+		}
+		return out
+	}
+	for _, e := range cfg.Network.Endpoints {
+		if e.Kind == "rest" {
+			out := make(map[string]string, len(e.Headers))
+			for k, v := range e.Headers {
+				out[k] = v
+			}
+			return out
+		}
+	}
+	return nil
+}
+
+// resolveSupplyRESTURL mirrors resolveSnapshotterRESTURL but reads the
+// supply section's override first. Kept separate so an operator can
+// route supply queries through a different archive than rewards (e.g.
+// when one upstream has bank-module pruning enabled and another doesn't).
+func resolveSupplyRESTURL(cfg *config.Config) string {
+	if u := strings.TrimSpace(cfg.Snapshotters.Supply.RESTURL); u != "" {
+		return u
+	}
+	for _, e := range cfg.Network.Endpoints {
+		if e.Kind == "rest" {
+			return e.URL
+		}
+	}
+	return ""
+}
+
+// resolveSupplyRESTHeaders mirrors resolveSnapshotterRESTHeaders for
+// the supply snapshotter.
+func resolveSupplyRESTHeaders(cfg *config.Config) map[string]string {
+	if len(cfg.Snapshotters.Supply.RESTHeaders) > 0 {
+		out := make(map[string]string, len(cfg.Snapshotters.Supply.RESTHeaders))
+		for k, v := range cfg.Snapshotters.Supply.RESTHeaders {
 			out[k] = v
 		}
 		return out
