@@ -546,6 +546,11 @@ func resolveSnapshotterRESTHeaders(cfg *config.Config) map[string]string {
 // supply section's override first. Kept separate so an operator can
 // route supply queries through a different archive than rewards (e.g.
 // when one upstream has bank-module pruning enabled and another doesn't).
+// Final fallback: provider_rewards' REST URL. Both snapshotters hit the
+// same chain LCD, so the common single-REST deploy shape (no
+// kind: rest in network.endpoints, one rest_url set under
+// provider_rewards) should Just Work for supply without a second
+// duplicated URL in config.
 func resolveSupplyRESTURL(cfg *config.Config) string {
 	if u := strings.TrimSpace(cfg.Snapshotters.Supply.RESTURL); u != "" {
 		return u
@@ -555,29 +560,33 @@ func resolveSupplyRESTURL(cfg *config.Config) string {
 			return e.URL
 		}
 	}
-	return ""
+	return strings.TrimSpace(cfg.Snapshotters.ProviderRewards.RESTURL)
 }
 
 // resolveSupplyRESTHeaders mirrors resolveSnapshotterRESTHeaders for
-// the supply snapshotter.
+// the supply snapshotter. Same three-level fallback as the URL — the
+// archive-routing header (`lava-extension: archive`) is typically set
+// once under provider_rewards, and supply should inherit it.
 func resolveSupplyRESTHeaders(cfg *config.Config) map[string]string {
-	if len(cfg.Snapshotters.Supply.RESTHeaders) > 0 {
-		out := make(map[string]string, len(cfg.Snapshotters.Supply.RESTHeaders))
-		for k, v := range cfg.Snapshotters.Supply.RESTHeaders {
+	clone := func(src map[string]string) map[string]string {
+		if len(src) == 0 {
+			return nil
+		}
+		out := make(map[string]string, len(src))
+		for k, v := range src {
 			out[k] = v
 		}
 		return out
 	}
+	if len(cfg.Snapshotters.Supply.RESTHeaders) > 0 {
+		return clone(cfg.Snapshotters.Supply.RESTHeaders)
+	}
 	for _, e := range cfg.Network.Endpoints {
 		if e.Kind == "rest" {
-			out := make(map[string]string, len(e.Headers))
-			for k, v := range e.Headers {
-				out[k] = v
-			}
-			return out
+			return clone(e.Headers)
 		}
 	}
-	return nil
+	return clone(cfg.Snapshotters.ProviderRewards.RESTHeaders)
 }
 
 // multiClientSignals bridges rpc.MultiClient into pipeline.SignalSource.
