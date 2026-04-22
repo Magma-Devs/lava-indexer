@@ -217,3 +217,22 @@ snapshotters:
     # Optional headers attached to every CoinGecko call. Use for Pro
     # API keys.
     rest_headers: {}
+
+  supply:
+    # First monthly-17th we attempt to snapshot. Optional — when empty
+    # the snapshotter emits every genesis-anchored slot from
+    # genesis+1mo through now. Operators set it only to skip early
+    # history they don't care about.
+    earliest_date: ""
+
+    # Optional: dedicated REST URL for this snapshotter. When empty,
+    # falls back to the first `network.endpoints` entry whose kind
+    # is `rest`. Set when you want to route supply queries through a
+    # known-archive upstream while the main indexer uses a pruning
+    # fleet. Also settable via env: SUPPLY_REST_URL.
+    rest_url: ""
+
+    # Optional: headers attached to every snapshotter request. When
+    # empty, inherits the headers from the chosen REST endpoint.
+    # Typical use: `lava-extension: archive` on Lava's public gateway.
+    rest_headers: {}

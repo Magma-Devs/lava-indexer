@@ -43,6 +43,7 @@ type Snapshotters struct {
 
 	ProviderRewards ProviderRewardsSnapshotter `yaml:"provider_rewards"`
 	DenomPrices     DenomPricesSnapshotter     `yaml:"denom_prices"`
+	Supply          SupplySnapshotter          `yaml:"supply"`
 }
 
 // WantsSnapshotter reports whether `name` should be registered given
@@ -111,6 +112,47 @@ type DenomPricesSnapshotter struct {
 	// RESTHeaders attaches extra HTTP headers to every CoinGecko call.
 	// Typical use: `x-cg-pro-api-key` for the Pro API.
 	RESTHeaders map[string]string `yaml:"rest_headers,omitempty"`
+}
+
+// SupplySnapshotter configures the supply snapshotter (see
+// internal/snapshotters/supply). Gated by Snapshotters.Handlers —
+// absent from the list means the section is ignored entirely.
+//
+// Same overlap pattern as provider_rewards: when REST URL / headers
+// are empty, the wiring in cmd/indexer/main.go falls back to the first
+// `kind: rest` endpoint in network.endpoints so a typical single-config
+// deployment doesn't need a duplicated URL.
+type SupplySnapshotter struct {
+	// EarliestDate is the first monthly-17th we attempt to snapshot.
+	// Format: "2006-01-02". Optional — when empty the snapshotter
+	// emits every genesis-anchored slot from genesis+1mo through now.
+	EarliestDate string `yaml:"earliest_date"`
+
+	// RESTURL optionally overrides the main REST endpoint used for
+	// this snapshotter. When empty, the snapshotter falls back to the
+	// first `kind: rest` endpoint in network.endpoints. Set this when
+	// you want to route supply queries through a dedicated
+	// archive-backed endpoint.
+	RESTURL string `yaml:"rest_url"`
+
+	// RESTHeaders attaches extra HTTP headers to every snapshotter
+	// call to RESTURL. Typical use: `lava-extension: archive` to hint
+	// archive-mode on Lava's public gateway.
+	RESTHeaders map[string]string `yaml:"rest_headers,omitempty"`
+}
+
+// ParsedEarliestDate returns the earliest_date parsed as a UTC date.
+// Relies on validate() having rejected invalid strings — returns the
+// zero time.Time when empty so the snapshotter floors at genesis+1mo.
+func (p SupplySnapshotter) ParsedEarliestDate() time.Time {
+	if strings.TrimSpace(p.EarliestDate) == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse("2006-01-02", p.EarliestDate)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 // ParsedSnapshotAnchor returns the snapshot-anchor time override as a
@@ -528,6 +570,11 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("COINGECKO_API_URL"); v != "" {
 		cfg.Snapshotters.DenomPrices.CoingeckoAPIURL = v
 	}
+
+	// Supply
+	if v := os.Getenv("SUPPLY_REST_URL"); v != "" {
+		cfg.Snapshotters.Supply.RESTURL = v
+	}
 }
 
 func envInt(name string) (int, bool) {
@@ -597,6 +644,15 @@ func (c *Config) validate() error {
 		if ed := strings.TrimSpace(c.Snapshotters.ProviderRewards.EarliestDate); ed != "" {
 			if _, err := time.Parse("2006-01-02", ed); err != nil {
 				return fmt.Errorf("snapshotters.provider_rewards.earliest_date: %w", err)
+			}
+		}
+	}
+	if c.Snapshotters.WantsSnapshotter("supply") {
+		// Same optional-floor semantics as provider_rewards —
+		// validate format if set, let empty fall through.
+		if ed := strings.TrimSpace(c.Snapshotters.Supply.EarliestDate); ed != "" {
+			if _, err := time.Parse("2006-01-02", ed); err != nil {
+				return fmt.Errorf("snapshotters.supply.earliest_date: %w", err)
 			}
 		}
 	}
