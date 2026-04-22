@@ -801,7 +801,7 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 	// CopyFrom the fact rows. Short tx — a few milliseconds of DB work,
 	// no HTTP inside. On failure the whole write tx rolls back and the
 	// next tick re-tries the date.
-	return pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+	err = pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		if err := h.insertSnapshotRow(ctx, tx, target, provWithRewards, "ok", ""); err != nil {
 			return fmt.Errorf("insert snapshot row: %w", err)
 		}
@@ -819,6 +819,23 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	// Refresh the pricing MV so new reward rows become queryable even
+	// when denom_prices hasn't caught up yet (or is failing on
+	// CoinGecko rate limits). The MV LEFT JOINs denom_prices, so rows
+	// with no matching price row still appear with price_usd = NULL.
+	// Non-fatal on error — rewards are already committed; the MV will
+	// converge on the next refresh (denom_prices also refreshes it).
+	if _, err := pool.Exec(ctx,
+		fmt.Sprintf(`REFRESH MATERIALIZED VIEW CONCURRENTLY %s.priced_rewards`, h.cfg.Schema),
+	); err != nil {
+		slog.Warn("provider_rewards: MV refresh failed (non-fatal)",
+			"snapshotter", Name, "err", err)
+	}
+	return nil
 }
 
 // collectKeys is a tiny helper for deterministic list order out of a

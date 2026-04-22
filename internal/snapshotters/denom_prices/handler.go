@@ -375,30 +375,30 @@ type denomRow struct {
 // load-bearing; if LAVA fails the whole date is marked 'failed' and
 // the other denoms don't bother running.
 func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snapshotters.SnapshotTarget) error {
-	denoms, err := h.selectDenoms(ctx, pool)
+	// Only fetch prices for denoms that ACTUALLY APPEAR in
+	// provider_rewards at this block. Fetching every mapped denom
+	// regardless of relevance burns CoinGecko free-tier quota on 20+
+	// useless calls per date (Lava rewards are usually 1-3 distinct
+	// denoms). Cuts a 27-date backfill from ~650 to ~40 calls.
+	denoms, err := h.selectDenomsForBlock(ctx, pool, target.BlockHeight)
 	if err != nil {
 		return fmt.Errorf("select denoms: %w", err)
 	}
 	if len(denoms) == 0 {
-		// Legitimate empty snapshot — no denoms have a coingecko_id so
-		// there are no prices to fetch. Record a zero-count row so
-		// BlocksDue subtracts this date.
-		return pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
-			return h.insertSnapshotRow(ctx, tx, target, 0, "ok", "")
-		})
+		// No reward rows for this date (e.g. pre-provider-rewards
+		// block, or every provider returned empty) → no prices to
+		// fetch. Record a zero-count row so BlocksDue subtracts this
+		// date and move on.
+		return h.persistAndRefresh(ctx, pool, target, nil)
 	}
 
 	// Order LAVA first — it's the load-bearing denom. If LAVA fails
 	// after retries we persist status='failed' and abort the rest of
-	// the date.
+	// the date. When the date's rewards don't include ulava at all,
+	// LAVA is simply not in the list and no special handling kicks in.
 	ordered := orderLavaFirst(denoms)
 
 	date := target.SnapshotDate.UTC()
-	type priceRow struct {
-		denomID     int32
-		priceUSD    string // decimal string to preserve precision through numeric(40,18)
-		coingeckoID string
-	}
 	prices := make([]priceRow, 0, len(ordered))
 
 	for _, d := range ordered {
@@ -435,6 +435,14 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 		})
 	}
 
+	return h.persistAndRefresh(ctx, pool, target, prices)
+}
+
+// persistAndRefresh commits the snapshot row + per-denom price rows in
+// one tx, then refreshes the pricing MV. Shared between the
+// zero-denom fast path and the normal Snapshot flow.
+func (h *Handler) persistAndRefresh(ctx context.Context, pool *pgxpool.Pool, target snapshotters.SnapshotTarget, prices []priceRow) error {
+	date := target.SnapshotDate.UTC()
 	copyCols := []string{"snapshot_date", "denom_id", "price_usd", "coingecko_id"}
 	rows := make([][]any, 0, len(prices))
 	for _, p := range prices {
@@ -447,7 +455,7 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 		})
 	}
 
-	err = pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+	err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		if err := h.insertSnapshotRow(ctx, tx, target, len(rows), "ok", ""); err != nil {
 			return fmt.Errorf("insert snapshot row: %w", err)
 		}
@@ -469,11 +477,6 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 		return err
 	}
 
-	// Refresh the pricing MV concurrently so /priced_rewards stays
-	// live without blocking readers. CONCURRENTLY requires a unique
-	// index on the MV — defined in DDL. Errors here are logged but
-	// not fatal: the underlying data is already committed, and the
-	// next tick (or a manual REFRESH) will retry.
 	if _, err := pool.Exec(ctx,
 		fmt.Sprintf(`REFRESH MATERIALIZED VIEW CONCURRENTLY %s.priced_rewards`, h.cfg.Schema),
 	); err != nil {
@@ -483,9 +486,46 @@ func (h *Handler) Snapshot(ctx context.Context, pool *pgxpool.Pool, target snaps
 	return nil
 }
 
+// priceRow is one (denom, date, price) tuple collected before the
+// write tx.
+type priceRow struct {
+	denomID     int32
+	priceUSD    string // decimal string to preserve NUMERIC(40,18) precision
+	coingeckoID string
+}
+
+// selectDenomsForBlock returns the coingecko-mapped, non-suppressed
+// denoms that appear in app.provider_rewards AT THIS block_height.
+// Pricing a denom that never shows up in rewards at this date is
+// wasted CoinGecko budget — on mainnet the 24-row seed means 20+
+// useless per-date lookups otherwise.
+func (h *Handler) selectDenomsForBlock(ctx context.Context, pool *pgxpool.Pool, blockHeight int64) ([]denomRow, error) {
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
+		SELECT DISTINCT dm.denom_id, dm.coingecko_id
+		FROM %[1]s.provider_rewards pr
+		JOIN %[1]s.denom_metadata dm ON dm.denom_id = pr.denom_id
+		WHERE pr.block_height = $1
+		  AND dm.coingecko_id IS NOT NULL
+		  AND dm.suppress = FALSE
+		ORDER BY dm.denom_id`, h.cfg.Schema), blockHeight)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]denomRow, 0, 8)
+	for rows.Next() {
+		var d denomRow
+		if err := rows.Scan(&d.denomID, &d.coingeckoID); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // selectDenoms returns the coingecko-mapped, non-suppressed denoms
-// from app.denom_metadata. Joined with app.denoms so the caller has
-// the denom_id FK target it needs for the denom_prices insert.
+// from app.denom_metadata. Retained for reference but no longer used
+// by Snapshot — the per-block variant above is much cheaper.
 func (h *Handler) selectDenoms(ctx context.Context, pool *pgxpool.Pool) ([]denomRow, error) {
 	rows, err := pool.Query(ctx, fmt.Sprintf(`
 		SELECT dm.denom_id, dm.coingecko_id
