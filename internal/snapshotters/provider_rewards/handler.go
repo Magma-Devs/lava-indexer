@@ -242,10 +242,14 @@ func seedDenomMetadata(schema string) []string {
 //     a single tuple lands once per block while preserving the RAW
 //     (pre-resolution) denom observed on-chain for audit.
 //
-// The schema is wiped + recreated (DROP TABLE IF EXISTS) because no
-// prod data exists yet and the column layout is changing. Safe to run
-// against an empty DB; catastrophic against populated prod — operators
-// must re-run the snapshotter to refill.
+// Idempotent. Uses CREATE ... IF NOT EXISTS throughout — the old
+// DROP CASCADE was a one-shot migration artefact that was wiping every
+// restart's accumulated data; the schema-change migration has already
+// happened on every deployed environment by now.
+//
+// Note: `priced_denoms` (from the earlier deriver design) is dropped
+// because operators may still have the table lingering from older
+// deploys. Harmless when it doesn't exist.
 func (h *Handler) DDL() []string {
 	stmts := []string{
 		h.providers.DDL(),
@@ -268,14 +272,9 @@ func (h *Handler) DDL() []string {
 	// Seed the known microdenoms + blacklist. Appended after the
 	// create-table statements so the INSERTs have targets.
 	stmts = append(stmts, seedDenomMetadata(h.cfg.Schema)...)
-	// DROP + recreate the fact tables — no prod data to preserve.
-	// CASCADE handles the priced_rewards MV defined in the
-	// denom_prices snapshotter's DDL.
 	stmts = append(stmts,
-		fmt.Sprintf(`DROP TABLE IF EXISTS %[1]s.provider_rewards CASCADE;`, h.cfg.Schema),
-		fmt.Sprintf(`DROP TABLE IF EXISTS %[1]s.provider_rewards_snapshots CASCADE;`, h.cfg.Schema),
-		// Leftover from the previous priced_denoms design — harmless
-		// if the table never existed.
+		// One-shot cleanup for the old priced_denoms design. Harmless
+		// when the table never existed.
 		fmt.Sprintf(`DROP TABLE IF EXISTS %[1]s.priced_denoms CASCADE;`, h.cfg.Schema),
 		fmt.Sprintf(`
 			CREATE TABLE IF NOT EXISTS %[1]s.provider_rewards_snapshots (
