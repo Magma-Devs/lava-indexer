@@ -1380,8 +1380,17 @@ func (c *HTTPCaller) EstimatedRewards(ctx context.Context, addr string, blockHei
 			// retries exhaust, treat as state-pruned (archive
 			// unavailable for this height) rather than a real
 			// fetch failure.
+			// Route HTTP 5xx + 404 into the pruned-retry loop. On the
+			// Lava public gateway, historical queries land on a mix of
+			// archive replicas; the ones that don't have state for a
+			// given (provider, height) respond with 500/501/502/503/504
+			// depending on which layer refused. All are the same
+			// semantic class as "pruned state unavailable" — not a
+			// real fetch failure we should penalise the whole snapshot
+			// for. 404 = handler not registered, same treatment.
+			// Other 4xx (401, 403, 429) fall through as real errors.
 			var hs *httpStatusErr
-			if errors.As(err, &hs) && (hs.code == 501 || hs.code == 404) {
+			if errors.As(err, &hs) && (hs.code == 404 || (hs.code >= 500 && hs.code <= 504)) {
 				if attempt+1 >= maxPrunedRetries {
 					return nil, fmt.Errorf("%w: %v (attempts=%d)", errStatePruned, err, attempt+1)
 				}
