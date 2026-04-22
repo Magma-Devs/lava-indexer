@@ -12,13 +12,185 @@ import (
 )
 
 type Config struct {
-	Network       Network  `yaml:"network"`
-	Indexer       Indexer  `yaml:"indexer"`
-	Database      Database `yaml:"database"`
-	Web           Web      `yaml:"web"`
-	Log           Log      `yaml:"log"`
-	GraphQL       GraphQL  `yaml:"graphql"`
-	AggregatesDir string   `yaml:"aggregates_dir"`
+	Network       Network      `yaml:"network"`
+	Indexer       Indexer      `yaml:"indexer"`
+	Database      Database     `yaml:"database"`
+	Web           Web          `yaml:"web"`
+	Log           Log          `yaml:"log"`
+	GraphQL       GraphQL      `yaml:"graphql"`
+	Snapshotters  Snapshotters `yaml:"snapshotters"`
+	AggregatesDir string       `yaml:"aggregates_dir"`
+}
+
+// Snapshotters configures the snapshotter seam — periodic, calendar-
+// driven ingestion jobs that run in-process (vs. pg_cron-scheduled
+// aggregates, which run inside Postgres). Each snapshotter has its own
+// subsection; CheckInterval gates how often the RunLoop scans for due
+// work across all of them.
+type Snapshotters struct {
+	// CheckInterval is the tick period for the snapshotter RunLoop.
+	// Default 10m — each tick is cheap (one DB roundtrip per
+	// snapshotter to compute due targets) so "check often" is fine.
+	CheckInterval time.Duration `yaml:"check_interval"`
+
+	// Handlers selects which snapshotters to register. Use ["all"] (or
+	// leave empty) to enable every compiled-in snapshotter. Otherwise
+	// name them explicitly (e.g. ["provider_rewards"]). Field name
+	// matches indexer.handlers so both selectors read the same to an
+	// operator — snapshotters not listed are never constructed: no
+	// DDL, no goroutine, no UI entry.
+	Handlers []string `yaml:"handlers"`
+
+	ProviderRewards ProviderRewardsSnapshotter `yaml:"provider_rewards"`
+	DenomPrices     DenomPricesSnapshotter     `yaml:"denom_prices"`
+	Supply          SupplySnapshotter          `yaml:"supply"`
+}
+
+// WantsSnapshotter reports whether `name` should be registered given
+// the snapshotters.handlers config. Empty list or ["all"] means "every
+// snapshotter" — same semantics as Indexer.WantsHandler.
+func (s Snapshotters) WantsSnapshotter(name string) bool {
+	if len(s.Handlers) == 0 {
+		return true
+	}
+	for _, n := range s.Handlers {
+		if strings.EqualFold(n, "all") || strings.EqualFold(n, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// ProviderRewardsSnapshotter configures the provider_rewards
+// snapshotter (see internal/snapshotters/provider_rewards). Gated by
+// Snapshotters.Handlers — absent from the list means the section is
+// ignored entirely.
+type ProviderRewardsSnapshotter struct {
+	// EarliestDate is the first monthly-17th we attempt to snapshot.
+	// Format: "2006-01-02". Must be a 17th (the RunLoop will error at
+	// config validation if not — forces the operator to notice a
+	// misconfiguration).
+	EarliestDate string `yaml:"earliest_date"`
+
+	// Concurrency caps per-provider chain calls during a single
+	// snapshot. Default 25 — matches the public Lava gateway's
+	// comfortable per-IP concurrency ceiling.
+	Concurrency int `yaml:"concurrency"`
+
+	// RESTURL optionally overrides the main REST endpoint used for
+	// this snapshotter. When empty, the snapshotter falls back to the
+	// first `kind: rest` endpoint in network.endpoints. Set this when
+	// you want to route snapshotter work through a dedicated
+	// archive-backed endpoint (rewards queries require archive mode).
+	RESTURL string `yaml:"rest_url"`
+
+	// RESTHeaders attaches extra HTTP headers to every snapshotter
+	// call to RESTURL. Typical use: `lava-extension: archive` to hint
+	// archive-mode on Lava's public gateway.
+	RESTHeaders map[string]string `yaml:"rest_headers,omitempty"`
+
+	// SnapshotAnchor overrides the chain's reported genesis timestamp
+	// as the monthly-cadence anchor. Useful when the chain forked or
+	// was renamed — e.g. lava-testnet-2 reports 2022-12-26 via /genesis
+	// (the upstream testnet-1 origin), but its operational start and
+	// intended snapshot cadence is 2023-08-17 10:02 UTC. Format: RFC3339.
+	// When empty, the snapshotter uses client.GenesisTime() (the
+	// chain's own /genesis response).
+	SnapshotAnchor string `yaml:"snapshot_anchor,omitempty"`
+}
+
+// DenomPricesSnapshotter configures the denom_prices snapshotter (see
+// internal/snapshotters/denom_prices). Gated by Snapshotters.Handlers —
+// absent from the list means the section is ignored entirely.
+type DenomPricesSnapshotter struct {
+	// EarliestDate is the first monthly-17th we attempt to price.
+	// Format: "2006-01-02". Optional — when empty the snapshotter
+	// emits every genesis-anchored slot from genesis+1mo through now.
+	// Default "2024-11-17" matches the earliest date on which the
+	// Lava chain's subscription.estimated_provider_rewards handler
+	// returned useful per-source data; older blocks uniformly return
+	// empty info[] so pricing them wastes CoinGecko budget.
+	EarliestDate string `yaml:"earliest_date"`
+
+	// CoingeckoAPIURL is the base URL of the CoinGecko API (v3). When
+	// empty, defaults to the public API. Operators with a Pro plan can
+	// point this at `https://pro-api.coingecko.com/api/v3` (and pass
+	// the API key via rest_headers).
+	CoingeckoAPIURL string `yaml:"coingecko_api_url"`
+
+	// RESTHeaders attaches extra HTTP headers to every CoinGecko call.
+	// Typical use: `x-cg-pro-api-key` for the Pro API.
+	RESTHeaders map[string]string `yaml:"rest_headers,omitempty"`
+}
+
+// ParsedEarliestDate returns DenomPrices.EarliestDate as a UTC
+// time.Time or the zero value when unset / unparsable. Mirrors the
+// provider_rewards + supply helpers.
+func (p DenomPricesSnapshotter) ParsedEarliestDate() time.Time {
+	if strings.TrimSpace(p.EarliestDate) == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse("2006-01-02", p.EarliestDate)
+	if err != nil {
+		return time.Time{}
+	}
+	return t.UTC()
+}
+
+// SupplySnapshotter configures the supply snapshotter (see
+// internal/snapshotters/supply). Gated by Snapshotters.Handlers —
+// absent from the list means the section is ignored entirely.
+//
+// Same overlap pattern as provider_rewards: when REST URL / headers
+// are empty, the wiring in cmd/indexer/main.go falls back to the first
+// `kind: rest` endpoint in network.endpoints so a typical single-config
+// deployment doesn't need a duplicated URL.
+type SupplySnapshotter struct {
+	// EarliestDate is the first monthly-17th we attempt to snapshot.
+	// Format: "2006-01-02". Optional — when empty the snapshotter
+	// emits every genesis-anchored slot from genesis+1mo through now.
+	EarliestDate string `yaml:"earliest_date"`
+
+	// RESTURL optionally overrides the main REST endpoint used for
+	// this snapshotter. When empty, the snapshotter falls back to the
+	// first `kind: rest` endpoint in network.endpoints. Set this when
+	// you want to route supply queries through a dedicated
+	// archive-backed endpoint.
+	RESTURL string `yaml:"rest_url"`
+
+	// RESTHeaders attaches extra HTTP headers to every snapshotter
+	// call to RESTURL. Typical use: `lava-extension: archive` to hint
+	// archive-mode on Lava's public gateway.
+	RESTHeaders map[string]string `yaml:"rest_headers,omitempty"`
+}
+
+// ParsedEarliestDate returns the earliest_date parsed as a UTC date.
+// Relies on validate() having rejected invalid strings — returns the
+// zero time.Time when empty so the snapshotter floors at genesis+1mo.
+func (p SupplySnapshotter) ParsedEarliestDate() time.Time {
+	if strings.TrimSpace(p.EarliestDate) == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse("2006-01-02", p.EarliestDate)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// ParsedSnapshotAnchor returns the snapshot-anchor time override as a
+// time.Time, or the zero value when unset / unparsable. Callers fall
+// back to the chain's /genesis response in that case.
+func (p ProviderRewardsSnapshotter) ParsedSnapshotAnchor() time.Time {
+	s := strings.TrimSpace(p.SnapshotAnchor)
+	if s == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t.UTC()
 }
 
 // Web configures the built-in progress UI + status JSON API.
@@ -72,19 +244,19 @@ type Indexer struct {
 	// empty) to enable every compiled-in handler. Otherwise list handler
 	// names (e.g. ["lava_relay_payment"]). Handlers not listed are not
 	// registered, so they also don't record coverage in indexer_ranges.
-	Handlers         []string      `yaml:"handlers"`
-	TipConfirmations int64         `yaml:"tip_confirmations"`
+	Handlers         []string `yaml:"handlers"`
+	TipConfirmations int64    `yaml:"tip_confirmations"`
 	// FetchWorkers: positive number = explicit worker count; 0 = adaptive.
 	// In adaptive mode the process spawns `Σ endpoint.max_concurrency`
 	// workers at startup, so every endpoint can hit its ceiling in
 	// parallel. The AIMD controller then gates actual concurrent calls
 	// per endpoint, so over-provisioning workers just backpressures
 	// gracefully instead of overloading a node.
-	FetchWorkers     int           `yaml:"fetch_workers"`
-	FetchBatchSize   int           `yaml:"fetch_batch_size"`
-	WriteBatchRows   int           `yaml:"write_batch_rows"`
-	QueueDepth       int           `yaml:"queue_depth"`
-	TipPollInterval  time.Duration `yaml:"tip_poll_interval"`
+	FetchWorkers    int           `yaml:"fetch_workers"`
+	FetchBatchSize  int           `yaml:"fetch_batch_size"`
+	WriteBatchRows  int           `yaml:"write_batch_rows"`
+	QueueDepth      int           `yaml:"queue_depth"`
+	TipPollInterval time.Duration `yaml:"tip_poll_interval"`
 
 	// PruneOutsideWindow, if true, deletes any indexer_ranges and
 	// indexer_failures entries for heights outside [StartHeight, EndHeight|tip]
@@ -119,6 +291,21 @@ type Indexer struct {
 	// when you only ever have one gap). Default 5 → 80/20 split in
 	// favour of tip-close work.
 	BackfillInterleave int `yaml:"backfill_interleave"`
+}
+
+// ParsedEarliestDate returns the earliest_date parsed as a UTC date.
+// Relies on validate() having rejected invalid strings — returns the
+// zero time.Time only for a disabled snapshotter or misuse of the
+// parsed result without checking Enabled first.
+func (p ProviderRewardsSnapshotter) ParsedEarliestDate() time.Time {
+	if strings.TrimSpace(p.EarliestDate) == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse("2006-01-02", p.EarliestDate)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 // WantsHandler reports whether `name` should be registered given the
@@ -172,10 +359,10 @@ func Load(path string) (*Config, error) {
 func defaults() *Config {
 	return &Config{
 		Indexer: Indexer{
-			StartHeight:          1,
-			EndHeight:            0,
-			TipConfirmations:     0, // Cosmos/CometBFT has deterministic finality
-			FetchWorkers:         16,
+			StartHeight:      1,
+			EndHeight:        0,
+			TipConfirmations: 0, // Cosmos/CometBFT has deterministic finality
+			FetchWorkers:     16,
 			// Bumped from 10 to 50. With the fetch/persist split and the
 			// uncapped per-endpoint routing, roundtrip overhead matters more
 			// than queue depth; 50 heights per JSON-RPC batch cuts per-
@@ -220,6 +407,37 @@ func defaults() *Config {
 			// proxy with auth, or by binding the indexer to loopback.
 			Enabled:  false,
 			Upstream: "http://graphql:5000",
+		},
+		Snapshotters: Snapshotters{
+			CheckInterval: 10 * time.Minute,
+			// Default ["all"] mirrors indexer.handlers' default —
+			// every compiled-in snapshotter runs unless the operator
+			// narrows the list.
+			Handlers: []string{"all"},
+			ProviderRewards: ProviderRewardsSnapshotter{
+				// 2024-11-17 is the earliest monthly-17th where the
+				// chain's estimated_provider_rewards handler returned
+				// useful per-source data on mainnet. Earlier dates
+				// uniformly yielded empty info[] (the handler was either
+				// not registered or had no state), so there's nothing
+				// to index below this floor.
+				EarliestDate: "2024-11-17",
+				Concurrency:  25,
+			},
+			DenomPrices: DenomPricesSnapshotter{
+				// Match provider_rewards' floor — there's nothing to
+				// price if there are no reward rows.
+				EarliestDate: "2024-11-17",
+				// Public CoinGecko API. Free tier; rate-limited to ~10-30
+				// req/min. The snapshotter honours Retry-After and does
+				// exponential backoff with a 60s cap — see pricing.ts for
+				// the pattern this is ported from.
+				CoingeckoAPIURL: "https://api.coingecko.com/api/v3",
+			},
+			// Supply snapshotter: EarliestDate left empty on purpose.
+			// Total-supply samples ARE useful from the chain's genesis
+			// (burn-rate chart starts at month 1), and the bank supply
+			// endpoint works at every historical block.
 		},
 		AggregatesDir: "./aggregates",
 	}
@@ -355,6 +573,47 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("GRAPHQL_UPSTREAM"); v != "" {
 		cfg.GraphQL.Upstream = v
 	}
+
+	// Snapshotters
+	if v := os.Getenv("SNAPSHOTTERS_CHECK_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Snapshotters.CheckInterval = d
+		}
+	}
+	if v := os.Getenv("SNAPSHOTTERS_HANDLERS"); v != "" {
+		// Comma-separated names, e.g. "all" or "provider_rewards".
+		// Mirrors INDEXER_HANDLERS exactly.
+		out := make([]string, 0, 4)
+		for _, p := range strings.Split(v, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		cfg.Snapshotters.Handlers = out
+	}
+	if v := os.Getenv("PROVIDER_REWARDS_EARLIEST_DATE"); v != "" {
+		cfg.Snapshotters.ProviderRewards.EarliestDate = v
+	}
+	if v, ok := envInt("PROVIDER_REWARDS_CONCURRENCY"); ok {
+		cfg.Snapshotters.ProviderRewards.Concurrency = v
+	}
+	if v := os.Getenv("PROVIDER_REWARDS_REST_URL"); v != "" {
+		cfg.Snapshotters.ProviderRewards.RESTURL = v
+	}
+
+	// Denom prices
+	if v := os.Getenv("COINGECKO_API_URL"); v != "" {
+		cfg.Snapshotters.DenomPrices.CoingeckoAPIURL = v
+	}
+	if v := os.Getenv("DENOM_PRICES_EARLIEST_DATE"); v != "" {
+		cfg.Snapshotters.DenomPrices.EarliestDate = v
+	}
+
+	// Supply
+	if v := os.Getenv("SUPPLY_REST_URL"); v != "" {
+		cfg.Snapshotters.Supply.RESTURL = v
+	}
 }
 
 func envInt(name string) (int, bool) {
@@ -409,6 +668,32 @@ func (c *Config) validate() error {
 	}
 	if c.Database.Schema == "" {
 		c.Database.Schema = "app"
+	}
+	// Snapshotters: validate provider_rewards earliest_date when it's
+	// selected via snapshotters.handlers. Fail fast here so a typo surfaces
+	// at startup rather than on the first scheduled tick ~10 minutes
+	// in. Snapshotters not in the list are skipped — we don't force
+	// operators to keep fields valid for something they haven't turned
+	// on.
+	if c.Snapshotters.WantsSnapshotter("provider_rewards") {
+		// earliest_date is an optional floor — when empty, the
+		// snapshotter emits every genesis-anchored slot from
+		// genesis+1mo through now. Operators set it only to skip
+		// early history they don't care about.
+		if ed := strings.TrimSpace(c.Snapshotters.ProviderRewards.EarliestDate); ed != "" {
+			if _, err := time.Parse("2006-01-02", ed); err != nil {
+				return fmt.Errorf("snapshotters.provider_rewards.earliest_date: %w", err)
+			}
+		}
+	}
+	if c.Snapshotters.WantsSnapshotter("supply") {
+		// Same optional-floor semantics as provider_rewards —
+		// validate format if set, let empty fall through.
+		if ed := strings.TrimSpace(c.Snapshotters.Supply.EarliestDate); ed != "" {
+			if _, err := time.Parse("2006-01-02", ed); err != nil {
+				return fmt.Errorf("snapshotters.supply.earliest_date: %w", err)
+			}
+		}
 	}
 	return nil
 }

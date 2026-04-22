@@ -22,6 +22,10 @@ import (
 	"github.com/magma-devs/lava-indexer/internal/events/relay_payment"
 	"github.com/magma-devs/lava-indexer/internal/pipeline"
 	"github.com/magma-devs/lava-indexer/internal/rpc"
+	"github.com/magma-devs/lava-indexer/internal/snapshotters"
+	"github.com/magma-devs/lava-indexer/internal/snapshotters/denom_prices"
+	"github.com/magma-devs/lava-indexer/internal/snapshotters/provider_rewards"
+	"github.com/magma-devs/lava-indexer/internal/snapshotters/supply"
 	"github.com/magma-devs/lava-indexer/internal/state"
 	"github.com/magma-devs/lava-indexer/internal/web"
 	_ "go.uber.org/automaxprocs" // auto-tunes GOMAXPROCS from cgroup CPU quota
@@ -212,6 +216,98 @@ func main() {
 		}
 	}
 
+	// Register snapshotters. Snapshotters are the periodic, calendar-
+	// driven ingestion seam (parallel to events.Handler for event-
+	// driven). Selection mirrors the handler pattern:
+	// cfg.Snapshotters.Handlers selects a subset; "all" (or empty) means
+	// every one. Snapshotters not selected are never constructed —
+	// no DDL, no goroutine, nothing in /api/snapshotters.
+	snapReg := snapshotters.NewRegistry()
+	registerSnapshotter := func(s snapshotters.Snapshotter) {
+		if cfg.Snapshotters.WantsSnapshotter(s.Name()) {
+			snapReg.Register(s)
+			slog.Info("snapshotter registered", "name", s.Name())
+		} else {
+			slog.Info("snapshotter skipped by config", "name", s.Name())
+		}
+	}
+	// Prefer the operator-configured snapshot_anchor over the chain's
+	// /genesis timestamp — needed for forked / renamed chains where
+	// /genesis still reports the upstream origin (e.g. testnet-2 still
+	// reporting testnet-1's 2022-12-26 genesis when the operational
+	// start was 2023-08-17).
+	snapAnchor := cfg.Snapshotters.ProviderRewards.ParsedSnapshotAnchor()
+	if snapAnchor.IsZero() {
+		snapAnchor = client.GenesisTime()
+	}
+	// Build the provider_rewards caller once and share with denom_prices
+	// for the block-time binary search — same archive endpoint, same
+	// HTTP pool, same TLS session cache.
+	providerRewardsCaller := provider_rewards.NewHTTPCaller(
+		resolveSnapshotterRESTURL(cfg),
+		resolveSnapshotterRESTHeaders(cfg),
+	)
+	registerSnapshotter(provider_rewards.NewWithCaller(provider_rewards.Config{
+		Schema:        cfg.Database.Schema,
+		EarliestDate:  cfg.Snapshotters.ProviderRewards.ParsedEarliestDate(),
+		Concurrency:   cfg.Snapshotters.ProviderRewards.Concurrency,
+		RESTURL:       resolveSnapshotterRESTURL(cfg),
+		RESTHeaders:   resolveSnapshotterRESTHeaders(cfg),
+		GenesisHeight: client.Genesis(),
+		GenesisTime:   snapAnchor,
+	}, providerRewardsCaller))
+	registerSnapshotter(denom_prices.New(denom_prices.Config{
+		Schema:           cfg.Database.Schema,
+		EarliestDate:     cfg.Snapshotters.DenomPrices.ParsedEarliestDate(),
+		CoingeckoAPIURL:  cfg.Snapshotters.DenomPrices.CoingeckoAPIURL,
+		CoingeckoHeaders: cfg.Snapshotters.DenomPrices.RESTHeaders,
+		RESTCaller:       providerRewardsCaller,
+		GenesisHeight:    client.Genesis(),
+		GenesisTime:      snapAnchor,
+	}))
+	// Supply snapshotter: shares the genesis-anchored cadence and
+	// block-resolution caller with the other two; the only new chain
+	// call it makes is /cosmos/bank/v1beta1/supply, handled by supply's
+	// own HTTPCaller.
+	registerSnapshotter(supply.New(supply.Config{
+		Schema:        cfg.Database.Schema,
+		EarliestDate:  cfg.Snapshotters.Supply.ParsedEarliestDate(),
+		RESTURL:       resolveSupplyRESTURL(cfg),
+		RESTHeaders:   resolveSupplyRESTHeaders(cfg),
+		RESTCaller:    providerRewardsCaller,
+		GenesisHeight: client.Genesis(),
+		GenesisTime:   snapAnchor,
+	}))
+	// Apply snapshotter DDL, same one-tx-per-snapshotter pattern as
+	// event handlers. Each snapshotter owns its tables so a partial DDL
+	// failure rolls back cleanly.
+	for _, s := range snapReg.All() {
+		ddls := s.DDL()
+		err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+			for _, ddl := range ddls {
+				if _, err := tx.Exec(ctx, ddl); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			fatal("apply snapshotter DDL", fmt.Errorf("%s: %w", s.Name(), err))
+		}
+	}
+	// Snapshotters that implement events.Warmer get the same warm-up
+	// treatment as handlers — pre-loads dict caches so the first tick
+	// doesn't pay per-provider round-trips.
+	for _, s := range snapReg.All() {
+		w, ok := s.(events.Warmer)
+		if !ok {
+			continue
+		}
+		if err := w.Warmup(ctx, pool); err != nil {
+			slog.Warn("snapshotter warmup failed (non-fatal)", "name", s.Name(), "err", err)
+		}
+	}
+
 	// Apply user-defined aggregates + schedule refresh jobs.
 	if err := aggregates.Apply(ctx, pool, cfg.AggregatesDir); err != nil {
 		slog.Warn("aggregates apply failed (non-fatal)", "err", err)
@@ -270,12 +366,22 @@ func main() {
 		}
 		return nil
 	})
+	// Snapshotters run on their own tick; RunLoop never returns a fatal
+	// error (per-tick failures are logged + continue), so this goroutine
+	// only exits when ctx is cancelled by sibling shutdown.
+	if len(snapReg.All()) > 0 {
+		g.Go(func() error {
+			return snapReg.RunLoop(gctx, pool, cfg.Snapshotters.CheckInterval)
+		})
+	}
+
 	if cfg.Web.Enabled {
 		srv := &web.Server{
 			ChainID:         cfg.Network.ChainID,
 			State:           st,
 			Client:          client,
 			Registry:        reg,
+			Snapshotters:    snapReg,
 			Pool:            pool,
 			Stats:           pipelineStatsAdapter{pipe},
 			Start:           cfg.Indexer.StartHeight,
@@ -393,6 +499,85 @@ func (a pipelineStatsAdapter) Stats() web.Stats {
 func fatal(what string, err error) {
 	slog.Error(what, "err", err)
 	os.Exit(1)
+}
+
+// resolveSnapshotterRESTURL returns the REST URL the provider_rewards
+// snapshotter should hit. Explicit override wins; otherwise fall back
+// to the first kind=rest endpoint in the main config so a typical
+// single-config deployment doesn't need a duplicated URL.
+func resolveSnapshotterRESTURL(cfg *config.Config) string {
+	if u := strings.TrimSpace(cfg.Snapshotters.ProviderRewards.RESTURL); u != "" {
+		return u
+	}
+	for _, e := range cfg.Network.Endpoints {
+		if e.Kind == "rest" {
+			return e.URL
+		}
+	}
+	return ""
+}
+
+// resolveSnapshotterRESTHeaders picks the headers to attach to
+// snapshotter-specific requests. If the snapshotter has its own headers
+// in config, those win (so an operator can target an archive-mode
+// upstream differently from the main one). Otherwise fall back to the
+// first REST endpoint's headers.
+func resolveSnapshotterRESTHeaders(cfg *config.Config) map[string]string {
+	if len(cfg.Snapshotters.ProviderRewards.RESTHeaders) > 0 {
+		out := make(map[string]string, len(cfg.Snapshotters.ProviderRewards.RESTHeaders))
+		for k, v := range cfg.Snapshotters.ProviderRewards.RESTHeaders {
+			out[k] = v
+		}
+		return out
+	}
+	for _, e := range cfg.Network.Endpoints {
+		if e.Kind == "rest" {
+			out := make(map[string]string, len(e.Headers))
+			for k, v := range e.Headers {
+				out[k] = v
+			}
+			return out
+		}
+	}
+	return nil
+}
+
+// resolveSupplyRESTURL mirrors resolveSnapshotterRESTURL but reads the
+// supply section's override first. Kept separate so an operator can
+// route supply queries through a different archive than rewards (e.g.
+// when one upstream has bank-module pruning enabled and another doesn't).
+func resolveSupplyRESTURL(cfg *config.Config) string {
+	if u := strings.TrimSpace(cfg.Snapshotters.Supply.RESTURL); u != "" {
+		return u
+	}
+	for _, e := range cfg.Network.Endpoints {
+		if e.Kind == "rest" {
+			return e.URL
+		}
+	}
+	return ""
+}
+
+// resolveSupplyRESTHeaders mirrors resolveSnapshotterRESTHeaders for
+// the supply snapshotter.
+func resolveSupplyRESTHeaders(cfg *config.Config) map[string]string {
+	if len(cfg.Snapshotters.Supply.RESTHeaders) > 0 {
+		out := make(map[string]string, len(cfg.Snapshotters.Supply.RESTHeaders))
+		for k, v := range cfg.Snapshotters.Supply.RESTHeaders {
+			out[k] = v
+		}
+		return out
+	}
+	for _, e := range cfg.Network.Endpoints {
+		if e.Kind == "rest" {
+			out := make(map[string]string, len(e.Headers))
+			for k, v := range e.Headers {
+				out[k] = v
+			}
+			return out
+		}
+	}
+	return nil
 }
 
 // multiClientSignals bridges rpc.MultiClient into pipeline.SignalSource.

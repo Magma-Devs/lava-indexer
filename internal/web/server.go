@@ -28,6 +28,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/magma-devs/lava-indexer/internal/events"
 	"github.com/magma-devs/lava-indexer/internal/rpc"
+	"github.com/magma-devs/lava-indexer/internal/snapshotters"
 	"github.com/magma-devs/lava-indexer/internal/state"
 )
 
@@ -56,6 +57,7 @@ type Server struct {
 	State           *state.State
 	Client          *rpc.MultiClient
 	Registry        *events.Registry
+	Snapshotters    *snapshotters.Registry // optional — nil disables the /api/snapshotters endpoint
 	Pool            *pgxpool.Pool
 	Stats           StatsProvider // optional — enables blocks/sec in the response
 	Start           int64
@@ -84,6 +86,7 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200); _, _ = w.Write([]byte("ok")) })
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/history", s.handleHistory)
+	mux.HandleFunc("/api/snapshotters", s.handleSnapshotters)
 
 	// Optional reverse-proxy to PostGraphile (or whatever GraphQL server).
 	// When enabled, /graphql and /graphiql on this port proxy to the
@@ -190,13 +193,13 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 
 type StatusResponse struct {
 	ChainID          string           `json:"chain_id"`
-	ChainGenesis     int64            `json:"chain_genesis"`               // always 1 by Cosmos convention
-	ChainGenesisTime *time.Time       `json:"chain_genesis_time,omitempty"`// set iff an endpoint reports earliest=1 (archive)
-	TipTime          *time.Time       `json:"tip_time,omitempty"`          // wall-clock time at current tip
-	Start            int64            `json:"start_height"`                // user-configured indexing window
+	ChainGenesis     int64            `json:"chain_genesis"`                // always 1 by Cosmos convention
+	ChainGenesisTime *time.Time       `json:"chain_genesis_time,omitempty"` // set iff an endpoint reports earliest=1 (archive)
+	TipTime          *time.Time       `json:"tip_time,omitempty"`           // wall-clock time at current tip
+	Start            int64            `json:"start_height"`                 // user-configured indexing window
 	End              int64            `json:"end_height"`
 	Tip              int64            `json:"tip"`
-	BlocksPerSec     float64          `json:"blocks_per_sec"`              // short-window rate, 0 if not tracking yet
+	BlocksPerSec     float64          `json:"blocks_per_sec"` // short-window rate, 0 if not tracking yet
 	GeneratedAt      time.Time        `json:"generated_at"`
 	Endpoints        []EndpointStatus `json:"endpoints"`
 	Handlers         []HandlerStatus  `json:"handlers"`
@@ -224,11 +227,11 @@ type RunSummary struct {
 // LifetimeStats aggregates across every run that has ever existed for this
 // schema — survives process restarts.
 type LifetimeStats struct {
-	FirstStartedAt  *time.Time `json:"first_started_at,omitempty"`
-	TotalSeconds    float64    `json:"total_seconds"`
-	TotalBlocks     int64      `json:"total_blocks"`
-	TotalRows       int64      `json:"total_rows"`
-	TotalRuns       int        `json:"total_runs"`
+	FirstStartedAt *time.Time `json:"first_started_at,omitempty"`
+	TotalSeconds   float64    `json:"total_seconds"`
+	TotalBlocks    int64      `json:"total_blocks"`
+	TotalRows      int64      `json:"total_rows"`
+	TotalRuns      int        `json:"total_runs"`
 }
 
 type EndpointStatus struct {
@@ -259,9 +262,9 @@ type EndpointMetricsJSON struct {
 }
 
 type HandlerStatus struct {
-	Name         string           `json:"name"`
-	EventTypes   []string         `json:"event_types"`
-	Ranges       []RangeJSON      `json:"ranges"`
+	Name       string      `json:"name"`
+	EventTypes []string    `json:"event_types"`
+	Ranges     []RangeJSON `json:"ranges"`
 	// Gaps is "never-tried" heights only: uncovered AND not currently in
 	// the dead-letter pool. FailedRanges holds the dead-letter side so
 	// the UI can report them separately with different semantics.
@@ -279,11 +282,11 @@ type HandlerStatus struct {
 	// FailureCount sums both slices; the individual fields let the UI
 	// distinguish a churning retry pool from one the pipeline has
 	// permanently given up on.
-	FailureCount     int64       `json:"failure_count"`
-	RetryingCount    int64       `json:"retrying_count"`
-	PermanentCount   int64       `json:"permanent_count"`
-	MaxRetries       int         `json:"max_retries"`
-	FailedRanges     []RangeJSON `json:"failed_ranges,omitempty"`
+	FailureCount   int64       `json:"failure_count"`
+	RetryingCount  int64       `json:"retrying_count"`
+	PermanentCount int64       `json:"permanent_count"`
+	MaxRetries     int         `json:"max_retries"`
+	FailedRanges   []RangeJSON `json:"failed_ranges,omitempty"`
 }
 
 type RangeJSON struct {
@@ -669,4 +672,115 @@ func coverageRatio(ranges []RangeJSON, from, to int64) float64 {
 		return 0
 	}
 	return float64(covered) / float64(total)
+}
+
+// ---------------------------------------------------------------------------
+// /api/snapshotters
+// ---------------------------------------------------------------------------
+
+// SnapshotterStatus is one entry in the /api/snapshotters response.
+// Matches the shape rendered by the UI card: expected/covered dates,
+// failures, and the last/next tick timestamps.
+type SnapshotterStatus struct {
+	Name      string                  `json:"name"`
+	RESTURL   string                  `json:"rest_url,omitempty"`
+	Expected  []string                `json:"expected"`
+	Covered   []string                `json:"covered"`
+	Missing   []string                `json:"missing"`
+	Failed    []SnapshotterFailedDate `json:"failed"`
+	Blocks    map[string]int64        `json:"blocks,omitempty"`
+	LastRunAt *time.Time              `json:"last_run_at,omitempty"`
+	NextRunAt *time.Time              `json:"next_run_at,omitempty"`
+}
+
+// SnapshotterFailedDate pairs a failed snapshot date with the recorded
+// error message. Rendered in the UI as a collapsed expandable.
+type SnapshotterFailedDate struct {
+	Date  string `json:"date"`
+	Error string `json:"error"`
+}
+
+func (s *Server) handleSnapshotters(w http.ResponseWriter, r *http.Request) {
+	if s.Snapshotters == nil || len(s.Snapshotters.All()) == 0 {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte("[]"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	out := make([]SnapshotterStatus, 0, len(s.Snapshotters.All()))
+	for _, sn := range s.Snapshotters.All() {
+		st := s.snapshotterStatus(ctx, sn)
+		out = append(out, st)
+	}
+	w.Header().Set("content-type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
+}
+
+// redactURLUserinfo masks any basic-auth credentials embedded in a
+// URL before it's surfaced on /api/snapshotters or /api/status.
+// /api/snapshotters has no authentication in front of it; operators
+// who accidentally embed `user:secret@host` in a private-gateway URL
+// should see `user:***@host` on the dashboard, not the raw secret.
+func redactURLUserinfo(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.User == nil {
+		return raw
+	}
+	if _, hasPw := u.User.Password(); hasPw {
+		u.User = url.UserPassword(u.User.Username(), "***")
+	}
+	return u.String()
+}
+
+// snapshotterStatus builds one entry of the /api/snapshotters response.
+// Iterates snapshotters generically — expected/covered/missing/failed
+// come from Snapshotter.Status, the optional RESTURL() interface
+// exposes the REST URL if the snapshotter has one. No concrete
+// knowledge of any particular snapshotter here.
+func (s *Server) snapshotterStatus(ctx context.Context, sn snapshotters.Snapshotter) SnapshotterStatus {
+	st := SnapshotterStatus{Name: sn.Name()}
+	if lr := s.Snapshotters.LastRunAt(); !lr.IsZero() {
+		t := lr
+		st.LastRunAt = &t
+	}
+	if nr := s.Snapshotters.NextRunAt(); !nr.IsZero() {
+		t := nr
+		st.NextRunAt = &t
+	}
+	// URL-publishing seam: snapshotters.URLSurface is an optional
+	// capability exported by the snapshotters package. Kept off the
+	// base Snapshotter interface so the core stays focused on
+	// DDL + schedule + snapshot, but declared as a named type so the
+	// seam has a compile-time anchor (renames break the build, not
+	// silently the UI).
+	if u, ok := sn.(snapshotters.URLSurface); ok {
+		st.RESTURL = redactURLUserinfo(u.RESTURL())
+	}
+	// Coverage view: every Snapshotter implements Status so the web
+	// layer stays generic (no concrete imports, no type-switches on
+	// Name). Implementations may return an empty Status if they don't
+	// track expected/covered dates.
+	cov, err := sn.Status(ctx, s.Pool)
+	if err != nil {
+		slog.Warn("snapshotter status failed", "snapshotter", sn.Name(), "err", err)
+		return st
+	}
+	st.Expected = cov.Expected
+	st.Covered = cov.Covered
+	st.Missing = cov.Missing
+	st.Blocks = cov.Blocks
+	for _, fd := range cov.Failed {
+		st.Failed = append(st.Failed, SnapshotterFailedDate{Date: fd.Date, Error: fd.Error})
+	}
+	return st
 }

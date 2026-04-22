@@ -390,6 +390,132 @@ All in `config.yml` under `indexer:` unless noted:
 The handler gets a fresh `pgx.Tx` for each batch. Writing goes into that tx,
 so your rows land atomically with the range-merge.
 
+## Snapshotters
+
+Handlers react to events that appear in the block stream. Some jobs
+don't fit that shape: they pull state from the chain on a **calendar
+schedule** (monthly, weekly) and record what the chain answered at that
+moment. For those we have a parallel seam: `internal/snapshotters`.
+
+A snapshotter implements:
+
+```go
+type Snapshotter interface {
+    Name() string
+    DDL() []string
+    BlocksDue(ctx, pool) ([]SnapshotTarget, error)
+    Snapshot(ctx, tx, target) error
+}
+```
+
+The registry runs `BlocksDue` on every tick (default 10 min) and
+dispatches `Snapshot` inside a fresh `pgx.Tx` per target. A failure on
+one target logs and continues — one bad snapshot never starves the
+others. DDL applies at startup, same as handler DDL.
+
+### Built-in: `provider_rewards`
+
+Records Lava's `estimated_provider_rewards` at the 17th of every month,
+15:00 UTC. For each snapshot date we binary-search the chain for the
+block closest to that timestamp, then fetch estimated rewards for every
+provider in `app.providers` at that block height. Results go into:
+
+- `app.provider_rewards_snapshots` — one row per (date, block),
+  `status` column is `ok` / `failed`.
+- `app.provider_rewards` — fact rows, `(block_height, provider_id,
+  spec_id, source_kind, denom)` composite PK, amounts stored as
+  `NUMERIC(40, 0)` (no precision loss vs. the chain's decimal strings).
+
+Operator setup:
+
+```yaml
+snapshotters:
+  handlers: ["all"]       # same shape as indexer.handlers; [] also means all
+  check_interval: 10m
+  provider_rewards:
+    earliest_date: "2025-01-17"
+    concurrency: 25
+    rest_url: ""          # optional; falls back to the first REST endpoint
+    rest_headers: {}      # optional; falls back to that endpoint's headers
+```
+
+The REST endpoint **must be archive-backed** — estimated-rewards queries
+historical heights (18+ months in some cases). If your main REST
+endpoint is pruning, set `rest_url` to a dedicated archive node.
+
+Progress is visible in the web UI's "Snapshotters" card (one dot per
+expected date — green covered / red failed / grey missing) and via
+`GET /api/snapshotters`.
+
+Env overrides: `SNAPSHOTTERS_HANDLERS` (comma-separated — `all` /
+`provider_rewards`), `SNAPSHOTTERS_CHECK_INTERVAL`,
+`PROVIDER_REWARDS_EARLIEST_DATE`, `PROVIDER_REWARDS_CONCURRENCY`,
+`PROVIDER_REWARDS_REST_URL`.
+
+### Adding a new snapshotter
+
+1. Create a package under `internal/snapshotters/<your_snap>/` that
+   implements `snapshotters.Snapshotter`.
+2. Add a `cfg.Snapshotters.YourSnap` section to `internal/config/config.go`
+   with whatever schedule/target knobs you need — **no** `enabled` flag;
+   selection is done via `snapshotters.handlers` to match the handler pattern.
+3. Register it unconditionally in `cmd/indexer/main.go` via the
+   `registerSnapshotter` helper — it consults `cfg.Snapshotters.WantsSnapshotter`
+   and skips anything not in the list.
+4. DDL applies at startup; RunLoop runs `BlocksDue` + `Snapshot` on
+   every tick.
+
+## Denom pricing (schema + snapshotter)
+
+Denom data lives in three tables that split dictionary, operator
+overlay, and historical pricing cleanly:
+
+- **`app.denoms`** — pure string dict (`id INT PK`, `denom UNIQUE`).
+  Same shape as `app.providers` / `app.chains`. Populated by the
+  `provider_rewards` snapshotter as it observes RESOLVED denoms
+  (IBC hashes are resolved to their base before they land here).
+- **`app.denom_metadata`** — operator-editable overlay keyed on
+  `denom_id`. Carries `base_denom`, `factor` (microdenom divisor),
+  `coingecko_id`, and a `suppress` boolean. Seeded at startup with
+  24 known Cosmos tokens (`ulava`, `uatom`, `uosmo`, …) plus a
+  blacklist for a rogue test IBC hash. Operators edit in-place via
+  SQL — no redeploy needed.
+- **`app.denom_prices`** — CoinGecko historical USD prices at each
+  monthly snapshot date. Written by the `denom_prices` snapshotter.
+
+The `denom_prices` snapshotter shares the genesis-anchored monthly
+cadence with `provider_rewards`; every 17th-of-month@15:00 UTC slot
+gets one pricing row per denom that has a `coingecko_id` and isn't
+suppressed. LAVA goes first and is load-bearing — if LAVA's fetch
+fails after retries, the whole date is marked `status='failed'`.
+
+`app.priced_rewards` is a materialised view that joins
+`provider_rewards` × `denom_metadata` × `denom_prices`, giving
+dashboards `display_amount` (raw / factor) and `value_usd`
+(display_amount × price_usd). `REFRESH MATERIALIZED VIEW
+CONCURRENTLY` runs after every successful price snapshot.
+
+**Adding a coingecko_id for a new denom.**
+
+```sql
+UPDATE app.denom_metadata dm
+   SET coingecko_id = 'some-new-token'
+  FROM app.denoms d
+ WHERE d.id = dm.denom_id AND d.denom = 'usnt';
+```
+
+**Suppressing a denom (keeps it out of `priced_rewards`).**
+
+```sql
+UPDATE app.denom_metadata dm
+   SET suppress = TRUE
+  FROM app.denoms d
+ WHERE d.id = dm.denom_id AND d.denom = 'ibc/BAD_HASH';
+```
+
+The suppress cache inside `provider_rewards` refreshes every tick, so
+the change takes effect on the next snapshot run.
+
 ## Aggregates: MVs and rollups
 
 Every `*.sql` file under `aggregates/` is executed at startup in filename

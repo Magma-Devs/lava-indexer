@@ -57,6 +57,7 @@ indexer:
   # Which event handlers to register. Use ["all"] or leave empty to enable
   # every compiled-in handler. Otherwise give a list of handler names; ones
   # not listed are skipped entirely (they won't record coverage either).
+  # Compiled-in handlers: [lava_relay_payment].
   # Also settable via env: INDEXER_HANDLERS=lava_relay_payment,...
   handlers: ["all"]
 
@@ -160,3 +161,91 @@ graphql:
   # Enable with graphql.enabled: true or env GRAPHQL_ENABLED=true.
   enabled: false
   upstream: "http://graphql:5000"
+
+# Snapshotters are the periodic-ingestion seam: scheduled jobs that
+# query the chain at specific block heights and write rows into their
+# own tables. Unlike event handlers (which consume the block stream),
+# snapshotters own their cadence and RPC work.
+#
+# Unlisted snapshotters incur zero cost — no DDL is applied, no
+# goroutine is spawned, and the /api/snapshotters endpoint doesn't
+# surface them. Turn on only the ones your operator use case needs.
+snapshotters:
+  # Which snapshotters to register. Same shape as indexer.handlers:
+  # ["all"] enables every compiled-in snapshotter; empty also means
+  # "all"; otherwise name them explicitly. Examples:
+  #   handlers: ["all"]                  # every snapshotter
+  #   handlers: ["provider_rewards"]     # just this one
+  #   handlers: []                       # also means "all"
+  # Compiled-in snapshotters: [provider_rewards, denom_prices, supply].
+  handlers: ["all"]
+
+  # How often the snapshotter loop checks whether there's work to do.
+  # Each tick is one DB query per snapshotter (cheap); short intervals
+  # are fine. Default 10m.
+  check_interval: 10m
+
+  provider_rewards:
+    # First monthly-17th we attempt to snapshot. Optional — when empty,
+    # the snapshotter emits every genesis-anchored slot from
+    # genesis+1mo through now. On Lava mainnet the default 2024-11-17
+    # is the earliest 17th where the chain's
+    # subscription.estimated_provider_rewards handler returned useful
+    # per-source data; earlier dates uniformly yielded empty info[]
+    # so there's nothing to index below that floor. Clear this (set
+    # to "") if your chain has earlier useful data.
+    earliest_date: "2024-11-17"
+
+    # Max concurrent per-provider REST calls during one snapshot.
+    # Default 25 — matches the public Lava gateway's comfortable
+    # per-IP ceiling. Drop if your upstream returns 5xx under load.
+    concurrency: 25
+
+    # Optional: dedicated REST URL for this snapshotter. When empty,
+    # falls back to the first `network.endpoints` entry whose kind
+    # is `rest`. Set when you want to route reward queries through a
+    # known-archive upstream while the main indexer uses a pruning
+    # fleet.
+    rest_url: ""
+
+    # Optional: headers attached to every snapshotter request. When
+    # empty, inherits the headers from the chosen REST endpoint.
+    # Typical use: `lava-extension: archive` on Lava's public gateway.
+    rest_headers: {}
+
+  denom_prices:
+    # First monthly-17th we attempt to price. Optional — when empty,
+    # the snapshotter emits every genesis-anchored slot from
+    # genesis+1mo through now. Matches provider_rewards' floor by
+    # default: there's nothing to price if there are no reward rows
+    # on that date. Also settable via env: DENOM_PRICES_EARLIEST_DATE.
+    earliest_date: "2024-11-17"
+
+    # CoinGecko API base URL. The free public API is fine; bump to
+    # https://pro-api.coingecko.com/api/v3 and add x-cg-pro-api-key to
+    # rest_headers if you have a Pro plan. Also settable via env:
+    # COINGECKO_API_URL.
+    coingecko_api_url: "https://api.coingecko.com/api/v3"
+
+    # Optional headers attached to every CoinGecko call. Use for Pro
+    # API keys.
+    rest_headers: {}
+
+  supply:
+    # First monthly-17th we attempt to snapshot. Optional — when empty
+    # the snapshotter emits every genesis-anchored slot from
+    # genesis+1mo through now. Operators set it only to skip early
+    # history they don't care about.
+    earliest_date: ""
+
+    # Optional: dedicated REST URL for this snapshotter. When empty,
+    # falls back to the first `network.endpoints` entry whose kind
+    # is `rest`. Set when you want to route supply queries through a
+    # known-archive upstream while the main indexer uses a pruning
+    # fleet. Also settable via env: SUPPLY_REST_URL.
+    rest_url: ""
+
+    # Optional: headers attached to every snapshotter request. When
+    # empty, inherits the headers from the chosen REST endpoint.
+    # Typical use: `lava-extension: archive` on Lava's public gateway.
+    rest_headers: {}
