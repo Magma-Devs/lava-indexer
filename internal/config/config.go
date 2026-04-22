@@ -103,6 +103,15 @@ type ProviderRewardsSnapshotter struct {
 // internal/snapshotters/denom_prices). Gated by Snapshotters.Handlers —
 // absent from the list means the section is ignored entirely.
 type DenomPricesSnapshotter struct {
+	// EarliestDate is the first monthly-17th we attempt to price.
+	// Format: "2006-01-02". Optional — when empty the snapshotter
+	// emits every genesis-anchored slot from genesis+1mo through now.
+	// Default "2024-11-17" matches the earliest date on which the
+	// Lava chain's subscription.estimated_provider_rewards handler
+	// returned useful per-source data; older blocks uniformly return
+	// empty info[] so pricing them wastes CoinGecko budget.
+	EarliestDate string `yaml:"earliest_date"`
+
 	// CoingeckoAPIURL is the base URL of the CoinGecko API (v3). When
 	// empty, defaults to the public API. Operators with a Pro plan can
 	// point this at `https://pro-api.coingecko.com/api/v3` (and pass
@@ -112,6 +121,20 @@ type DenomPricesSnapshotter struct {
 	// RESTHeaders attaches extra HTTP headers to every CoinGecko call.
 	// Typical use: `x-cg-pro-api-key` for the Pro API.
 	RESTHeaders map[string]string `yaml:"rest_headers,omitempty"`
+}
+
+// ParsedEarliestDate returns DenomPrices.EarliestDate as a UTC
+// time.Time or the zero value when unset / unparsable. Mirrors the
+// provider_rewards + supply helpers.
+func (p DenomPricesSnapshotter) ParsedEarliestDate() time.Time {
+	if strings.TrimSpace(p.EarliestDate) == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse("2006-01-02", p.EarliestDate)
+	if err != nil {
+		return time.Time{}
+	}
+	return t.UTC()
 }
 
 // SupplySnapshotter configures the supply snapshotter (see
@@ -392,16 +415,29 @@ func defaults() *Config {
 			// narrows the list.
 			Handlers: []string{"all"},
 			ProviderRewards: ProviderRewardsSnapshotter{
-				EarliestDate: "2025-01-17",
+				// 2024-11-17 is the earliest monthly-17th where the
+				// chain's estimated_provider_rewards handler returned
+				// useful per-source data on mainnet. Earlier dates
+				// uniformly yielded empty info[] (the handler was either
+				// not registered or had no state), so there's nothing
+				// to index below this floor.
+				EarliestDate: "2024-11-17",
 				Concurrency:  25,
 			},
 			DenomPrices: DenomPricesSnapshotter{
+				// Match provider_rewards' floor — there's nothing to
+				// price if there are no reward rows.
+				EarliestDate: "2024-11-17",
 				// Public CoinGecko API. Free tier; rate-limited to ~10-30
 				// req/min. The snapshotter honours Retry-After and does
 				// exponential backoff with a 60s cap — see pricing.ts for
 				// the pattern this is ported from.
 				CoingeckoAPIURL: "https://api.coingecko.com/api/v3",
 			},
+			// Supply snapshotter: EarliestDate left empty on purpose.
+			// Total-supply samples ARE useful from the chain's genesis
+			// (burn-rate chart starts at month 1), and the bank supply
+			// endpoint works at every historical block.
 		},
 		AggregatesDir: "./aggregates",
 	}
@@ -569,6 +605,9 @@ func applyEnvOverrides(cfg *Config) {
 	// Denom prices
 	if v := os.Getenv("COINGECKO_API_URL"); v != "" {
 		cfg.Snapshotters.DenomPrices.CoingeckoAPIURL = v
+	}
+	if v := os.Getenv("DENOM_PRICES_EARLIEST_DATE"); v != "" {
+		cfg.Snapshotters.DenomPrices.EarliestDate = v
 	}
 
 	// Supply

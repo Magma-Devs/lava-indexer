@@ -57,6 +57,7 @@ indexer:
   # Which event handlers to register. Use ["all"] or leave empty to enable
   # every compiled-in handler. Otherwise give a list of handler names; ones
   # not listed are skipped entirely (they won't record coverage either).
+  # Compiled-in handlers: [lava_relay_payment].
   # Also settable via env: INDEXER_HANDLERS=lava_relay_payment,...
   handlers: ["all"]
 
@@ -176,6 +177,7 @@ snapshotters:
   #   handlers: ["all"]                  # every snapshotter
   #   handlers: ["provider_rewards"]     # just this one
   #   handlers: []                       # also means "all"
+  # Compiled-in snapshotters: [provider_rewards, denom_prices, supply].
   handlers: ["all"]
 
   # How often the snapshotter loop checks whether there's work to do.
@@ -184,11 +186,15 @@ snapshotters:
   check_interval: 10m
 
   provider_rewards:
-    # First monthly-17th we attempt to snapshot. Must be a 17th of
-    # some month (validated at startup). Every subsequent 17th whose
-    # 15:00 UTC slot is in the past is eligible; covered dates are
-    # subtracted.
-    earliest_date: "2025-01-17"
+    # First monthly-17th we attempt to snapshot. Optional — when empty,
+    # the snapshotter emits every genesis-anchored slot from
+    # genesis+1mo through now. On Lava mainnet the default 2024-11-17
+    # is the earliest 17th where the chain's
+    # subscription.estimated_provider_rewards handler returned useful
+    # per-source data; earlier dates uniformly yielded empty info[]
+    # so there's nothing to index below that floor. Clear this (set
+    # to "") if your chain has earlier useful data.
+    earliest_date: "2024-11-17"
 
     # Max concurrent per-provider REST calls during one snapshot.
     # Default 25 — matches the public Lava gateway's comfortable
@@ -208,6 +214,13 @@ snapshotters:
     rest_headers: {}
 
   denom_prices:
+    # First monthly-17th we attempt to price. Optional — when empty,
+    # the snapshotter emits every genesis-anchored slot from
+    # genesis+1mo through now. Matches provider_rewards' floor by
+    # default: there's nothing to price if there are no reward rows
+    # on that date. Also settable via env: DENOM_PRICES_EARLIEST_DATE.
+    earliest_date: "2024-11-17"
+
     # CoinGecko API base URL. The free public API is fine; bump to
     # https://pro-api.coingecko.com/api/v3 and add x-cg-pro-api-key to
     # rest_headers if you have a Pro plan. Also settable via env:

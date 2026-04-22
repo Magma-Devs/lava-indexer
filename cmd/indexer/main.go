@@ -258,7 +258,7 @@ func main() {
 	}, providerRewardsCaller))
 	registerSnapshotter(denom_prices.New(denom_prices.Config{
 		Schema:           cfg.Database.Schema,
-		EarliestDate:     cfg.Snapshotters.ProviderRewards.ParsedEarliestDate(),
+		EarliestDate:     cfg.Snapshotters.DenomPrices.ParsedEarliestDate(),
 		CoingeckoAPIURL:  cfg.Snapshotters.DenomPrices.CoingeckoAPIURL,
 		CoingeckoHeaders: cfg.Snapshotters.DenomPrices.RESTHeaders,
 		RESTCaller:       providerRewardsCaller,
