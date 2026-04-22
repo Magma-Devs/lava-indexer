@@ -15,7 +15,7 @@ import (
 func TestHTTPCaller_EstimatedRewards_Success(t *testing.T) {
 	const body = `{"info":[{"source":"Boost: ETH1","amount":[{"denom":"ulava","amount":"42"}]}]}`
 	mux := http.NewServeMux()
-	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/10000000000ulava",
+	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/",
 		func(w http.ResponseWriter, r *http.Request) {
 			if h := r.Header.Get("x-cosmos-block-height"); h != "123" {
 				t.Errorf("x-cosmos-block-height = %q, want \"123\"", h)
@@ -41,7 +41,7 @@ func TestHTTPCaller_EstimatedRewards_Success(t *testing.T) {
 // no-rewards-for-this-provider, separate from a real fetch failure.
 func TestHTTPCaller_EstimatedRewards_NoClaimable(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/10000000000ulava",
+	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/",
 		func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"success": false, "message": "cannot get claimable rewards after distribution"}`))
 		})
@@ -64,7 +64,7 @@ func TestHTTPCaller_EstimatedRewards_NoClaimable(t *testing.T) {
 func TestHTTPCaller_EstimatedRewards_PrunedThenSuccess(t *testing.T) {
 	var calls atomic.Int32
 	mux := http.NewServeMux()
-	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/10000000000ulava",
+	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/",
 		func(w http.ResponseWriter, r *http.Request) {
 			n := calls.Add(1)
 			if n == 1 {
@@ -146,7 +146,7 @@ func TestHTTPCaller_BlockTime(t *testing.T) {
 func TestHTTPCaller_EstimatedRewards_5xxRoutesAsPruned(t *testing.T) {
 	var calls atomic.Int32
 	mux := http.NewServeMux()
-	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/10000000000ulava",
+	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/",
 		func(w http.ResponseWriter, _ *http.Request) {
 			calls.Add(1)
 			http.Error(w, "nope", http.StatusInternalServerError)
@@ -175,7 +175,7 @@ func TestHTTPCaller_EstimatedRewards_5xxRoutesAsPruned(t *testing.T) {
 func TestHTTPCaller_EstimatedRewards_4xxAuthFailsFast(t *testing.T) {
 	var calls atomic.Int32
 	mux := http.NewServeMux()
-	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/10000000000ulava",
+	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/",
 		func(w http.ResponseWriter, _ *http.Request) {
 			calls.Add(1)
 			http.Error(w, "no", http.StatusForbidden)

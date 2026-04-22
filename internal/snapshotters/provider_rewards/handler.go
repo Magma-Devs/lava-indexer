@@ -1362,31 +1362,30 @@ func NewHTTPCaller(baseURL string, headers map[string]string) *HTTPCaller {
 	}
 }
 
-// estimatedRewardsDelegatorAmount is the amount_delegator path
-// segment on the EstimatedProviderRewards REST endpoint. 10^10 ulava
-// (= 10 LAVA) — per operator guidance, this is the amount downstream
-// consumers expect; a trivially small amount like 1ulava returns
-// technically-valid-but-not-useful estimates.
-const estimatedRewardsDelegatorAmount = "10000000000ulava"
-
 // EstimatedRewards hits the Lava subscription module's estimated-
-// rewards endpoint pinned at blockHeight. The gRPC method takes two
-// args (provider, amount_delegator); the REST gateway exposes it as a
-// two-segment path: /{provider}/{amount_delegator}. We pass
-// 10000000000ulava (10 LAVA) so the chain returns the estimated
-// per-provider breakdown against that delegation amount.
+// rewards endpoint pinned at blockHeight. Path shape:
+//
+//	/lavanet/lava/subscription/estimated_provider_rewards/{addr}/
+//
+// Note the TRAILING SLASH and NO amount_delegator arg — this is the
+// shape that returns actual accrued rewards per source
+// (info[] populated with "Boost: <chain>", "Pools: <chain>",
+// "Subscription: <chain>" entries). Adding a coin amount segment like
+// `/10000000000ulava` flips the semantics to "simulate rewards for a
+// delegation of this size" and returns info=[] with a synthetic total[]
+// that's ~40× smaller than actual accrual. Match prod info's shape
+// (apps/api/src/rpc/rewards.ts::fetchRawProviderRewards) verbatim.
 //
 // Retries pruned-replica responses up to maxPrunedRetries with
-// jittered exponential backoff. Also treats HTTP 501/404 the same way:
-// Lava's public gateway load-balances across replicas, and the
-// EstimatedProviderRewards handler isn't always registered on every
-// replica — a fresh connection usually hits a working one.
+// jittered exponential backoff. Also treats HTTP 5xx/404 the same way:
+// Lava's public gateway load-balances across replicas and the handler
+// isn't always registered on every replica.
 func (c *HTTPCaller) EstimatedRewards(ctx context.Context, addr string, blockHeight int64) ([]RewardEntry, error) {
 	// url.PathEscape defends against any bech32 weirdness sneaking into
 	// the addr segment. Cosmos addresses don't contain path-special
 	// characters in practice, but escaping eliminates the injection
 	// class outright.
-	path := "/lavanet/lava/subscription/estimated_provider_rewards/" + url.PathEscape(addr) + "/" + estimatedRewardsDelegatorAmount
+	path := "/lavanet/lava/subscription/estimated_provider_rewards/" + url.PathEscape(addr) + "/"
 	for attempt := 0; ; attempt++ {
 		body, err := c.doGET(ctx, path, blockHeight)
 		if err != nil {
