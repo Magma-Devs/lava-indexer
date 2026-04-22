@@ -138,10 +138,12 @@ func TestHTTPCaller_BlockTime(t *testing.T) {
 	}
 }
 
-// TestHTTPCaller_EstimatedRewards_HTTPErrorFailsFast verifies a
-// non-2xx HTTP response surfaces as an error without retrying
-// (non-2xx isn't a classified "retry" branch).
-func TestHTTPCaller_EstimatedRewards_HTTPErrorFailsFast(t *testing.T) {
+// TestHTTPCaller_EstimatedRewards_5xxRoutesAsPruned verifies that a
+// persistent 5xx response retries up to maxPrunedRetries and then
+// surfaces as errStatePruned — same treatment as 501/404. On the Lava
+// public LB these are archive-replica refusals, not real fetch
+// failures, so the snapshot should not penalise them.
+func TestHTTPCaller_EstimatedRewards_5xxRoutesAsPruned(t *testing.T) {
 	var calls atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/10000000000ulava",
@@ -155,10 +157,41 @@ func TestHTTPCaller_EstimatedRewards_HTTPErrorFailsFast(t *testing.T) {
 
 	_, err := c.EstimatedRewards(context.Background(), "lava@addr", 1)
 	if err == nil {
-		t.Fatal("expected error on 500, got nil")
+		t.Fatal("expected error after retries, got nil")
 	}
-	// Single shot — no retry loop on raw HTTP errors.
+	if !errors.Is(err, errStatePruned) {
+		t.Fatalf("expected errStatePruned, got %v", err)
+	}
+	if got := calls.Load(); got != int32(maxPrunedRetries) {
+		t.Fatalf("calls = %d, want %d (should exhaust pruned retries on 500)",
+			got, maxPrunedRetries)
+	}
+}
+
+// TestHTTPCaller_EstimatedRewards_4xxAuthFailsFast verifies auth/rate
+// errors (401, 403, 429) still surface immediately — those aren't
+// archive-unavailability, they're caller problems the operator needs
+// to see.
+func TestHTTPCaller_EstimatedRewards_4xxAuthFailsFast(t *testing.T) {
+	var calls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/lavanet/lava/subscription/estimated_provider_rewards/lava@addr/10000000000ulava",
+		func(w http.ResponseWriter, _ *http.Request) {
+			calls.Add(1)
+			http.Error(w, "no", http.StatusForbidden)
+		})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := NewHTTPCaller(srv.URL, nil)
+
+	_, err := c.EstimatedRewards(context.Background(), "lava@addr", 1)
+	if err == nil {
+		t.Fatal("expected error on 403, got nil")
+	}
+	if errors.Is(err, errStatePruned) {
+		t.Fatalf("403 should fail fast, got errStatePruned: %v", err)
+	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("calls = %d, want 1 (no retry on http 500)", got)
+		t.Fatalf("calls = %d, want 1 (no retry on http 403)", got)
 	}
 }
