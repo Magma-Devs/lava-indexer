@@ -94,6 +94,7 @@ func (s *Server) Mux() *http.ServeMux {
 	if s.GraphQLEnabled && s.GraphQLUpstream != "" {
 		if target, err := parseProxyUpstream(s.GraphQLUpstream); err == nil {
 			proxy := httputil.NewSingleHostReverseProxy(target)
+			proxy.Transport = newUpstreamTransport()
 			mux.Handle("/graphql", proxy)
 			mux.Handle("/graphql/", proxy)
 			mux.Handle("/graphiql", proxy)
@@ -114,11 +115,17 @@ func (s *Server) Mux() *http.ServeMux {
 
 // parseProxyUpstream parses and validates the GraphQL reverse-proxy
 // upstream URL. Reject anything that isn't http/https and anything that
-// resolves outside loopback or RFC1918/ULA private space — without this
+// points outside loopback or RFC1918/ULA private space — without this
 // the indexer becomes a SSRF proxy: a misconfigured GRAPHQL_UPSTREAM
 // could be aimed at the AWS metadata service or an arbitrary attacker
 // host, and any unauthenticated client of the indexer's web port could
 // proxy through it.
+//
+// A literal IP is checked here. A hostname is not resolved here: at boot
+// the graphql container often starts after the indexer, so its name does
+// not resolve yet, and failing here would leave /graphql unregistered
+// until the indexer restarts. privateDialContext checks every address a
+// hostname resolves to on each connection instead.
 func parseProxyUpstream(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -131,23 +138,52 @@ func parseProxyUpstream(raw string) (*url.URL, error) {
 		return nil, fmt.Errorf("missing host")
 	}
 	host := u.Hostname()
-	// Resolve the host. ResolveIPAddr returns a single IP — fine for the
-	// validation gate; we're checking that no public IP is reachable, so
-	// any single resolved address tells us whether the host points at a
-	// safe range. For multi-A-record hostnames Go uses LookupIP elsewhere
-	// in the stack, but the proxy only needs to know if the *target* is
-	// allowed to be reached.
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return nil, fmt.Errorf("resolve %q: %w", host, err)
-	}
-	for _, ip := range ips {
-		if !isPrivateOrLoopback(ip) {
-			return nil, fmt.Errorf("upstream host %q resolves to public IP %s — refusing to proxy",
-				host, ip)
-		}
+	if ip := net.ParseIP(host); ip != nil && !isPrivateOrLoopback(ip) {
+		return nil, fmt.Errorf("upstream host %q is a public IP — refusing to proxy", host)
 	}
 	return u, nil
+}
+
+// newUpstreamTransport is the GraphQL proxy's transport. It never goes
+// through HTTP(S)_PROXY and dials only addresses privateDialContext allows.
+func newUpstreamTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	t.DialContext = privateDialContext(&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second})
+	return t
+}
+
+// privateDialContext resolves the upstream host on every connection,
+// refuses it if any address is outside loopback or RFC1918/ULA space, and
+// then dials a vetted IP itself, so the DNS answer cannot change between
+// the check and the connect. An upstream that does not resolve yet fails
+// only that request (the proxy answers 502) and works once it resolves.
+func privateDialContext(dialer *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if err != nil {
+			return nil, fmt.Errorf("resolve %q: %w", host, err)
+		}
+		for _, ip := range ips {
+			if !isPrivateOrLoopback(ip) {
+				return nil, fmt.Errorf("upstream host %q resolves to public IP %s — refusing to proxy",
+					host, ip)
+			}
+		}
+		var lastErr error
+		for _, ip := range ips {
+			conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
+	}
 }
 
 func isPrivateOrLoopback(ip net.IP) bool {
