@@ -693,7 +693,7 @@ design.
 
 `.github/workflows/` ships four pipelines:
 
-- **`ci.yml`** — runs on every push to `main` / `mainnet` / `testnet` and
+- **`ci.yml`** — runs on every push to `main` / `mainnet` and
   every PR targeting `main`. `go mod download` → `go vet ./...` →
   `go build ./...` → `go test ./...`. Concurrency-grouped on the ref
   with `cancel-in-progress: true`, so outdated PR pushes are cancelled.
@@ -705,8 +705,8 @@ design.
   `:<sha>` plus `:latest`.
 - **`publish.yml`** — manual (`workflow_dispatch`). Same image-build
   logic as `build.yml`, for ad-hoc re-publishes without a push.
-- **`deploy.yml`** — manual, takes an `environment` (`mainnet` /
-  `testnet`) and a `tag` input (default `latest`). Pulls the current
+- **`deploy.yml`** — manual, takes an `environment` (`mainnet`)
+  and a `tag` input (default `latest`). Pulls the current
   ECS task definition for `lava-indexer-<env>-indexer`, rewrites its
   container image to point at the chosen ECR tag, registers a new
   task-def revision, and `update-service`s the `indexer` service to
