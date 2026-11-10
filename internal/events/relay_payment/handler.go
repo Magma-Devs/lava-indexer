@@ -201,9 +201,9 @@ func (h *Handler) Persist(ctx context.Context, tx pgx.Tx, es []events.HandledEve
 }
 
 // stageTable is a session-local temp table the rows are COPYed into before
-// they are merged into relay_payments. ON COMMIT DELETE ROWS empties it at
-// every commit; the explicit TRUNCATE covers several Persist calls within
-// one tx (the writer aggregates jobs).
+// they are merged into relay_payments. The merge moves rows out with
+// DELETE … RETURNING, so the stage is empty again after every Persist call
+// (the writer runs several per tx); ON COMMIT DELETE ROWS is a backstop.
 const stageTable = "relay_payments_stage"
 
 // insertIdempotent writes rows so that a block whose rows already exist is
@@ -220,16 +220,17 @@ func (h *Handler) insertIdempotent(ctx context.Context, tx pgx.Tx, rows [][]any)
 		ON COMMIT DELETE ROWS`, stageTable, h.schema)); err != nil {
 		return fmt.Errorf("create %s: %w", stageTable, err)
 	}
-	if _, err := tx.Exec(ctx, "TRUNCATE "+stageTable); err != nil {
-		return fmt.Errorf("truncate %s: %w", stageTable, err)
-	}
 	if _, err := tx.CopyFrom(ctx, pgx.Identifier{stageTable}, copyCols, pgx.CopyFromRows(rows)); err != nil {
 		return fmt.Errorf("COPY %s: %w", stageTable, err)
 	}
+	// One statement moves the staged rows: it empties the stage for the
+	// next Persist call in this tx without a TRUNCATE (which would swap the
+	// table's file, i.e. catalog churn, on every call).
 	if _, err := tx.Exec(ctx, fmt.Sprintf(`
-		INSERT INTO %s.relay_payments (%s)
-		SELECT %s FROM %s
-		ON CONFLICT DO NOTHING`, h.schema, cols, cols, stageTable)); err != nil {
+		WITH moved AS (DELETE FROM %[3]s RETURNING %[2]s)
+		INSERT INTO %[1]s.relay_payments (%[2]s)
+		SELECT %[2]s FROM moved
+		ON CONFLICT DO NOTHING`, h.schema, cols, stageTable)); err != nil {
 		return fmt.Errorf("insert relay_payments: %w", err)
 	}
 	return nil

@@ -129,15 +129,33 @@ func TestPersistMixedExistingAndNewBlocks(t *testing.T) {
 }
 
 // The writer aggregates several jobs into one tx, so Persist runs several
-// times per tx. Each call must insert only its own rows.
+// times per tx. Each call must insert only its own rows and leave the stage
+// empty for the next call.
 func TestPersistSeveralCallsInOneTx(t *testing.T) {
 	h, pool := testHandler(t)
 	ctx := context.Background()
-	persist(t, ctx, h, pool,
-		paymentEvents([]int64{300}, 2),
-		paymentEvents([]int64{301}, 1),
-		paymentEvents([]int64{300}, 2),
-	)
+	err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		for _, es := range [][]events.HandledEvent{
+			paymentEvents([]int64{300}, 2),
+			paymentEvents([]int64{301}, 1),
+			paymentEvents([]int64{300}, 2),
+		} {
+			if err := h.Persist(ctx, tx, es); err != nil {
+				return err
+			}
+			var staged int
+			if err := tx.QueryRow(ctx, "SELECT count(*) FROM "+stageTable).Scan(&staged); err != nil {
+				return err
+			}
+			if staged != 0 {
+				t.Errorf("%d rows left in %s after Persist", staged, stageTable)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
 	if got := countRows(t, ctx, h, pool); got != 3 {
 		t.Fatalf("rows = %d, want 3", got)
 	}
