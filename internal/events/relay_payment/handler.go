@@ -197,14 +197,41 @@ func (h *Handler) Persist(ctx context.Context, tx pgx.Tx, es []events.HandledEve
 		}
 	}
 
-	_, err = tx.CopyFrom(
-		ctx,
-		pgx.Identifier{h.schema, "relay_payments"},
-		copyCols,
-		pgx.CopyFromRows(final),
-	)
-	if err != nil {
-		return fmt.Errorf("COPY relay_payments: %w", err)
+	return h.insertIdempotent(ctx, tx, final)
+}
+
+// stageTable is a session-local temp table the rows are COPYed into before
+// they are merged into relay_payments. The merge moves rows out with
+// DELETE … RETURNING, so the stage is empty again after every Persist call
+// (the writer runs several per tx); ON COMMIT DELETE ROWS is a backstop.
+const stageTable = "relay_payments_stage"
+
+// insertIdempotent writes rows so that a block whose rows already exist is
+// a no-op instead of a failed tx. A plain COPY into relay_payments aborts
+// on the first duplicate key, and the writer then dead-letters every job in
+// the aggregated tx (MAG-5084). The rows of a block are fully determined by
+// the chain, so an existing row with the same primary key is the same row:
+// ON CONFLICT DO NOTHING is safe. COPY into the stage table keeps the bulk
+// path fast.
+func (h *Handler) insertIdempotent(ctx context.Context, tx pgx.Tx, rows [][]any) error {
+	cols := strings.Join(copyCols, ", ")
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`
+		CREATE TEMP TABLE IF NOT EXISTS %s (LIKE %s.relay_payments INCLUDING DEFAULTS)
+		ON COMMIT DELETE ROWS`, stageTable, h.schema)); err != nil {
+		return fmt.Errorf("create %s: %w", stageTable, err)
+	}
+	if _, err := tx.CopyFrom(ctx, pgx.Identifier{stageTable}, copyCols, pgx.CopyFromRows(rows)); err != nil {
+		return fmt.Errorf("COPY %s: %w", stageTable, err)
+	}
+	// One statement moves the staged rows: it empties the stage for the
+	// next Persist call in this tx without a TRUNCATE (which would swap the
+	// table's file, i.e. catalog churn, on every call).
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`
+		WITH moved AS (DELETE FROM %[3]s RETURNING %[2]s)
+		INSERT INTO %[1]s.relay_payments (%[2]s)
+		SELECT %[2]s FROM moved
+		ON CONFLICT DO NOTHING`, h.schema, cols, stageTable)); err != nil {
+		return fmt.Errorf("insert relay_payments: %w", err)
 	}
 	return nil
 }

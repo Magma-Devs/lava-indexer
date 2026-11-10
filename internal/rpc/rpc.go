@@ -470,14 +470,32 @@ type rawBlockResults struct {
 	FinalizeBlockEvents []rawEvent    `json:"finalize_block_events"` // CometBFT 0.38+
 }
 
+// decodeBlock pairs a block with its block_results. It rejects responses
+// that cannot be the requested block's complete results — a null or empty
+// result, a header for another height, or a txs_results count that differs
+// from the block's tx count — so MultiClient fails over to another endpoint
+// instead of the pipeline recording a block with missing events as indexed
+// (MAG-5084). CometBFT always returns one txs_results entry per tx.
 func decodeBlock(height int64, blockRaw, resultsRaw json.RawMessage) (*Block, error) {
+	if isJSONEmpty(blockRaw) {
+		return nil, fmt.Errorf("block: empty result")
+	}
+	if isJSONEmpty(resultsRaw) {
+		return nil, fmt.Errorf("block_results: empty result")
+	}
 	var rb rawBlock
 	if err := json.Unmarshal(blockRaw, &rb); err != nil {
 		return nil, fmt.Errorf("block: %w", err)
 	}
+	if got := rb.Block.Header.Height; got != strconv.FormatInt(height, 10) {
+		return nil, fmt.Errorf("block: header height %q, want %d", got, height)
+	}
 	var rr rawBlockResults
 	if err := json.Unmarshal(resultsRaw, &rr); err != nil {
 		return nil, fmt.Errorf("block_results: %w", err)
+	}
+	if len(rr.TxsResults) != len(rb.Block.Data.Txs) {
+		return nil, fmt.Errorf("block_results: %d txs_results for %d txs", len(rr.TxsResults), len(rb.Block.Data.Txs))
 	}
 
 	// Compute tx hashes from the block's raw tx bytes. Each hash pairs with
@@ -532,6 +550,12 @@ func decodeBlock(height int64, blockRaw, resultsRaw json.RawMessage) (*Block, er
 		Time:   rb.Block.Header.Time,
 		Events: events,
 	}, nil
+}
+
+// isJSONEmpty reports whether raw is absent or the JSON literal null.
+func isJSONEmpty(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+	return s == "" || s == "null"
 }
 
 func truncate(s string, n int) string {

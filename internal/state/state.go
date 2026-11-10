@@ -351,6 +351,13 @@ func (s *State) Gaps(ctx context.Context, handler string, start, end int64) ([]R
 // UnionGaps returns heights in [start, end] where AT LEAST ONE handler needs
 // coverage. Useful for the fetcher: we fetch the superset, then each batch
 // only calls Persist on handlers that actually need that specific range.
+//
+// Heights a handler has given up on (permanent dead-letters) are not gaps
+// for that handler: the producer would otherwise re-emit them on every tip
+// poll, forever, and each pass drags its gap neighbours into the same
+// failing job. Retrying a permanent height takes an operator clearing its
+// indexer_failures row. Gaps (used by the UI) still reports them, so the
+// coverage numbers stay honest.
 func (s *State) UnionGaps(ctx context.Context, handlers []string, start, end int64) ([]Range, error) {
 	if len(handlers) == 0 || end < start {
 		return nil, nil
@@ -361,9 +368,38 @@ func (s *State) UnionGaps(ctx context.Context, handlers []string, start, end int
 		if err != nil {
 			return nil, err
 		}
+		if len(g) > 0 {
+			perm, err := s.PermanentFailureHeights(ctx, h, start, end)
+			if err != nil {
+				return nil, err
+			}
+			g = subtractHeights(g, perm)
+		}
 		union = mergeRanges(append(union, g...))
 	}
 	return union, nil
+}
+
+// PermanentFailureHeights returns the permanent dead-letter heights in
+// [start, end] for a handler, ascending.
+func (s *State) PermanentFailureHeights(ctx context.Context, handler string, start, end int64) ([]int64, error) {
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
+		SELECT height FROM %s.indexer_failures
+		WHERE handler = $1 AND permanent AND height BETWEEN $2 AND $3
+		ORDER BY height`, s.schema), handler, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var h int64
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }
 
 // HandlerNeedsRange reports whether [from, to] is entirely or partially
@@ -445,90 +481,92 @@ func (s *State) RecordRange(ctx context.Context, tx pgx.Tx, handler string, from
 
 // CompactRanges merges touching/overlapping rows in indexer_ranges for the
 // given handler into the minimum-count representation. Intended to run on
-// a timer (see pipeline.go). Uses range_agg (PG 14+) for one-shot server-
-// side merging, then swaps old rows for merged ones inside a single tx.
+// a timer (see pipeline.go). Reads the handler's rows, merges them in Go,
+// then swaps exactly those rows for the merged ones inside a single tx.
 //
-// Races with concurrent INSERTs into indexer_ranges are benign: if a
-// writer inserts a new row after we read but before we swap, its row is
-// simply preserved (the DELETE only targets from_height values we saw)
-// and picked up on the next compaction cycle.
+// Writers insert ranges concurrently and without a lock, so the swap must
+// never touch a row this call did not read. The DELETE therefore matches
+// the exact (from_height, to_height) pairs that were read:
+//   - a row committed after the read is not matched, survives, and is
+//     merged on the next tick;
+//   - a row a writer extended after the read (ON CONFLICT … GREATEST) no
+//     longer matches its old pair, survives, and the merged INSERT keeps
+//     the larger to_height on conflict.
+//
+// Deleting by handler alone (the previous behaviour) dropped any range
+// committed between the read and the DELETE. Its rows stayed in the event
+// tables while the heights became gaps again, which the producer re-emitted
+// forever (MAG-5084).
 func (s *State) CompactRanges(ctx context.Context, handler string) (merged int, err error) {
+	return s.compactRanges(ctx, handler, nil)
+}
+
+// compactRanges is CompactRanges with an optional hook that runs after the
+// rows are read and before they are swapped. Tests use it to commit a
+// concurrent writer's range inside that window.
+func (s *State) compactRanges(ctx context.Context, handler string, afterRead func()) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
 
-	// Compute the merged representation server-side via range_agg. Returned
-	// rows are already minimal and non-overlapping per PG's semantics.
-	rows, err := tx.Query(ctx, fmt.Sprintf(`
-		WITH merged AS (
-		  SELECT range_agg(int8range(from_height, to_height + 1, '[)')) AS rs
-		  FROM %s.indexer_ranges WHERE handler = $1
-		)
-		SELECT lower(r), upper(r) - 1
-		FROM merged, unnest(rs) AS t(r)
-		ORDER BY 1`, s.schema), handler)
+	rows, err := tx.Query(ctx, fmt.Sprintf(
+		`SELECT from_height, to_height FROM %s.indexer_ranges WHERE handler = $1`,
+		s.schema), handler)
 	if err != nil {
 		return 0, fmt.Errorf("compact select: %w", err)
 	}
-	type mrange struct{ from, to int64 }
-	var want []mrange
-	for rows.Next() {
-		var m mrange
-		if err := rows.Scan(&m.from, &m.to); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		want = append(want, m)
-	}
+	seen, err := scanRanges(rows)
 	rows.Close()
-	if err := rows.Err(); err != nil {
+	if err != nil {
 		return 0, err
 	}
-
-	// Current row count for this handler (before compaction).
-	var before int
-	if err := tx.QueryRow(ctx,
-		fmt.Sprintf(`SELECT count(*) FROM %s.indexer_ranges WHERE handler = $1`, s.schema),
-		handler).Scan(&before); err != nil {
-		return 0, err
-	}
-	if before <= len(want) {
-		// Nothing to do: already at minimum representation (or writers
-		// raced and added a row we'll pick up next tick).
+	// mergeRanges sorts in place; keep `seen` as read for the DELETE.
+	want := mergeRanges(append([]Range(nil), seen...))
+	if len(seen) <= len(want) {
+		// Already minimal.
 		return 0, tx.Commit(ctx)
 	}
+	if afterRead != nil {
+		afterRead()
+	}
 
-	// Replace. DELETE everything we saw for this handler, INSERT the
-	// merged set. We read fresh rows committed between SELECT and DELETE
-	// won't exist in `want` but are also not in the DELETE set — they
-	// survive and get compacted next tick.
-	if _, err := tx.Exec(ctx,
-		fmt.Sprintf(`DELETE FROM %s.indexer_ranges WHERE handler = $1
-		             AND from_height IN (
-		               SELECT from_height FROM %s.indexer_ranges WHERE handler = $1
-		             )`, s.schema, s.schema), handler); err != nil {
+	seenFrom, seenTo := splitRanges(seen)
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`
+		DELETE FROM %s.indexer_ranges
+		WHERE handler = $1
+		  AND (from_height, to_height) IN (
+		    SELECT * FROM unnest($2::bigint[], $3::bigint[])
+		  )`, s.schema), handler, seenFrom, seenTo); err != nil {
 		return 0, fmt.Errorf("compact delete: %w", err)
 	}
-	// Bulk insert merged ranges. ON CONFLICT DO UPDATE in case a writer
-	// raced in a row for the same from_height between our DELETE and
-	// INSERT — keep the larger to_height.
-	for _, m := range want {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(
-			`INSERT INTO %s.indexer_ranges (handler, from_height, to_height)
-			 VALUES ($1, $2, $3)
-			 ON CONFLICT (handler, from_height) DO UPDATE
-			   SET to_height = GREATEST(%s.indexer_ranges.to_height, EXCLUDED.to_height),
-			       updated_at = now()`,
-			s.schema, s.schema), handler, m.from, m.to); err != nil {
-			return 0, fmt.Errorf("compact insert: %w", err)
-		}
+	// ON CONFLICT keeps the larger to_height when a row we did not delete
+	// (committed or extended after our read) shares a merged from_height.
+	wantFrom, wantTo := splitRanges(want)
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %[1]s.indexer_ranges (handler, from_height, to_height)
+		SELECT $1, f, t FROM unnest($2::bigint[], $3::bigint[]) AS u(f, t)
+		ON CONFLICT (handler, from_height) DO UPDATE
+		  SET to_height = GREATEST(%[1]s.indexer_ranges.to_height, EXCLUDED.to_height),
+		      updated_at = now()`, s.schema), handler, wantFrom, wantTo); err != nil {
+		return 0, fmt.Errorf("compact insert: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	return before - len(want), nil
+	return len(seen) - len(want), nil
+}
+
+// splitRanges returns the From and To columns of rs as two slices, for
+// passing to unnest().
+func splitRanges(rs []Range) (from, to []int64) {
+	from = make([]int64, len(rs))
+	to = make([]int64, len(rs))
+	for i, r := range rs {
+		from[i], to[i] = r.From, r.To
+	}
+	return from, to
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +611,33 @@ func computeGaps(ranges []Range, start, end int64) []Range {
 		gaps = append(gaps, Range{From: cursor, To: end})
 	}
 	return gaps
+}
+
+// subtractHeights removes each height in `heights` (ascending) from the
+// non-overlapping, ascending ranges `rs`, splitting a range around every
+// height it contains.
+func subtractHeights(rs []Range, heights []int64) []Range {
+	if len(heights) == 0 {
+		return rs
+	}
+	out := make([]Range, 0, len(rs)+len(heights))
+	i := 0
+	for _, r := range rs {
+		for i < len(heights) && heights[i] < r.From {
+			i++
+		}
+		cursor := r.From
+		for j := i; j < len(heights) && heights[j] <= r.To; j++ {
+			if heights[j] > cursor {
+				out = append(out, Range{From: cursor, To: heights[j] - 1})
+			}
+			cursor = heights[j] + 1
+		}
+		if cursor <= r.To {
+			out = append(out, Range{From: cursor, To: r.To})
+		}
+	}
+	return out
 }
 
 // mergeRanges sorts and coalesces touching/overlapping ranges into a minimal

@@ -98,8 +98,10 @@ refetched on next run.
 
 When you rerun with a lower `start_height`, the missing window is split into
 disjoint gaps: the _old_ gap between the new start and the prior earliest,
-plus every gap between previously-indexed ranges (including dead-letter
-holes) and the tip. All gaps are worked in parallel by a shared pool, but
+plus every gap between previously-indexed ranges (including transient
+dead-letter holes) and the tip. Permanent dead-letters are not gaps for the
+producer — it would re-emit them every tip poll — so retrying one takes
+deleting its `indexer_failures` row. All gaps are worked in parallel by a shared pool, but
 the producer is **tip-first**: on every emit it picks the gap whose cursor
 is currently highest — i.e. closest to the chain tip — and dispatches the
 next batch from there. Consequences:
@@ -135,8 +137,12 @@ producer → jobs → N fetchers → writeCh → M writers → DB
   holds a DB tx.
 - **M writers** (`pool_size - 4`) drain up to 32 `writeJob`s per 50 ms
   window and commit them in a single Postgres tx — amortising the
-  BEGIN/Heartbeat/COMMIT overhead across many batches. Persist failures
-  record the batch as dead-letter; the sweep re-fetches.
+  BEGIN/Heartbeat/COMMIT overhead across many batches. If that tx fails,
+  each `writeJob` is retried in its own tx, so only a job that fails alone
+  is recorded as dead-letter; the sweep re-fetches it. Event persists are
+  idempotent (`relay_payments` goes through a staging table and
+  `INSERT … ON CONFLICT DO NOTHING`), so re-processing an already-stored
+  block is a no-op.
 
 This lets fetch run up to the upstream ceiling and write run up to the DB
 ceiling independently — whichever is slower becomes the bottleneck, not
@@ -144,9 +150,11 @@ both. No more "fast upstream gated on slow commit" or vice versa.
 
 Writers to `indexer_ranges` are **lock-free**: each writer does an
 `INSERT … ON CONFLICT DO UPDATE` and exits. A background compactor ticks
-every 30 s and runs `range_agg(int8range(...))` to collapse overlapping
-or touching raw ranges into the minimum-row representation. Writers never
-block on each other; fragmentation is bounded by one compaction cycle.
+every 30 s and collapses overlapping or touching raw ranges into the
+minimum-row representation. It swaps out only the exact rows it read, so
+a range a writer commits or extends mid-compaction survives to the next
+tick. Writers never block on each other; fragmentation is bounded by one
+compaction cycle.
 
 ## Space-efficient schema
 
@@ -270,6 +278,7 @@ runWindow          (gap detection + coverage-tier slicing)
 | `processWithSplit` | multi-block batch failure (transient) | **bisect halves until size 1** | isolate one bad block from an otherwise-healthy batch |
 | Dead-letter sweep | size-1 failures still in `indexer_failures` | **`failure_max_retries` × 60 s ticks** (default 3) | slow-time recovery for whole-infra outages; flips `permanent=true` once exhausted |
 | Permanent classifier (`HeightPrunedError`, `NoEndpointCoversError`) | nothing | **0** — short-circuits the bisect, records every height as `permanent=true` in one shot | retrying a pruned height across all endpoints is the same answer every time |
+| Writer fallback | an aggregated write tx that fails | **each `writeJob` once, in its own tx** | one bad job must not dead-letter the jobs it was batched with |
 
 ### Why we don't retry the whole `MultiClient` call
 

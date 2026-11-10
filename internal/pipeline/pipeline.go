@@ -244,7 +244,8 @@ func splitByEndpointCoverage(gaps []state.Range, eps []*rpc.Endpoint) []state.Ra
 //     errors. Hands the parsed batch to the writer pool via writeCh.
 //   - WRITE pool (M = writerCount, bounded by pg pool): aggregates up
 //     to 32 writeJobs per tx, persists each handler's events, merges
-//     indexer_ranges, heartbeats run stats, commits.
+//     indexer_ranges, heartbeats run stats, commits. If the aggregated
+//     tx fails, each job is retried in its own tx.
 //   - DEAD-LETTER SWEEP (1 goroutine, optional): pops newest-first
 //     failures on a 60s ticker, re-runs them through processWithSplit.
 //   - RANGE COMPACTOR (1 goroutine): every 30s runs range_agg to
@@ -574,19 +575,13 @@ func (p *Pipeline) indexForever(ctx context.Context) error {
 				}
 				timer.Stop()
 
-				if err := p.persistJobs(ctx, batch); err != nil {
-					// Whole-tx failure → record every job's range as dead-letter.
-					reason := safeFailureReason(err)
-					slog.Error("persist failed; batch recorded as dead-letter",
-						"count", len(batch), "err", reason)
-					for _, j := range batch {
-						p.recordBatchFailure(ctx, j.from, j.to, reason)
-					}
+				committed := p.persistBatch(ctx, batch)
+				if len(committed) == 0 {
 					continue
 				}
-				// Success: update progress counters summed across the batch.
+				// Update progress counters summed across the committed jobs.
 				var n int64
-				for _, j := range batch {
+				for _, j := range committed {
 					n += j.blocksThisBatch
 				}
 				done := progressBlocks.Add(n)
@@ -713,6 +708,53 @@ func (p *Pipeline) processWithSplit(ctx context.Context, writeCh chan<- writeJob
 	return p.processWithSplit(ctx, writeCh, mid+1, to)
 }
 
+// persistBatch commits an aggregated writer batch and returns the jobs that
+// committed. Jobs that fail are recorded as dead-letters.
+func (p *Pipeline) persistBatch(ctx context.Context, batch []writeJob) []writeJob {
+	return persistWithFallback(ctx, batch,
+		func(jobs []writeJob) error { return p.persistJobs(ctx, jobs) },
+		func(j writeJob, err error) {
+			reason := safeFailureReason(err)
+			slog.Error("persist failed; batch recorded as dead-letter",
+				"from", j.from, "to", j.to, "err", reason)
+			p.recordBatchFailure(ctx, j.from, j.to, reason)
+		})
+}
+
+// persistWithFallback persists the whole batch in one tx. If that fails and
+// the batch holds more than one job, it retries every job in its own tx, so
+// one bad job dead-letters only its own heights instead of rolling back and
+// dead-lettering every job it was aggregated with (MAG-5084). failed is
+// called once per job that cannot be committed. On ctx cancellation it
+// stops without retrying or recording anything.
+func persistWithFallback(ctx context.Context, batch []writeJob, persist func([]writeJob) error, failed func(writeJob, error)) []writeJob {
+	err := persist(batch)
+	if err == nil {
+		return batch
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	if len(batch) == 1 {
+		failed(batch[0], err)
+		return nil
+	}
+	slog.Warn("aggregated persist failed; retrying each job in its own tx",
+		"jobs", len(batch), "err", safeFailureReason(err))
+	committed := make([]writeJob, 0, len(batch))
+	for _, j := range batch {
+		if ctx.Err() != nil {
+			return committed
+		}
+		if err := persist([]writeJob{j}); err != nil {
+			failed(j, err)
+			continue
+		}
+		committed = append(committed, j)
+	}
+	return committed
+}
+
 // recordBatchFailure records every height in [from, to] as a transient
 // failure — used when persist throws on a batch that fetched
 // successfully. The dead-letter sweep will re-fetch and re-persist these.
@@ -811,7 +853,7 @@ func (p *Pipeline) fetchBatch(ctx context.Context, from, to int64) (writeJob, er
 // call Persist (skipped entirely when the dispatched event slice for that
 // handler is empty — the common case for historical-empty blocks) and
 // RecordRange. One Heartbeat sums all jobs. Returns an error when the tx
-// fails; the caller records every job's range as dead-letter.
+// fails; persistWithFallback then retries the jobs one by one.
 //
 // Aggregating N jobs per tx amortises BEGIN / Heartbeat / COMMIT overhead
 // across those jobs. At batch=50 and agg=16 that's 800 blocks per tx —
