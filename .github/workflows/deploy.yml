@@ -9,7 +9,6 @@ on:
         type: choice
         options:
           - mainnet
-          - testnet
       tag:
         description: "Image tag (commit SHA or latest)"
         required: false
