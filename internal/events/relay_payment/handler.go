@@ -197,14 +197,40 @@ func (h *Handler) Persist(ctx context.Context, tx pgx.Tx, es []events.HandledEve
 		}
 	}
 
-	_, err = tx.CopyFrom(
-		ctx,
-		pgx.Identifier{h.schema, "relay_payments"},
-		copyCols,
-		pgx.CopyFromRows(final),
-	)
-	if err != nil {
-		return fmt.Errorf("COPY relay_payments: %w", err)
+	return h.insertIdempotent(ctx, tx, final)
+}
+
+// stageTable is a session-local temp table the rows are COPYed into before
+// they are merged into relay_payments. ON COMMIT DELETE ROWS empties it at
+// every commit; the explicit TRUNCATE covers several Persist calls within
+// one tx (the writer aggregates jobs).
+const stageTable = "relay_payments_stage"
+
+// insertIdempotent writes rows so that a block whose rows already exist is
+// a no-op instead of a failed tx. A plain COPY into relay_payments aborts
+// on the first duplicate key, and the writer then dead-letters every job in
+// the aggregated tx (MAG-5084). The rows of a block are fully determined by
+// the chain, so an existing row with the same primary key is the same row:
+// ON CONFLICT DO NOTHING is safe. COPY into the stage table keeps the bulk
+// path fast.
+func (h *Handler) insertIdempotent(ctx context.Context, tx pgx.Tx, rows [][]any) error {
+	cols := strings.Join(copyCols, ", ")
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`
+		CREATE TEMP TABLE IF NOT EXISTS %s (LIKE %s.relay_payments INCLUDING DEFAULTS)
+		ON COMMIT DELETE ROWS`, stageTable, h.schema)); err != nil {
+		return fmt.Errorf("create %s: %w", stageTable, err)
+	}
+	if _, err := tx.Exec(ctx, "TRUNCATE "+stageTable); err != nil {
+		return fmt.Errorf("truncate %s: %w", stageTable, err)
+	}
+	if _, err := tx.CopyFrom(ctx, pgx.Identifier{stageTable}, copyCols, pgx.CopyFromRows(rows)); err != nil {
+		return fmt.Errorf("COPY %s: %w", stageTable, err)
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s.relay_payments (%s)
+		SELECT %s FROM %s
+		ON CONFLICT DO NOTHING`, h.schema, cols, cols, stageTable)); err != nil {
+		return fmt.Errorf("insert relay_payments: %w", err)
 	}
 	return nil
 }
